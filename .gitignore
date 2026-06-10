@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Model weights — NEVER commit
+weights/*
+!weights/.gitkeep
+
+# Exported .aimodel files — upload to HuggingFace instead
+exports/*
+!exports/.gitkeep
+*.aimodel
+
+# macOS / Xcode
+.DS_Store
+DerivedData/
+*.xcworkspace/
