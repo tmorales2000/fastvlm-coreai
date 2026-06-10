@@ -12,5 +12,8 @@ dependencies = [
     "numpy",
 ]
 
+[tool.setuptools]
+packages = []
+
 [dependency-groups]
 dev = []
