@@ -4,13 +4,15 @@ version = "0.1.0"
 description = "FastVLM to Core AI .aimodel conversion pipeline"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.8.0",
-    "torchvision",
+    "coreai-torch",
+    "coreai-opt",
     "safetensors",
-    "transformers",
     "huggingface-hub",
     "numpy",
 ]
+
+[tool.uv]
+prerelease = "allow"
 
 [tool.setuptools]
 packages = []
