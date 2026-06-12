@@ -9,6 +9,7 @@ dependencies = [
     "safetensors",
     "huggingface-hub",
     "numpy",
+    "transformers",
 ]
 
 [tool.uv]
