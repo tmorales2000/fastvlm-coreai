@@ -47,7 +47,13 @@ def verify(variant: str = "1.5b") -> None:
     _mutate_state_dict(weights_f32)
 
     model_f32 = FastVLMDecoderStateful(text_cfg).to(dtype=torch.float32)
-    model_f32.load_state_dict(weights_f32, assign=True, strict=True)
+    missing, unexpected = model_f32.load_state_dict(weights_f32, assign=True, strict=False)
+    expected_missing = {"k_cache", "v_cache"}
+    actual_missing = set(missing) - expected_missing
+    if actual_missing:
+        raise RuntimeError(f"Unexpected missing keys in fp32 model: {actual_missing}")
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in fp32 checkpoint: {unexpected}")
     model_f32.eval()
 
     # ── Test inputs ───────────────────────────────────────────────────────────

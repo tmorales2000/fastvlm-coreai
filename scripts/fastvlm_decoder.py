@@ -183,7 +183,7 @@ class FastVLMDecoderStateful(nn.Module):
           1. Load only decoder keys (filter by DECODER_PREFIXES)
           2. Fuse q/k/v -> qkv_proj (_mutate_state_dict, keys still have model. prefix)
           3. Strip model. prefix so keys match PyTorch module hierarchy
-          4. load_state_dict with strict=True
+          4. load_state_dict with strict=False (k_cache/v_cache are buffers, not checkpoint weights)
         """
         model = cls(config).to(dtype=torch.float16)
         weights = _load_decoder_weights(weights_dir)
@@ -194,7 +194,14 @@ class FastVLMDecoderStateful(nn.Module):
         #   model.norm.* -> norm.*
         #   lm_head.* -> lm_head.* (no prefix to strip)
         weights = {k.removeprefix("model."): v for k, v in weights.items()}
-        model.load_state_dict(weights, assign=True, strict=True)
+        missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
+        # k_cache and v_cache are registered buffers, not checkpoint weights
+        expected_missing = {"k_cache", "v_cache"}
+        actual_missing = set(missing) - expected_missing
+        if actual_missing:
+            raise RuntimeError(f"Unexpected missing keys: {actual_missing}")
+        if unexpected:
+            raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected}")
         return model
 
 
