@@ -173,47 +173,78 @@ class FastVLMDecoderStateful(nn.Module):
 
     @classmethod
     def from_weights(cls, config, weights_dir: str) -> "FastVLMDecoderStateful":
-        """Load from SafeTensors weights directory."""
+        """Load from SafeTensors weights directory.
+
+        Decoder weights in Apple's original PyTorch checkpoint live directly at:
+          model.layers.*, model.embed_tokens.*, model.norm.*, lm_head.*
+        There is NO language_model. prefix — confirmed from discovery output.
+
+        Loading steps:
+          1. Load only decoder keys (filter by DECODER_PREFIXES)
+          2. Fuse q/k/v -> qkv_proj (_mutate_state_dict, keys still have model. prefix)
+          3. Strip model. prefix so keys match PyTorch module hierarchy
+          4. load_state_dict with strict=True
+        """
         model = cls(config).to(dtype=torch.float16)
-        weights = _load_safetensors(weights_dir, prefix="language_model.")
+        weights = _load_decoder_weights(weights_dir)
         _mutate_state_dict(weights)
+        # Strip model. prefix so keys match the module hierarchy:
+        #   model.layers.N.* -> layers.N.*
+        #   model.embed_tokens.* -> embed_tokens.*
+        #   model.norm.* -> norm.*
+        #   lm_head.* -> lm_head.* (no prefix to strip)
+        weights = {k.removeprefix("model."): v for k, v in weights.items()}
         model.load_state_dict(weights, assign=True, strict=True)
         return model
 
 
 # ─── Weight loading helpers ───────────────────────────────────────────────────
 
+# Keys that belong to the decoder in Apple's original PyTorch checkpoint.
+# Confirmed from discovery output — no language_model. prefix exists.
+_DECODER_PREFIXES = (
+    "model.layers.",
+    "model.embed_tokens.",
+    "model.norm.",
+    "lm_head.",
+)
 
-def _load_safetensors(
+
+def _load_decoder_weights(
     weights_dir: str,
-    prefix: str = "",
     dtype: torch.dtype = torch.float16,
 ) -> dict[str, torch.Tensor]:
-    """Load SafeTensors files, stripping prefix and casting to dtype."""
+    """Load only decoder weights from SafeTensors, casting bfloat16 -> dtype.
+
+    Filters to DECODER_PREFIXES only — excludes vision tower and projector keys.
+    Weights are stored as bfloat16 in Apple's checkpoint; cast during loading.
+    Embeddings are kept as float32 for precision (skip cast).
+    """
     st_files = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
     result = {}
     for path in st_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():
-                if prefix and not key.startswith(prefix):
+                if not any(key.startswith(p) for p in _DECODER_PREFIXES):
                     continue
-                stripped = key.removeprefix(prefix) if prefix else key
                 t = f.get_tensor(key)
-                # Cast to target dtype except embeddings and quantization params
-                if (
-                    t.dtype != dtype
-                    and "embed" not in key
-                    and "zero_point" not in key
-                ):
+                if t.dtype != dtype and "embed_tokens" not in key:
                     t = t.to(dtype)
-                result[stripped] = t
+                result[key] = t
     return result
 
 
 def _mutate_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
-    """
-    Fuse separate q_proj, k_proj, v_proj -> qkv_proj in-place.
-    Matches the _mutate_state_dict pattern in coreai-models/qwen2.py.
+    """Fuse q_proj, k_proj, v_proj -> qkv_proj in-place.
+
+    Called BEFORE stripping the model. prefix, so keys are still:
+      model.layers.N.self_attn.q_proj.weight  (confirmed from discovery output)
+
+    After fusion, replaces those three keys with:
+      model.layers.N.self_attn.qkv_proj.weight
+      model.layers.N.self_attn.qkv_proj.bias
+
+    The model. prefix is stripped in from_weights() after this call.
     """
     layer_indices = set()
     for k in state_dict:

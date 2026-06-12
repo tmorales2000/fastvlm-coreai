@@ -16,7 +16,7 @@ import torch
 from transformers import AutoConfig
 
 sys.path.insert(0, "scripts")
-from fastvlm_decoder import FastVLMDecoderStateful, MAX_SEQ_LEN, _load_safetensors, _mutate_state_dict
+from fastvlm_decoder import FastVLMDecoderStateful, MAX_SEQ_LEN, _load_decoder_weights, _mutate_state_dict
 
 
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -43,9 +43,7 @@ def verify(variant: str = "1.5b") -> None:
 
     # ── fp32 reference model ──────────────────────────────────────────────────
     print("Loading fp32 reference model...")
-    weights_f32 = _load_safetensors(
-        weights_dir, prefix="language_model.", dtype=torch.float32
-    )
+    weights_f32 = _load_decoder_weights(weights_dir, dtype=torch.float32)
     _mutate_state_dict(weights_f32)
 
     model_f32 = FastVLMDecoderStateful(text_cfg).to(dtype=torch.float32)
