@@ -70,6 +70,12 @@ def discover(model_dir: str, out_file: str | None = None) -> None:
             shape, dtype = weights[k]
             lines.append(f"  {k}: {shape}  [{dtype}]")
 
+    lines.append('\n--- SUMMARY ---')
+    lines.append(f'  Vision tower tensors : {len([k for k in weights if "vision_tower" in k])}')
+    lines.append(f'  MM projector tensors : {len([k for k in weights if "mm_projector" in k])}')
+    lines.append(f'  Decoder tensors      : {len([k for k in weights if not any(p in k for p in ["vision_tower", "mm_projector"])])}')
+    lines.append(f'  All dtypes           : {set(d for _, d in weights.values())}')
+
     output = "\n".join(lines)
     print(output)
     if out_file:
