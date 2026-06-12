@@ -45,6 +45,7 @@ def verify(variant: str = "1.5b") -> None:
     print("Loading fp32 reference model...")
     weights_f32 = _load_decoder_weights(weights_dir, dtype=torch.float32)
     _mutate_state_dict(weights_f32)
+    weights_f32 = {k.removeprefix("model."): v for k, v in weights_f32.items()}
 
     model_f32 = FastVLMDecoderStateful(text_cfg).to(dtype=torch.float32)
     missing, unexpected = model_f32.load_state_dict(weights_f32, assign=True, strict=False)
