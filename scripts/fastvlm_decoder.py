@@ -235,7 +235,7 @@ def _load_decoder_weights(
                 if not any(key.startswith(p) for p in _DECODER_PREFIXES):
                     continue
                 t = f.get_tensor(key)
-                if t.dtype != dtype and "embed_tokens" not in key:
+                if t.dtype != dtype:
                     t = t.to(dtype)
                 result[key] = t
     return result
