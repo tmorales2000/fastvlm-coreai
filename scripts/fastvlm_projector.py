@@ -58,8 +58,8 @@ class FastVLMProjector(nn.Module):
                     # Strip top-level prefix (e.g. "model.mm_projector.layers.0.weight"
                     # → "layers.0.weight") to match self.layers.N.weight
                     stripped = key
-                    for remove in ["model.", "mm_projector."]:
-                        stripped = stripped.replace(remove, "")
+                    stripped = key.removeprefix("model.mm_projector.")
+                    stripped = "layers." + stripped
                     t = f.get_tensor(key)
                     if t.dtype != torch.float16:
                         t = t.to(torch.float16)

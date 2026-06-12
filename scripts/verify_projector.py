@@ -47,9 +47,7 @@ def verify(variant: str = "1.5b") -> None:
             for key in f.keys():
                 if "mm_projector" not in key:
                     continue
-                stripped = key
-                for r in ["model.", "mm_projector."]:
-                    stripped = stripped.replace(r, "")
+                stripped = "layers." + key.removeprefix("model.mm_projector.")
                 weights_f32[stripped] = f.get_tensor(key).float()
     model_f32.load_state_dict(weights_f32, assign=True, strict=True)
     model_f32.eval()
