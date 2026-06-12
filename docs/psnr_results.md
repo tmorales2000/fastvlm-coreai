@@ -12,7 +12,7 @@ PSNR thresholds:
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
-| Decoder re-authored fp16 vs fp32 | TBD | — | |
+| Decoder re-authored fp16 vs fp32 | 61.8 dB | ✓ | |
 | Vision encoder re-authored fp16 vs fp32 | TBD | — | |
 | Projector re-authored fp16 vs fp32 | TBD | — | |
 | Python runtime (macOS) vs fp32 | TBD | — | |
