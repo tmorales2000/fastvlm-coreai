@@ -14,7 +14,7 @@ PSNR thresholds:
 |-------|------|-------|-------|
 | Decoder re-authored fp16 vs fp32 | 61.8 dB | ✓ | |
 | Vision encoder re-authored fp16 vs fp32 | TBD | — | |
-| Projector re-authored fp16 vs fp32 | TBD | — | |
+| Projector re-authored fp16 vs fp32 | 90.9 dB | ✓ | |
 | Python runtime (macOS) vs fp32 | TBD | — | |
 | After palettization vs fp16 (iOS) | TBD | — | |
 | Compiled iOS on-device vs fp32 | TBD | — | |
