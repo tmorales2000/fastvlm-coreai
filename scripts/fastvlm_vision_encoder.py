@@ -25,7 +25,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from coreai_torch.composite_ops import SDPA
 from safetensors import safe_open
-from timm.models import create_model
 from functools import partial
 
 # Add weights directory to path so llava_qwen.py can be imported for fastvithd registration
@@ -112,15 +111,8 @@ class ANEAttention(nn.Module):
 # ─── Patch functions ──────────────────────────────────────────────────────────
 
 
-def _patch_layernorm(model: nn.Module) -> None:
+def _patch_layernorm(model: nn.Module, LayerNormChannel) -> None:
     """Replace all LayerNormChannel instances with ANELayerNorm in-place."""
-    # Import LayerNormChannel from llava_qwen
-    sys.path.insert(0, "weights/fastvlm-1.5b")
-    try:
-        from llava_qwen import LayerNormChannel
-    finally:
-        sys.path.pop(0)
-
     for name, module in model.named_modules():
         if isinstance(module, LayerNormChannel):
             # Navigate to parent and replace
@@ -138,14 +130,8 @@ def _patch_layernorm(model: nn.Module) -> None:
             setattr(parent, parts[-1], replacement)
 
 
-def _patch_attention(model: nn.Module) -> None:
+def _patch_attention(model: nn.Module, MHSA) -> None:
     """Replace all MHSA instances with ANEAttention in-place."""
-    sys.path.insert(0, "weights/fastvlm-1.5b")
-    try:
-        from llava_qwen import MHSA
-    finally:
-        sys.path.pop(0)
-
     for name, module in model.named_modules():
         if isinstance(module, MHSA):
             parts = name.split(".")
@@ -180,24 +166,28 @@ class FastVLMVisionEncoder(nn.Module):
     def __init__(self, weights_dir: str) -> None:
         super().__init__()
 
-        # Register fastvithd with timm by importing llava_qwen.py
+        # Import llava_qwen to get FastViT, LayerNormChannel, MHSA classes
         sys.path.insert(0, weights_dir)
         try:
-            import llava_qwen  # noqa: F401 — side effect: registers fastvithd
+            import llava_qwen
         finally:
             sys.path.pop(0)
 
-        # Instantiate FastViTHD in inference mode (weights already reparameterized)
-        from timm.models import create_model
-        self.model = create_model(
-            "fastvithd",
-            pretrained=False,
+        # Instantiate FastViTHD directly — create_model via timm returns empty model
+        # Config matches fastvithd() function in llava_qwen.py lines 1493-1519
+        self.model = llava_qwen.FastViT(
+            layers=[2, 12, 24, 4, 2],
+            embed_dims=[96, 192, 384, 768, 1536],
+            mlp_ratios=[4, 4, 4, 4, 4],
+            downsamples=[True, True, True, True, True],
+            token_mixers=["repmixer", "repmixer", "repmixer", "attention", "attention"],
+            norm_layer=llava_qwen.LayerNormChannel,
             inference_mode=True,
         )
 
-        # Patch for ANE compatibility
-        _patch_layernorm(self.model)
-        _patch_attention(self.model)
+        # Patch for ANE compatibility — pass classes to avoid re-importing llava_qwen
+        _patch_layernorm(self.model, llava_qwen.LayerNormChannel)
+        _patch_attention(self.model, llava_qwen.MHSA)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """

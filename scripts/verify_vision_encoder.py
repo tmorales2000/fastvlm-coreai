@@ -31,7 +31,7 @@ def verify(variant: str = "1.5b") -> None:
     print(f"Verifying vision encoder for {variant}")
 
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
-    image_size = config.vision_config.image_size
+    image_size = int(config.mm_vision_tower.split("_")[-1])
     print(f"Image size: {image_size}x{image_size}")
 
     # ── fp16 model ────────────────────────────────────────────────────────────
