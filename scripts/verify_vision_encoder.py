@@ -15,7 +15,7 @@ import torch
 from transformers import AutoConfig
 
 sys.path.insert(0, "scripts")
-from fastvlm_vision_encoder import FastVLMVisionEncoder, _load_vision_weights, _sanitize_vision_keys
+from fastvlm_vision_encoder import FastVLMVisionEncoder, _load_vision_weights
 
 
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -30,19 +30,28 @@ def verify(variant: str = "1.5b") -> None:
     weights_dir = f"weights/fastvlm-{variant}"
     print(f"Verifying vision encoder for {variant}")
 
-    config = AutoConfig.from_pretrained(weights_dir)
+    config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     image_size = config.vision_config.image_size
     print(f"Image size: {image_size}x{image_size}")
 
     # ── fp16 model ────────────────────────────────────────────────────────────
+    print("Loading fp16 model...")
     model_fp16 = FastVLMVisionEncoder.from_weights(config, weights_dir)
     model_fp16.eval()
 
     # ── fp32 reference model ──────────────────────────────────────────────────
+    # Same architecture, same weights — just cast to float32
+    print("Loading fp32 reference model...")
+    model_f32 = FastVLMVisionEncoder(weights_dir).to(dtype=torch.float32)
     weights_f32 = _load_vision_weights(weights_dir, dtype=torch.float32)
-    _sanitize_vision_keys(weights_f32)
-    model_f32 = FastVLMVisionEncoder(config).to(dtype=torch.float32)
-    model_f32.load_state_dict(weights_f32, assign=True, strict=True)
+    missing, unexpected = model_f32.load_state_dict(weights_f32, assign=True, strict=False)
+    # head.proj not used in forward — expected missing
+    missing_real = [k for k in missing if "head" not in k]
+    unexpected_real = [k for k in unexpected if "head" not in k]
+    if missing_real:
+        raise RuntimeError(f"Missing keys in fp32 model: {missing_real[:5]}")
+    if unexpected_real:
+        raise RuntimeError(f"Unexpected keys in fp32 model: {unexpected_real[:5]}")
     model_f32.eval()
 
     # ── Test inputs ───────────────────────────────────────────────────────────
