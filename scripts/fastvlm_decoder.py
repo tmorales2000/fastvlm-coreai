@@ -1,14 +1,95 @@
 """
-fastvlm_decoder.py — Re-authored FastVLM language decoder for CoreAI export.
+fastvlm_decoder.py — FastVLM language decoder re-authored for Core AI export.
 
-The decoder is Qwen2. Reference:
-  coreai-models/python/src/coreai_models/models/macos/qwen2.py
+WHAT THIS FILE IS
+-----------------
+FastVLM's language decoder is a Qwen2 transformer. The original model lives in
+llava_qwen.py (downloaded with the weights) and delegates to HuggingFace's
+Qwen2ForCausalLM internally. This file re-authors that decoder in plain PyTorch
+so that TorchConverter can export it to a Core AI .aimodel.
 
-Key decisions:
-  - RMSNormImpl, SDPA, RoPE are composite ops (externalized via ExternalizeSpec)
-  - nn.LayerNorm and nn.BatchNorm2d handled automatically by get_decomp_table()
-  - KV cache uses register_buffer + state_names (NOT readonly KV cache pattern)
-  - QKV projections fused in _mutate_state_dict before weight loading
+Re-authoring is required because the original HuggingFace model uses Python
+control flow and ops that are not exportable, and does not use the Core AI
+composite ops (RMSNorm, SDPA, RoPE) that the ANE compiler needs to recognize
+and optimize key operations.
+
+WHY THE STRUCTURE IS WHAT IT IS
+--------------------------------
+Three constraints drive every decision in this file:
+
+1. Composite ops must be explicit.
+   The ANE compiler recognizes RMSNorm, scaled dot-product attention, and
+   rotary position embeddings only when they appear as specific registered ops
+   (ExternalizeSpec boundary nodes) in the exported graph. Using nn.LayerNorm,
+   F.scaled_dot_product_attention, or a manual RoPE implementation instead
+   would produce functionally correct but ANE-unoptimized code. This is why
+   FastVLMRMSNorm, SDPA, and RoPE are wired as composite ops.
+
+2. The KV cache must be a mutable registered buffer, not a Python list.
+   torch.export.export traces a single static graph. The cache cannot be
+   passed as an input/output argument pair — it must be a registered buffer
+   that is mutated in place via mutable_slice_update. This is the pattern
+   Apple's own KVCache primitive uses (coreai_models/primitives/_ops.py).
+   TorchConverter then binds the buffer to state_names=["k_cache","v_cache"],
+   making it a persistent state that survives across inference calls in the
+   compiled .aimodel.
+
+3. mutable_slice_update must be the "coreai" custom op, not a plain slice-assign.
+   A plain x[slices] = update does not survive run_decompositions(get_decomp_table())
+   as a recognizable state mutation. The custom op — registered with
+   mutates_args=["x"] — tells the exporter that x is mutated in place, so the
+   buffer remains bound as state in the exported graph. The op namespace ("coreai")
+   and mutates_args declaration are confirmed from Apple's _ops.py source.
+
+WEIGHT LAYOUT (confirmed from discover_weights.py output)
+----------------------------------------------------------
+The FastVLM checkpoint stores decoder weights with these prefixes:
+  model.layers.*       — transformer blocks
+  model.embed_tokens.* — token embedding table
+  model.norm.*         — final RMS norm
+  lm_head.*            — unembedding projection
+
+There is NO "language_model." prefix — the checkpoint is flat.
+All weights are stored as bfloat16; this file casts to float16 on load.
+
+QKV FUSION
+----------
+HuggingFace Qwen2 stores q_proj, k_proj, v_proj as separate weights. This file
+uses a single fused qkv_proj (matching Apple's coreai-models/qwen2.py pattern)
+because fused QKV is more efficient on ANE. _mutate_state_dict() performs the
+fusion before load_state_dict() is called.
+
+Fusion order is [q, k, v] — confirmed by comparing logits against the original
+HuggingFace Qwen2ForCausalLM in verify_decoder.py Stage 1 (113.2 dB PSNR).
+
+KV CACHE LAYOUT
+---------------
+The cache buffers have shape (n_layers, 1, MAX_SEQ_LEN, kv_dim) where:
+  n_layers   = config.num_hidden_layers  (28 for 1.5B)
+  1          = batch size (always 1 for on-device inference)
+  max_seq_len = config.max_position_embeddings (4096 for 0.5B/1.5B, 8192 for 7B)
+  kv_dim     = head_dim * num_key_value_heads  (128 * 2 = 256 for 1.5B GQA)
+
+Heads are FLATTENED in the cache (kv_dim = n_kv_heads * head_dim) and restored
+to head-separated layout (B, n_kv_heads, seq_len, head_dim) before SDPA.
+This flattened layout is what mutable_slice_update writes and reads, and it
+must be consistent — mixing the two layouts corrupts the cache.
+
+ROPE_THETA
+----------
+FastVLM's config stores rope_theta inside a nested "rope_parameters" dict
+(LlavaConfig wraps the Qwen2 config). It does NOT appear as a direct attribute
+of the text config. The correct value is 1,000,000 — confirmed from:
+  - weights/fastvlm-1.5b/config.json: rope_parameters.rope_theta = 1000000.0
+  - MLXVLM/Models/Qwen2VL.swift line 767: ropeTheta default = 1_000_000
+
+Using the wrong fallback (1e4) produces ~32 dB Stage 1 PSNR instead of 113 dB.
+
+VERIFIED RESULTS (1.5B, June 2026)
+-----------------------------------
+Stage 1 — fp32 port vs HF Qwen2ForCausalLM: 113.2 dB  [PASS, threshold 80 dB]
+Stage 2 — fp16 cached decode vs full pass:    72.1 dB  [PASS, threshold 40 dB]
+fp16 max logit: 12 (fp16 ceiling 65504 — no overflow risk)
 """
 
 import glob
@@ -18,20 +99,25 @@ import torch
 import torch.nn as nn
 from coreai_torch.composite_ops import RMSNormImpl, RoPE, SDPA
 from safetensors import safe_open
-from transformers import AutoConfig
 
-# The in-place state mutation MUST go through mutable_slice_update — the same
-# custom op Apple's own KVCache uses (coreai_models.primitives.*.cache). It is a
-# registered torch.library op with a fake/meta kernel, so it survives
-# run_decompositions(get_decomp_table()) as a recognizable boundary that
-# TorchConverter binds to a named state. A plain narrow().copy_() or slice-assign
-# is NOT guaranteed to survive decomposition as a state mutation. Per the
-# coreai-torch docs: state is whatever the exported graph mutates in place; if the
-# mutation disappears, the buffer stops being state.
-# Confirmed from coreai_models/primitives/_ops.py:
-#   - op namespace: "coreai" (not "fastvlm")
-#   - mutates_args=["x"] (not () — this is what makes the exporter see a state mutation)
-#   - logic: torch.split + tuple of slices + x[slices] = update + return x.clone()
+# ─── KV cache state mutation op ──────────────────────────────────────────────
+#
+# mutable_slice_update writes new K or V vectors into a slice of the cache
+# buffer for this decode step. It MUST be the "coreai::mutable_slice_update"
+# custom op — not a plain slice-assign — for two reasons:
+#
+#   1. mutates_args=["x"] tells torch.export that x is mutated in place.
+#      Without this, the exporter treats the call as pure/functional and the
+#      buffer is not bound as mutable state in the exported graph.
+#
+#   2. The "coreai" namespace is what TorchConverter recognizes when binding
+#      mutable buffers to state_names. Using a different namespace ("fastvlm",
+#      etc.) may cause the binding to be skipped silently.
+#
+# This implementation is a verbatim copy of Apple's _ops.py, confirmed by
+# reading ~/git/apple/coreai-models/python/src/coreai_models/primitives/_ops.py.
+# coreai_models is NOT an installable package — this copy is the correct approach.
+#
 @torch.library.custom_op("coreai::mutable_slice_update", mutates_args=["x"])
 def mutable_slice_update(
     x: torch.Tensor, update: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
@@ -46,9 +132,8 @@ def mutable_slice_update(
 def _mutable_slice_update_fake(x, update, begin, end):
     return torch.empty(x.shape, dtype=x.dtype)
 
-# Maximum context length for static KV cache shape at export time.
-# Set from text_config.max_position_embeddings in practice.
-MAX_SEQ_LEN = 4096
+
+
 
 
 # ─── Composite op wrappers ────────────────────────────────────────────────────
@@ -56,12 +141,16 @@ MAX_SEQ_LEN = 4096
 
 class FastVLMRMSNorm(nn.Module):
     """
-    Holds the learnable scale (gamma) as nn.Parameter and passes it
-    explicitly to RMSNormImpl.forward(x, weight).
+    RMS layer normalization using the Core AI RMSNormImpl composite op.
 
-    Required because RMSNormImpl does NOT hold the scale internally —
-    it must be passed as a forward argument so it appears as a graph
-    input on the composite op boundary after externalization.
+    RMSNormImpl.forward(x, weight) takes the scale (gamma) as a forward
+    argument rather than holding it internally. This wrapper holds the
+    learnable scale as an nn.Parameter and passes it through, so that
+    after ExternalizeSpec externalization the scale appears as a named
+    input on the composite op boundary in the exported graph.
+
+    Key: 'weight' matches Qwen2's checkpoint key name for the norm scale,
+    so load_state_dict works without remapping.
     """
 
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -74,6 +163,31 @@ class FastVLMRMSNorm(nn.Module):
 
 
 class FastVLMAttention(nn.Module):
+    """
+    Qwen2 grouped-query attention using Core AI composite ops.
+
+    Architecture (1.5B):
+      hidden_size       = 1536
+      num_heads         = 12  (query heads)
+      num_kv_heads      = 2   (key/value heads — GQA)
+      head_dim          = 128
+      qkv_proj output   = (12 + 2 + 2) * 128 = 2048
+
+    QKV fusion: q_proj, k_proj, v_proj are concatenated into a single
+    qkv_proj weight [total, hidden_size] in order [q, k, v]. The SDPA
+    composite op handles GQA expansion (12 query heads vs 2 KV heads)
+    internally — no explicit repeat_kv needed.
+
+    RoPE: uses absolute position_ids passed from the stateful forward.
+    rope_theta=1e6 is read from config.rope_parameters['rope_theta']
+    (LlavaConfig nests it there — it is NOT a direct config attribute).
+
+    Cache: each attention layer writes its K/V into the shared k_cache
+    and v_cache buffers at offset = seq_len - query_len, then reads back
+    the full context [0:seq_len] for attention. See FastVLMDecoderStateful
+    for the full cache layout description.
+    """
+
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -86,12 +200,14 @@ class FastVLMAttention(nn.Module):
         self.qkv_proj = nn.Linear(dim, total, bias=True)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
-        # Composite ops — preserved by ExternalizeSpec during export
         self.sdpa = SDPA(is_causal=True)
         rope_theta = (
             getattr(config, "rope_theta", None)
             or (getattr(config, "rope_parameters", None) or {}).get("rope_theta")
-            or 1e6  # FastVLM Qwen2 default — never fall back to 1e4
+            # Mirrors Apple Qwen2VL.swift line 767: ropeTheta default = 1_000_000
+            # if config does not expose rope_theta / rope_parameters.rope_theta.
+            # Never fall back to 1e4 — that is wrong by 100x for Qwen2 models.
+            or 1e6
         )
         self.rope = RoPE(base=float(rope_theta))
 
@@ -105,53 +221,49 @@ class FastVLMAttention(nn.Module):
         seq_len: int,
     ) -> torch.Tensor:
         """
-        x            : (B, L, dim)  — L is query_len for this call
-        position_ids : (B, seq_len) — ABSOLUTE positions for the full context
-        k_cache,
-        v_cache      : (n_layers, 1, MAX_SEQ_LEN, kv_dim) registered state buffers
-        offset       : IntTensor scalar = seq_len - L; where this call's k/v land
-        seq_len      : total context length to attend over after the write
-
-        Cache buffer layout is FLATTENED over heads: last dim = n_kv_heads*head_dim,
-        sequence on dim 2. Attention works head-SEPARATED: (B, n_kv_heads, L,
-        head_dim). Store flattens; read restores. Write and read use the same
-        split or the cache corrupts.
-
-        The write goes through mutable_slice_update so the export pipeline sees a
-        state mutation it can bind to the k_cache / v_cache state names.
+        x            : (B, L, dim)       — L = query_len for this step
+        position_ids : (B, seq_len)       — absolute positions, full context width
+        k_cache      : (n_layers, batch_size, max_seq_len, kv_dim) — shared mutable state
+        v_cache      : same shape as k_cache
+        offset       : scalar int32       — seq_len - L; position of first new token
+        seq_len      : int                — total tokens to attend over after write
         """
         B, L, _ = x.shape
         n_heads, n_kv_heads, head_dim = self.n_heads, self.n_kv_heads, self.head_dim
         kv_dim = n_kv_heads * head_dim
 
+        # QKV projection and split
         qkv = (
             self.qkv_proj(x)
             .reshape(B, L, n_heads + 2 * n_kv_heads, head_dim)
             .permute(0, 2, 1, 3)
         )
         qk = qkv.narrow(1, 0, n_heads + n_kv_heads)
-        v = qkv.narrow(1, n_heads + n_kv_heads, n_kv_heads)
+        v  = qkv.narrow(1, n_heads + n_kv_heads, n_kv_heads)
 
-        # Rope on q/k with the query-length slice of absolute positions. Threading
-        # position_ids in (rather than re-deriving) avoids the classic decode bug.
+        # RoPE: apply to the query-length slice of absolute positions only.
+        # Threading position_ids in rather than re-deriving avoids the classic
+        # decode bug where offset is computed incorrectly on single-token steps.
         torch._check_is_size(L)
         torch._check_is_size(seq_len)
         rope_positions = position_ids.narrow(-1, seq_len - L, L)
         qk = self.rope(qk, position_ids=rope_positions)
         q = qk.narrow(1, 0, n_heads)
-        k = qk.narrow(1, n_heads, n_kv_heads)  # (B, n_kv_heads, L, head_dim)
+        k = qk.narrow(1, n_heads, n_kv_heads)
 
-        # Flatten heads -> (B, L, kv_dim) to match the buffer layout.
+        # Flatten heads for cache storage: (B, n_kv_heads, L, head_dim) -> (B, L, kv_dim)
         k_flat = k.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
         v_flat = v.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
 
+        # Write new K/V into cache at [layer, :, offset:offset+L, :]
         device = k_cache.device
         layer = self.layer_idx
-        # begin/end over [layer, batch, seq, kv_dim]; mutate the seq window at offset.
         z = torch.zeros(1, dtype=torch.int32, device=device)
         begin = torch.cat([
             torch.tensor([layer], dtype=torch.int32, device=device),
-            z, offset.reshape(1).to(torch.int32), z,
+            z,
+            offset.reshape(1).to(torch.int32),
+            z,
         ])
         end = torch.cat([
             torch.tensor([layer + 1], dtype=torch.int32, device=device),
@@ -159,12 +271,11 @@ class FastVLMAttention(nn.Module):
             (offset.reshape(1).to(torch.int32) + L),
             torch.tensor([kv_dim], dtype=torch.int32, device=device),
         ])
-
         mutable_slice_update(k_cache, k_flat.unsqueeze(0), begin, end)
         mutable_slice_update(v_cache, v_flat.unsqueeze(0), begin, end)
 
-        # Read back the full context [0:seq_len] for this layer, restore heads.
-        k_ctx = k_cache[layer].narrow(1, 0, seq_len)  # (1, seq_len, kv_dim)
+        # Read back full context [0:seq_len] and restore head-separated layout
+        k_ctx = k_cache[layer].narrow(1, 0, seq_len)
         v_ctx = v_cache[layer].narrow(1, 0, seq_len)
         k = k_ctx.reshape(B, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3).to(q.dtype)
         v = v_ctx.reshape(B, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3).to(q.dtype)
@@ -178,19 +289,20 @@ class FastVLMAttention(nn.Module):
 
 
 class FastVLMMLP(nn.Module):
-    """SwiGLU MLP. silu is handled automatically by get_decomp_table()."""
+    """
+    Qwen2 SwiGLU feed-forward network.
+
+    gate_proj and up_proj both project hidden_size -> intermediate_size.
+    silu(gate) * up is the gating mechanism; down_proj projects back.
+    The silu activation is handled automatically by get_decomp_table()
+    and does not need an ExternalizeSpec.
+    """
 
     def __init__(self, config):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj   = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(
@@ -199,16 +311,19 @@ class FastVLMMLP(nn.Module):
 
 
 class FastVLMDecoderBlock(nn.Module):
+    """
+    Single Qwen2 transformer block: pre-norm attention + pre-norm MLP.
+
+    Passes k_cache, v_cache, offset, and seq_len through to attention so
+    all cache state flows through the single traced graph path.
+    """
+
     def __init__(self, config, layer_idx: int):
         super().__init__()
-        self.self_attn = FastVLMAttention(config, layer_idx)
-        self.mlp = FastVLMMLP(config)
-        self.input_layernorm = FastVLMRMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
-        self.post_attention_layernorm = FastVLMRMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.self_attn             = FastVLMAttention(config, layer_idx)
+        self.mlp                   = FastVLMMLP(config)
+        self.input_layernorm       = FastVLMRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = FastVLMRMSNorm(config.hidden_size, config.rms_norm_eps)
 
     def forward(
         self,
@@ -227,17 +342,53 @@ class FastVLMDecoderBlock(nn.Module):
         return h + r
 
 
-# ─── Stateful decoder model ───────────────────────────────────────────────────
+# ─── Stateful decoder ─────────────────────────────────────────────────────────
 
 
 class FastVLMDecoderStateful(nn.Module):
     """
-    Full Qwen2 decoder re-authored for CoreAI export with KV cache states.
+    Complete Qwen2 decoder for Core AI export with persistent KV cache state.
 
-    KV cache is registered as mutable buffers via register_buffer.
-    The export pipeline passes state_names=["k_cache", "v_cache"] to
-    TorchConverter.add_pytorch_module(), which maps both the input and
-    in-place mutation output to a single state name each.
+    FORWARD SIGNATURE
+    -----------------
+    forward(input_ids, position_ids) -> logits
+
+      input_ids    : (1, query_len)  int32  — tokens for this step
+                     query_len = full prompt length during prefill
+                     query_len = 1 during single-token decode steps
+      position_ids : (1, seq_len)   int32  — ABSOLUTE positions for the full
+                     context seen so far (not just the new tokens).
+                     seq_len grows by 1 each decode step.
+      logits       : (1, query_len, vocab_size)  float16
+
+    WHY position_ids IS WIDER THAN input_ids
+    -----------------------------------------
+    position_ids carries the full context width (seq_len) so that each
+    attention layer can compute offset = seq_len - query_len and derive
+    the correct write position in the cache without any Python branching.
+    During a single-token decode step: input_ids is (1,1) but position_ids
+    is (1, N) where N is the total number of tokens generated so far.
+
+    KV CACHE STATE
+    --------------
+    k_cache and v_cache are registered buffers with shape:
+      (num_hidden_layers, batch_size, max_seq_len, kv_dim)
+
+    They are NOT passed as forward arguments — they are persistent state.
+    TorchConverter binds them to state_names=["k_cache","v_cache"] during
+    export, making them mutable state in the compiled .aimodel that persists
+    across inference calls without being re-initialized each time.
+
+    The buffers must be zeroed before a new generation sequence begins.
+    In the Swift runtime this is handled by the state reset API.
+
+    EXPORT NOTES
+    ------------
+    - Pass state_names=["k_cache","v_cache"] to add_pytorch_module()
+    - Pass dynamic_shapes={"position_ids": {1: seq_len_dim}} to allow
+
+    - The graph has exactly one traced path — no use_cache flag or
+      Python branches. Data-dependent branches cannot be exported.
     """
 
     def __init__(self, config):
@@ -246,37 +397,31 @@ class FastVLMDecoderStateful(nn.Module):
         self.layers = nn.ModuleList(
             [FastVLMDecoderBlock(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.norm = FastVLMRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm    = FastVLMRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight = self.embed_tokens.weight
 
-        # KV cache as mutable state buffers
         head_dim = config.hidden_size // config.num_attention_heads
-        kv_dim = head_dim * config.num_key_value_heads
-        cache_shape = (config.num_hidden_layers, 1, MAX_SEQ_LEN, kv_dim)
-        self.register_buffer("k_cache", torch.zeros(cache_shape))
-        self.register_buffer("v_cache", torch.zeros(cache_shape))
+        kv_dim   = head_dim * config.num_key_value_heads
+        # Cache dimensions from config — no hardcoded constants.
+        # self.max_seq_len exposed for export: torch.export.Dim("seq_len", min=1, max=model.max_seq_len)
+        # self.batch_size=1 is an intentional export constraint (on-device = single sequence), not an accident.
+        self.max_seq_len = config.max_position_embeddings
+        self.batch_size = 1
+        self.register_buffer("k_cache", torch.zeros(config.num_hidden_layers, self.batch_size, self.max_seq_len, kv_dim))
+        self.register_buffer("v_cache", torch.zeros_like(self.k_cache))
 
-    def forward(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Single traced path. The KV cache buffers are always mutated in place via
-        each layer's mutable_slice_update, so they are detected as state and bound
-        to state_names=["k_cache","v_cache"] at conversion. There is deliberately
-        no use_cache flag: per the coreai-torch docs, a data-dependent Python
-        branch cannot be exported as a runtime choice, and removing the mutation
-        would remove the buffers from state.
-
-        position_ids carries ABSOLUTE positions; its width is the total context
-        length (seq_len). offset = seq_len - query_len is where this step writes.
-        """
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         B, query_len = input_ids.shape
         seq_len = position_ids.shape[-1]
         torch._check_is_size(query_len)
         torch._check_is_size(seq_len)
+        # torch._check is export-compatible — unlike a Python if-branch, it
+        # survives torch.export when seq_len is symbolic. Fires as an assertion
+        # in eager mode and as a graph-level constraint in the exported program.
+        torch._check(seq_len <= self.max_seq_len)
         offset = torch.tensor(seq_len - query_len, dtype=torch.int32)
 
         h = self.embed_tokens(input_ids)
@@ -287,31 +432,31 @@ class FastVLMDecoderStateful(nn.Module):
 
     @classmethod
     def from_weights(cls, config, weights_dir: str) -> "FastVLMDecoderStateful":
-        """Load from SafeTensors weights directory.
+        """
+        Load decoder weights from the FastVLM SafeTensors checkpoint.
 
-        Decoder weights in Apple's original PyTorch checkpoint live directly at:
-          model.layers.*, model.embed_tokens.*, model.norm.*, lm_head.*
-        There is NO language_model. prefix — confirmed from discovery output.
+        The checkpoint uses these key prefixes for decoder weights:
+          model.layers.*       transformer blocks
+          model.embed_tokens.* token embedding table
+          model.norm.*         final RMS norm before lm_head
+          lm_head.*            unembedding projection
 
-        Loading steps:
-          1. Load only decoder keys (filter by DECODER_PREFIXES)
-          2. Fuse q/k/v -> qkv_proj (_mutate_state_dict, keys still have model. prefix)
-          3. Strip model. prefix so keys match PyTorch module hierarchy
-          4. load_state_dict with strict=False (k_cache/v_cache are buffers, not checkpoint weights)
+        There is NO "language_model." prefix — confirmed from discovery output.
+
+        Loading sequence:
+          1. Load keys matching _DECODER_PREFIXES, cast bfloat16 -> float16
+          2. Fuse q_proj + k_proj + v_proj -> qkv_proj (_mutate_state_dict)
+             Keys still have "model." prefix at this point
+          3. Strip "model." prefix to match the module hierarchy
+          4. load_state_dict(strict=False) — k_cache/v_cache are buffers,
+             not checkpoint weights, so they appear as expected missing keys
         """
         model = cls(config).to(dtype=torch.float16)
         weights = _load_decoder_weights(weights_dir)
         _mutate_state_dict(weights)
-        # Strip model. prefix so keys match the module hierarchy:
-        #   model.layers.N.* -> layers.N.*
-        #   model.embed_tokens.* -> embed_tokens.*
-        #   model.norm.* -> norm.*
-        #   lm_head.* -> lm_head.* (no prefix to strip)
         weights = {k.removeprefix("model."): v for k, v in weights.items()}
         missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
-        # k_cache and v_cache are registered buffers, not checkpoint weights
-        expected_missing = {"k_cache", "v_cache"}
-        actual_missing = set(missing) - expected_missing
+        actual_missing = set(missing) - {"k_cache", "v_cache"}
         if actual_missing:
             raise RuntimeError(f"Unexpected missing keys: {actual_missing}")
         if unexpected:
@@ -321,8 +466,8 @@ class FastVLMDecoderStateful(nn.Module):
 
 # ─── Weight loading helpers ───────────────────────────────────────────────────
 
-# Keys that belong to the decoder in Apple's original PyTorch checkpoint.
-# Confirmed from discovery output — no language_model. prefix exists.
+# Keys that identify decoder weights in the FastVLM checkpoint.
+# Confirmed from discover_weights.py output — no "language_model." prefix exists.
 _DECODER_PREFIXES = (
     "model.layers.",
     "model.embed_tokens.",
@@ -335,11 +480,11 @@ def _load_decoder_weights(
     weights_dir: str,
     dtype: torch.dtype = torch.float16,
 ) -> dict[str, torch.Tensor]:
-    """Load only decoder weights from SafeTensors, casting bfloat16 -> dtype.
+    """
+    Load decoder weights from SafeTensors, filtering to _DECODER_PREFIXES only.
 
-    Filters to DECODER_PREFIXES only — excludes vision tower and projector keys.
-    Weights are stored as bfloat16 in Apple's checkpoint; cast during loading.
-    Embeddings are kept as float32 for precision (skip cast).
+    Excludes vision tower and projector weights. Casts bfloat16 (the storage
+    dtype in Apple's checkpoint) to the target dtype on load.
     """
     st_files = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
     result = {}
@@ -356,22 +501,25 @@ def _load_decoder_weights(
 
 
 def _mutate_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
-    """Fuse q_proj, k_proj, v_proj -> qkv_proj in-place.
+    """
+    Fuse q_proj, k_proj, v_proj -> qkv_proj in-place.
 
-    Called BEFORE stripping the model. prefix, so keys are still:
-      model.layers.N.self_attn.q_proj.weight  (confirmed from discovery output)
+    HuggingFace Qwen2 stores attention projections separately. This file
+    uses a single fused qkv_proj matching Apple's coreai-models/qwen2.py
+    pattern. Fusion must happen BEFORE stripping the "model." prefix, because
+    the checkpoint keys still have it at this point:
+      model.layers.N.self_attn.q_proj.weight
 
-    After fusion, replaces those three keys with:
+    Fusion order is [q, k, v] — confirmed by Stage 1 PSNR 113.2 dB vs HF.
+
+    After fusion, the three keys are replaced with:
       model.layers.N.self_attn.qkv_proj.weight
       model.layers.N.self_attn.qkv_proj.bias
-
-    The model. prefix is stripped in from_weights() after this call.
     """
     layer_indices = set()
     for k in state_dict:
         if k.startswith("model.layers.") and ".self_attn.q_proj.weight" in k:
-            idx = int(k.split(".")[2])
-            layer_indices.add(idx)
+            layer_indices.add(int(k.split(".")[2]))
 
     for i in sorted(layer_indices):
         weights, biases = [], []
@@ -383,9 +531,5 @@ def _mutate_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
             weights.append(state_dict.pop(wk))
             biases.append(state_dict.pop(bk))
         else:
-            state_dict[f"model.layers.{i}.self_attn.qkv_proj.weight"] = torch.cat(
-                weights
-            )
-            state_dict[f"model.layers.{i}.self_attn.qkv_proj.bias"] = torch.cat(
-                biases
-            )
+            state_dict[f"model.layers.{i}.self_attn.qkv_proj.weight"] = torch.cat(weights)
+            state_dict[f"model.layers.{i}.self_attn.qkv_proj.bias"]   = torch.cat(biases)

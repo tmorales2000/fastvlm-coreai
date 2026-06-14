@@ -47,10 +47,16 @@ from fastvlm_decoder import (  # noqa: E402
     _mutate_state_dict,
 )
 
-# Pass thresholds (dB). fp32 cross-model should be high; fp16 looser.
-CORRECTNESS_PASS = 80.0
-CORRECTNESS_MARGINAL = 50.0
-CACHE_PASS = 40.0
+# Pass thresholds (dB). Engineering judgments, not Apple specifications.
+# See module docstring for rationale.
+CORRECTNESS_PASS     = 80.0   # fp32 cross-model; we achieve ~113 dB
+CORRECTNESS_MARGINAL = 50.0   # below here is definitely wrong
+CACHE_PASS           = 40.0   # fp16 cached decode; we achieve ~72 dB
+
+# fp16 range is 0..65504. Flag logits above this as overflow risk.
+# 60000 gives ~8% headroom below the ceiling — enough to catch runaway
+# activations before they produce Inf on the next arithmetic step.
+FP16_OVERFLOW_THRESHOLD = 60000.0
 
 
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -224,7 +230,7 @@ def stage_cache(text_cfg, weights_dir: str, n_prefill: int, n_decode: int) -> bo
     has_inf = torch.isinf(cached).any().item()
     # fp16 max finite is 65504; flag values near saturation as overflow risk.
     max_abs = cached.abs().max().item()
-    overflow_risk = max_abs > 60000.0
+    overflow_risk = max_abs > FP16_OVERFLOW_THRESHOLD
     print(f"\nfp16 NaN / Inf     : {has_nan} / {has_inf}")
     print(f"fp16 max |logit|   : {max_abs:.0f}  (fp16 ceiling 65504)")
 
@@ -263,7 +269,7 @@ def stage_cache(text_cfg, weights_dir: str, n_prefill: int, n_decode: int) -> bo
 def verify(variant: str, stage: str, n_prefill: int, n_decode: int) -> None:
     weights_dir = f"weights/fastvlm-{variant}"
     print(f"Verifying decoder: {variant} ({weights_dir})")
-    config = AutoConfig.from_pretrained(weights_dir)
+    config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
 
     if stage == "correctness":
