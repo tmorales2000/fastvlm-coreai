@@ -36,25 +36,28 @@ from functools import partial
 
 class ANELayerNorm(nn.Module):
     """
-    Drop-in replacement for LayerNormChannel that uses nn.LayerNorm.
+    Drop-in replacement for LayerNormChannel that uses F.layer_norm.
 
-    LayerNormChannel operates on [B, C, H, W] tensors normalizing over C.
-    nn.LayerNorm normalizes over the last dimension, so we permute to
-    [B, H, W, C], apply LayerNorm, then permute back.
+    Holds weight and bias as direct parameters (same names as LayerNormChannel)
+    so checkpoint key paths match without renaming. Uses F.layer_norm with
+    [B,C,H,W] -> permute -> normalize -> permute back pattern.
 
-    The decomp table preserves nn.LayerNorm as a composite op automatically.
-    Do NOT use the manual mean/pow/sqrt decomposition from llava_qwen.py —
-    that prevents the compiler from recognizing it as layer_norm.
+    F.layer_norm is recognized by the decomp table as the layer_norm composite
+    op. Do NOT wrap in nn.LayerNorm — that adds a .norm. prefix to the key
+    paths causing a mismatch with the checkpoint.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-5) -> None:
         super().__init__()
-        self.norm = nn.LayerNorm(num_features, eps=eps)
+        # Direct parameters — same key names as LayerNormChannel (weight, bias)
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, H, W] -> permute to [B, H, W, C] for LayerNorm -> back
+        # x: [B, C, H, W] -> permute to [B, H, W, C] for layer_norm -> back
         x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
+        x = F.layer_norm(x, [x.shape[-1]], self.weight, self.bias, self.eps)
         x = x.permute(0, 3, 1, 2)
         return x
 
@@ -124,9 +127,9 @@ def _patch_layernorm(model: nn.Module, LayerNormChannel) -> None:
                 num_features=module.weight.shape[0],
                 eps=module.eps,
             )
-            # Copy weights
-            replacement.norm.weight = nn.Parameter(module.weight.clone())
-            replacement.norm.bias = nn.Parameter(module.bias.clone())
+            # Copy weights directly — ANELayerNorm holds weight/bias at top level
+            replacement.weight = nn.Parameter(module.weight.clone())
+            replacement.bias = nn.Parameter(module.bias.clone())
             setattr(parent, parts[-1], replacement)
 
 
@@ -182,6 +185,12 @@ class FastVLMVisionEncoder(nn.Module):
             downsamples=[True, True, True, True, True],
             token_mixers=["repmixer", "repmixer", "repmixer", "attention", "attention"],
             norm_layer=llava_qwen.LayerNormChannel,
+            pos_embs=[
+                None, None, None,
+                # RepCPE stages confirmed from checkpoint: network.6 (768ch), network.9 (1536ch)
+                llava_qwen.RepCPE,
+                llava_qwen.RepCPE,
+            ],
             inference_mode=True,
         )
 
@@ -212,9 +221,9 @@ class FastVLMVisionEncoder(nn.Module):
         """Load vision encoder weights from SafeTensors checkpoint."""
         model = cls(weights_dir).to(dtype=torch.float16)
         weights = _load_vision_weights(weights_dir)
-        missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
+        missing, unexpected = model.model.load_state_dict(weights, assign=True, strict=False)
         # head.proj is excluded (not used in forward pass) — expected missing
-        unexpected_real = [k for k in unexpected if "head" not in k]
+        unexpected_real = [k for k in unexpected if "head" not in k and ".bn." not in k and "num_batches_tracked" not in k]
         missing_real = [k for k in missing if "head" not in k]
         if unexpected_real:
             raise RuntimeError(f"Unexpected keys: {unexpected_real[:5]}")

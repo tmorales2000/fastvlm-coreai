@@ -44,7 +44,7 @@ def verify(variant: str = "1.5b") -> None:
     print("Loading fp32 reference model...")
     model_f32 = FastVLMVisionEncoder(weights_dir).to(dtype=torch.float32)
     weights_f32 = _load_vision_weights(weights_dir, dtype=torch.float32)
-    missing, unexpected = model_f32.load_state_dict(weights_f32, assign=True, strict=False)
+    missing, unexpected = model_f32.model.load_state_dict(weights_f32, assign=True, strict=False)
     # head.proj not used in forward — expected missing
     missing_real = [k for k in missing if "head" not in k]
     unexpected_real = [k for k in unexpected if "head" not in k]
@@ -60,8 +60,12 @@ def verify(variant: str = "1.5b") -> None:
     pixels_f32 = pixels.to(torch.float32)
 
     # ── Forward passes ────────────────────────────────────────────────────────
-    with torch.no_grad():
+    # fp16 model uses autocast to promote attention to fp32 internally,
+    # matching what the ANE compiler does for numerically sensitive ops.
+    # Pure fp16 overflows at network.9 (max ~60928, near fp16 ceiling of 65504).
+    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.float16):
         features_fp16 = model_fp16(pixels_fp16)
+    with torch.no_grad():
         features_f32 = model_f32(pixels_f32)
 
     score = psnr(features_fp16, features_f32)
