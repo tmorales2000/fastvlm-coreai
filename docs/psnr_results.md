@@ -43,8 +43,8 @@
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
-| Decoder Stage 1 — fp32 port vs HF Qwen2 | TBD | — | |
-| Decoder Stage 2 — fp16 cached decode | TBD | — | |
+| Decoder Stage 1 — fp32 port vs HF Qwen2 | 110.2 dB | ✓ | |
+| Decoder Stage 2 — fp16 cached decode | 49.5 dB | ✓ | max logit 18 |
 | Vision encoder re-authored fp16 vs fp32 | TBD | — | |
 | Python runtime (macOS) vs fp32 | TBD | — | |
 | After INT4 quantization vs fp16 (macOS) | TBD | — | |
