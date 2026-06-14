@@ -385,8 +385,8 @@ class FastVLMDecoderStateful(nn.Module):
     EXPORT NOTES
     ------------
     - Pass state_names=["k_cache","v_cache"] to add_pytorch_module()
-    - Pass dynamic_shapes={"position_ids": {1: seq_len_dim}} to allow
-
+    - Pass dynamic_shapes={"position_ids": {1: seq_len_dim}} where
+      seq_len_dim = torch.export.Dim("seq_len", min=1, max=model.max_seq_len)
     - The graph has exactly one traced path — no use_cache flag or
       Python branches. Data-dependent branches cannot be exported.
     """
