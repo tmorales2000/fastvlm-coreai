@@ -20,6 +20,32 @@ from coreai_torch.composite_ops import RMSNormImpl, RoPE, SDPA
 from safetensors import safe_open
 from transformers import AutoConfig
 
+# The in-place state mutation MUST go through mutable_slice_update — the same
+# custom op Apple's own KVCache uses (coreai_models.primitives.*.cache). It is a
+# registered torch.library op with a fake/meta kernel, so it survives
+# run_decompositions(get_decomp_table()) as a recognizable boundary that
+# TorchConverter binds to a named state. A plain narrow().copy_() or slice-assign
+# is NOT guaranteed to survive decomposition as a state mutation. Per the
+# coreai-torch docs: state is whatever the exported graph mutates in place; if the
+# mutation disappears, the buffer stops being state.
+# Confirmed from coreai_models/primitives/_ops.py:
+#   - op namespace: "coreai" (not "fastvlm")
+#   - mutates_args=["x"] (not () — this is what makes the exporter see a state mutation)
+#   - logic: torch.split + tuple of slices + x[slices] = update + return x.clone()
+@torch.library.custom_op("coreai::mutable_slice_update", mutates_args=["x"])
+def mutable_slice_update(
+    x: torch.Tensor, update: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
+) -> torch.Tensor:
+    b = torch.split(begin, 1, dim=0)
+    e = torch.split(end, 1, dim=0)
+    slices = tuple(slice(bb.item(), ee.item()) for bb, ee in zip(b, e, strict=False))
+    x[slices] = update
+    return x.clone()
+
+@mutable_slice_update.register_fake
+def _mutable_slice_update_fake(x, update, begin, end):
+    return torch.empty(x.shape, dtype=x.dtype)
+
 # Maximum context length for static KV cache shape at export time.
 # Set from text_config.max_position_embeddings in practice.
 MAX_SEQ_LEN = 4096
@@ -62,28 +88,91 @@ class FastVLMAttention(nn.Module):
 
         # Composite ops — preserved by ExternalizeSpec during export
         self.sdpa = SDPA(is_causal=True)
-        self.rope = RoPE(base=float(getattr(config, "rope_theta", 1e4)))
+        rope_theta = (
+            getattr(config, "rope_theta", None)
+            or (getattr(config, "rope_parameters", None) or {}).get("rope_theta")
+            or 1e6  # FastVLM Qwen2 default — never fall back to 1e4
+        )
+        self.rope = RoPE(base=float(rope_theta))
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        offset: torch.Tensor,
+        seq_len: int,
     ) -> torch.Tensor:
+        """
+        x            : (B, L, dim)  — L is query_len for this call
+        position_ids : (B, seq_len) — ABSOLUTE positions for the full context
+        k_cache,
+        v_cache      : (n_layers, 1, MAX_SEQ_LEN, kv_dim) registered state buffers
+        offset       : IntTensor scalar = seq_len - L; where this call's k/v land
+        seq_len      : total context length to attend over after the write
+
+        Cache buffer layout is FLATTENED over heads: last dim = n_kv_heads*head_dim,
+        sequence on dim 2. Attention works head-SEPARATED: (B, n_kv_heads, L,
+        head_dim). Store flattens; read restores. Write and read use the same
+        split or the cache corrupts.
+
+        The write goes through mutable_slice_update so the export pipeline sees a
+        state mutation it can bind to the k_cache / v_cache state names.
+        """
         B, L, _ = x.shape
+        n_heads, n_kv_heads, head_dim = self.n_heads, self.n_kv_heads, self.head_dim
+        kv_dim = n_kv_heads * head_dim
+
         qkv = (
             self.qkv_proj(x)
-            .reshape(B, L, self.n_heads + 2 * self.n_kv_heads, self.head_dim)
+            .reshape(B, L, n_heads + 2 * n_kv_heads, head_dim)
             .permute(0, 2, 1, 3)
         )
-        qk = qkv.narrow(1, 0, self.n_heads + self.n_kv_heads)
-        v = qkv.narrow(1, self.n_heads + self.n_kv_heads, self.n_kv_heads)
+        qk = qkv.narrow(1, 0, n_heads + n_kv_heads)
+        v = qkv.narrow(1, n_heads + n_kv_heads, n_kv_heads)
 
-        qk = self.rope(qk, position_ids=position_ids)
-        q = qk.narrow(1, 0, self.n_heads)
-        k = qk.narrow(1, self.n_heads, self.n_kv_heads)
+        # Rope on q/k with the query-length slice of absolute positions. Threading
+        # position_ids in (rather than re-deriving) avoids the classic decode bug.
+        torch._check_is_size(L)
+        torch._check_is_size(seq_len)
+        rope_positions = position_ids.narrow(-1, seq_len - L, L)
+        qk = self.rope(qk, position_ids=rope_positions)
+        q = qk.narrow(1, 0, n_heads)
+        k = qk.narrow(1, n_heads, n_kv_heads)  # (B, n_kv_heads, L, head_dim)
+
+        # Flatten heads -> (B, L, kv_dim) to match the buffer layout.
+        k_flat = k.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
+        v_flat = v.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
+
+        device = k_cache.device
+        layer = self.layer_idx
+        # begin/end over [layer, batch, seq, kv_dim]; mutate the seq window at offset.
+        z = torch.zeros(1, dtype=torch.int32, device=device)
+        begin = torch.cat([
+            torch.tensor([layer], dtype=torch.int32, device=device),
+            z, offset.reshape(1).to(torch.int32), z,
+        ])
+        end = torch.cat([
+            torch.tensor([layer + 1], dtype=torch.int32, device=device),
+            torch.tensor([k_cache.size(1)], dtype=torch.int32, device=device),
+            (offset.reshape(1).to(torch.int32) + L),
+            torch.tensor([kv_dim], dtype=torch.int32, device=device),
+        ])
+
+        mutable_slice_update(k_cache, k_flat.unsqueeze(0), begin, end)
+        mutable_slice_update(v_cache, v_flat.unsqueeze(0), begin, end)
+
+        # Read back the full context [0:seq_len] for this layer, restore heads.
+        k_ctx = k_cache[layer].narrow(1, 0, seq_len)  # (1, seq_len, kv_dim)
+        v_ctx = v_cache[layer].narrow(1, 0, seq_len)
+        k = k_ctx.reshape(B, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3).to(q.dtype)
+        v = v_ctx.reshape(B, seq_len, n_kv_heads, head_dim).permute(0, 2, 1, 3).to(q.dtype)
 
         out = (
             self.sdpa(q, k, v)
             .permute(0, 2, 1, 3)
-            .reshape(B, L, self.n_heads * self.head_dim)
+            .reshape(B, L, n_heads * head_dim)
         )
         return self.o_proj(out)
 
@@ -122,9 +211,17 @@ class FastVLMDecoderBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        offset: torch.Tensor,
+        seq_len: int,
     ) -> torch.Tensor:
-        r = self.self_attn(self.input_layernorm(x), position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x), position_ids, k_cache, v_cache, offset, seq_len
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
@@ -165,9 +262,26 @@ class FastVLMDecoderStateful(nn.Module):
     def forward(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Single traced path. The KV cache buffers are always mutated in place via
+        each layer's mutable_slice_update, so they are detected as state and bound
+        to state_names=["k_cache","v_cache"] at conversion. There is deliberately
+        no use_cache flag: per the coreai-torch docs, a data-dependent Python
+        branch cannot be exported as a runtime choice, and removing the mutation
+        would remove the buffers from state.
+
+        position_ids carries ABSOLUTE positions; its width is the total context
+        length (seq_len). offset = seq_len - query_len is where this step writes.
+        """
+        B, query_len = input_ids.shape
+        seq_len = position_ids.shape[-1]
+        torch._check_is_size(query_len)
+        torch._check_is_size(seq_len)
+        offset = torch.tensor(seq_len - query_len, dtype=torch.int32)
+
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
-            h = layer(h, position_ids)
+            h = layer(h, position_ids, self.k_cache, self.v_cache, offset, seq_len)
         h = self.norm(h)
         return self.lm_head(h)
 
