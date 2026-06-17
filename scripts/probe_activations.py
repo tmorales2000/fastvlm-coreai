@@ -40,6 +40,13 @@ USAGE
   # Specific stages only
   python scripts/probe_activations.py --variant 1.5b --stages 6 7 8 9 10
 
+  # Print the module structure of specific stages (no forward pass needed) —
+  # use this to check whether a stage has normalization layers, what conv
+  # types it uses, etc. Added after discovering PatchEmbed stages have no
+  # normalization (BatchNorm is fused into the conv weights during
+  # inference-mode reparameterization — see ARCHITECTURAL FINDING below).
+  python scripts/probe_activations.py --variant 0.5b 1.5b 7b --inspect 8
+
   # Use a fixed seed for reproducible random input (default: 0)
   python scripts/probe_activations.py --variant 1.5b --seed 42
 
@@ -48,11 +55,47 @@ ARGUMENTS
   --variant   One or more FastVLM variants to probe. Default: 1.5b.
               Choices: 0.5b, 1.5b, 7b.
 
-  --stages    Which network stage indices to report. Default: 8 9 10
-              (the stages implicated in the known fp16 overflow). Pass
-              "all" to report every stage in the network ModuleList.
+  --stages    Which network stage indices to report magnitudes for.
+              Default: 8 9 10 (the stages implicated in the known fp16
+              overflow). Pass "all" to report every stage.
+
+  --inspect   Print the nn.Module structure (repr) of the given stage
+              indices for each variant, instead of running a forward pass.
+              Use this to check for normalization layers, conv types, etc.
+              Can be combined with --stages in the same invocation if you
+              want both the magnitude table and the structure printout.
 
   --seed      Random seed for the test input. Default: 0.
+
+ARCHITECTURAL FINDING (1.5B, confirmed June 2026, applies to all variants)
+-----------------------------------------------------------------------------
+PatchEmbed stages contain NO normalization layers:
+  PatchEmbed(
+    (proj): Sequential(
+      (0): ReparamLargeKernelConv(... lkb_reparam: Conv2d, no BN ...)
+      (1): MobileOneBlock(... reparam_conv: Conv2d, no BN ...)
+    )
+  )
+This is because FastViTHD's ReparamLargeKernelConv and MobileOneBlock are
+trained WITH BatchNorm, but inference-mode reparameterization fuses BN's
+scale/shift into the conv weights and bias (the standard conv-BN fusion
+identity) before the checkpoint is saved. This is mathematically equivalent
+in infinite precision, but it removes the explicit normalization checkpoint
+from the graph — nothing constrains the fused conv's output scale anymore.
+Each variant's vision tower was apparently trained independently (different
+checkpoints, not shared weights — confirmed: conv_exp.reparam_conv.weight is
+NOT bit-identical across 0.5b/1.5b/7b despite having the same shape and same
+max abs value of 121.0). Each one's BN parameters, now baked into the fused
+conv, happened to land at a different absolute scale. The result is that the
+SAME stage (network.8, the PatchEmbed right before the final attention block)
+produces wildly different activation magnitudes per variant:
+  0.5b max abs ~252,866   (use --inspect 8 to see the module; same Conv2d
+  1.5b max abs  ~55,630    structure across all three, different learned
+  7b   max abs  ~12,740    weight/bias values from independent training)
+This is a property of reparameterized/fused inference-mode architectures in
+general, not unique to FastVLM — any model using conv-BN fusion can have
+this issue, and it is invisible until you actually probe activation scale
+at fp16 precision.
 
 OUTPUT
 ------
@@ -72,6 +115,27 @@ from fastvlm_vision_encoder import FastVLMVisionEncoder, _load_vision_weights
 
 def _image_size(config) -> int:
     return int(config.mm_vision_tower.split("_")[-1])
+
+
+def inspect_stages(variant: str, stage_indices: list[int]) -> None:
+    """
+    Print the nn.Module structure of the requested stages without running
+    a forward pass. Useful for checking whether a stage has normalization
+    layers, what conv types it uses, etc. — the question that led to
+    discovering PatchEmbed's missing normalization (see module docstring).
+    """
+    weights_dir = f"weights/fastvlm-{variant}"
+    model = FastVLMVisionEncoder(weights_dir).to(torch.float32)
+    weights = _load_vision_weights(weights_dir, dtype=torch.float32)
+    model.model.load_state_dict(weights, assign=True, strict=False)
+
+    n_stages = len(model.model.network)
+    for i in stage_indices:
+        if i >= n_stages:
+            print(f"\n{variant} network.{i}: out of range (model has {n_stages} stages)")
+            continue
+        print(f"\n{variant} network.{i}:")
+        print(model.model.network[i])
 
 
 def probe(variant: str, stages: list[int] | str, seed: int) -> list[dict]:
@@ -134,7 +198,16 @@ examples:
         "--stages",
         nargs="+",
         default=["8", "9", "10"],
-        help='Stage indices to report, or "all". (default: 8 9 10)',
+        help='Stage indices to report magnitudes for, or "all". (default: 8 9 10)',
+    )
+    ap.add_argument(
+        "--inspect",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="STAGE",
+        help="Print nn.Module structure for these stage indices instead of "
+        "(or in addition to) running the magnitude probe.",
     )
     ap.add_argument(
         "--seed",
@@ -143,6 +216,14 @@ examples:
         help="Random seed for test input. (default: 0)",
     )
     args = ap.parse_args()
+
+    if args.inspect is not None:
+        for variant in args.variant:
+            inspect_stages(variant, args.inspect)
+        if args.stages == ["8", "9", "10"] and "--stages" not in sys.argv:
+            # --inspect was the point of this invocation; skip the magnitude
+            # table unless --stages was also explicitly requested.
+            return
 
     stages = "all" if args.stages == ["all"] else [int(s) for s in args.stages]
 
