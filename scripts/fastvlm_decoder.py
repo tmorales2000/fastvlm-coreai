@@ -28,18 +28,37 @@ Three constraints drive every decision in this file:
 2. The KV cache must be a mutable registered buffer, not a Python list.
    torch.export.export traces a single static graph. The cache cannot be
    passed as an input/output argument pair — it must be a registered buffer
-   that is mutated in place via mutable_slice_update. This is the pattern
-   Apple's own KVCache primitive uses (coreai_models/primitives/_ops.py).
-   TorchConverter then binds the buffer to state_names=["k_cache","v_cache"],
-   making it a persistent state that survives across inference calls in the
-   compiled .aimodel.
+   that is mutated in place. TorchConverter then binds the buffer to
+   state_names=["k_cache","v_cache"], making it a persistent state that
+   survives across inference calls in the compiled .aimodel.
 
-3. mutable_slice_update must be the "coreai" custom op, not a plain slice-assign.
-   A plain x[slices] = update does not survive run_decompositions(get_decomp_table())
-   as a recognizable state mutation. The custom op — registered with
-   mutates_args=["x"] — tells the exporter that x is mutated in place, so the
-   buffer remains bound as state in the exported graph. The op namespace ("coreai")
-   and mutates_args declaration are confirmed from Apple's _ops.py source.
+3. The cache write uses torch.ops.aten.slice_scatter, not a custom op, and
+   not an in-place narrow().copy_().
+   Two earlier approaches were tried and rejected:
+     (a) A "coreai::mutable_slice_update" custom op (torch.library.custom_op
+         with mutates_args=["x"]), copied verbatim from Apple's
+         coreai_models/primitives/_ops.py reference. Rejected: torch.export
+         wraps mutates_args custom ops in
+         torch.ops.higher_order.auto_functionalized_v2, and coreai-torch
+         0.4.0's converter has no lowering for that op — it crashes with
+         UnboundLocalError inside the converter itself (confirmed via
+         direct node-tracing).
+     (b) k_cache[layer].narrow(1, offset, L).copy_(k_flat) — in-place
+         mutation through a narrowed view with a dynamic (tensor-valued)
+         start. Rejected: fails inside torch.export itself, before ever
+         reaching coreai-torch, with PendingUnbackedSymbolNotFound — the
+         unbacked symbol allocated for the dynamically-shaped narrowed
+         view's size doesn't get threaded through correctly for an
+         in-place mutation through that view.
+   The working approach: torch.ops.aten.slice_scatter(cache[layer], src,
+   dim=1, start=offset, end=offset+L) is a FUNCTIONAL op — it returns a new
+   full-shape tensor with src written into the given slice, rather than
+   mutating a narrowed view in place. coreai-torch has a registered,
+   tested lowering for it (replace_slice_scatter -> coreai.slice_update in
+   _aten_to_core.py) that explicitly resolves dynamic start/end values.
+   The full-shape result is then written into the registered buffer with a
+   single .copy_() — a static-shape tensor-to-tensor copy, which does not
+   hit the unbacked-symbol problem that approach (b) did.
 
 WEIGHT LAYOUT (confirmed from discover_weights.py output)
 ----------------------------------------------------------
@@ -72,8 +91,9 @@ The cache buffers have shape (n_layers, 1, MAX_SEQ_LEN, kv_dim) where:
 
 Heads are FLATTENED in the cache (kv_dim = n_kv_heads * head_dim) and restored
 to head-separated layout (B, n_kv_heads, seq_len, head_dim) before SDPA.
-This flattened layout is what mutable_slice_update writes and reads, and it
-must be consistent — mixing the two layouts corrupts the cache.
+This flattened layout is what the narrow(...).copy_(...) write and the
+narrow(...) read both use, and it must be consistent — mixing the two
+layouts corrupts the cache.
 
 ROPE_THETA
 ----------
@@ -100,40 +120,19 @@ import torch.nn as nn
 from coreai_torch.composite_ops import RMSNormImpl, RoPE, SDPA
 from safetensors import safe_open
 
-# ─── KV cache state mutation op ──────────────────────────────────────────────
-#
-# mutable_slice_update writes new K or V vectors into a slice of the cache
-# buffer for this decode step. It MUST be the "coreai::mutable_slice_update"
-# custom op — not a plain slice-assign — for two reasons:
-#
-#   1. mutates_args=["x"] tells torch.export that x is mutated in place.
-#      Without this, the exporter treats the call as pure/functional and the
-#      buffer is not bound as mutable state in the exported graph.
-#
-#   2. The "coreai" namespace is what TorchConverter recognizes when binding
-#      mutable buffers to state_names. Using a different namespace ("fastvlm",
-#      etc.) may cause the binding to be skipped silently.
-#
-# This implementation is a verbatim copy of Apple's _ops.py, confirmed by
-# reading ~/git/apple/coreai-models/python/src/coreai_models/primitives/_ops.py.
-# coreai_models is NOT an installable package — this copy is the correct approach.
-#
-@torch.library.custom_op("coreai::mutable_slice_update", mutates_args=["x"])
-def mutable_slice_update(
-    x: torch.Tensor, update: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
-) -> torch.Tensor:
-    b = torch.split(begin, 1, dim=0)
-    e = torch.split(end, 1, dim=0)
-    slices = tuple(slice(bb.item(), ee.item()) for bb, ee in zip(b, e, strict=False))
-    x[slices] = update
-    return x.clone()
-
-@mutable_slice_update.register_fake
-def _mutable_slice_update_fake(x, update, begin, end):
-    return torch.empty(x.shape, dtype=x.dtype)
+# NOTE: an earlier version of this file defined a "coreai::mutable_slice_update"
+# custom op (torch.library.custom_op with mutates_args=["x"]) here, copied
+# verbatim from Apple's coreai_models/primitives/_ops.py reference. It has
+# been removed — see the "KV cache mutation" section of the module docstring
+# above for why: torch.export wraps mutates_args custom ops in
+# auto_functionalized_v2, which coreai-torch 0.4.0's converter cannot lower,
+# crashing with UnboundLocalError. The KV cache is now mutated with plain
+# torch.narrow(...).copy_(...) calls directly in FastVLMAttention.forward(),
+# matching the pattern coreai-torch's own tests/test_stateful.py uses and
+# tests for (including under dynamic shapes).
 
 
-
+# ─── Composite op wrappers ────────────────────────────────────────────────────
 
 
 # ─── Composite op wrappers ────────────────────────────────────────────────────
@@ -217,7 +216,7 @@ class FastVLMAttention(nn.Module):
         position_ids: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        offset: torch.Tensor,
+        offset: int,
         seq_len: int,
     ) -> torch.Tensor:
         """
@@ -225,7 +224,9 @@ class FastVLMAttention(nn.Module):
         position_ids : (B, seq_len)       — absolute positions, full context width
         k_cache      : (n_layers, batch_size, max_seq_len, kv_dim) — shared mutable state
         v_cache      : same shape as k_cache
-        offset       : scalar int32       — seq_len - L; position of first new token
+        offset       : int (SymInt under tracing) — seq_len - L; position of
+                       first new token. Deliberately NOT a torch.Tensor — see
+                       FastVLMDecoderStateful.forward for why.
         seq_len      : int                — total tokens to attend over after write
         """
         B, L, _ = x.shape
@@ -256,23 +257,64 @@ class FastVLMAttention(nn.Module):
         v_flat = v.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
 
         # Write new K/V into cache at [layer, :, offset:offset+L, :]
-        device = k_cache.device
+        #
+        # Uses torch.ops.aten.slice_scatter, NOT a custom op and NOT
+        # narrow(...).copy_() in place. History of this line:
+        #
+        #   1. coreai::mutable_slice_update (custom op, mutates_args=["x"]):
+        #      torch.export wraps mutates_args custom ops in
+        #      auto_functionalized_v2, which coreai-torch 0.4.0's converter
+        #      has no lowering for -> UnboundLocalError inside the converter.
+        #
+        #   2. k_cache[layer].narrow(1, offset, L).copy_(k_flat): a tensor-
+        #      valued (dynamic) start passed to narrow(), then mutated
+        #      in-place. This fails INSIDE torch.export itself (before ever
+        #      reaching coreai-torch): PendingUnbackedSymbolNotFound. The
+        #      unbacked symbol torch.export allocates to represent the
+        #      narrowed view's dynamic shape never gets threaded through to
+        #      the traced function's outputs correctly for an in-place
+        #      mutation through a narrowed view.
+        #
+        #   3. slice_scatter (this version): a FUNCTIONAL op — returns a new
+        #      full-shape tensor with src written into the given slice,
+        #      rather than mutating a narrowed view in place. Confirmed via
+        #      coreai_torch/_aten_to_core.py: aten.slice_scatter.default has
+        #      a registered lowering (replace_slice_scatter -> coreai.slice_update)
+        #      that explicitly resolves dynamic start/end values via
+        #      resolve_slice_arg(...), unlike the in-place-on-a-view path,
+        #      which has no such resolver and was never exercised by
+        #      coreai-torch's own dynamic-shapes stateful test (that test
+        #      mutates a buffer unconditionally in full, never into a
+        #      dynamic sub-region — see TestStatefulDynamicShapes in
+        #      tests/test_stateful.py). The full-tensor result is then
+        #      written back into the registered buffer with a single
+        #      .copy_() — this final copy is a full, statically-shaped
+        #      tensor-to-tensor copy, not a dynamic-shaped narrowed view,
+        #      so it does not hit the same unbacked-symbol problem.
+        #
+        #      slice_scatter's schema requires start/end to be SymInt, not
+        #      a Tensor. The actual root cause of an earlier failure here
+        #      was upstream of this line: offset was being constructed as
+        #      offset = torch.tensor(seq_len - query_len, dtype=torch.int32)
+        #      in FastVLMDecoderStateful.forward — wrapping an
+        #      already-symbolic expression (seq_len, query_len come from
+        #      .shape under dynamic_shapes, so they're already SymInt) in
+        #      torch.tensor(...) re-materializes it as a real tensor, and
+        #      calling .item() on THAT does not recover a usable SymInt
+        #      under tracing (it still surfaces as FakeTensor to
+        #      slice_scatter's schema checker). Fixed at the source: offset
+        #      is now a plain `seq_len - query_len` expression, never
+        #      wrapped in torch.tensor(...), so it arrives here as a
+        #      genuine int/SymInt and no .item() call is needed at all.
         layer = self.layer_idx
-        z = torch.zeros(1, dtype=torch.int32, device=device)
-        begin = torch.cat([
-            torch.tensor([layer], dtype=torch.int32, device=device),
-            z,
-            offset.reshape(1).to(torch.int32),
-            z,
-        ])
-        end = torch.cat([
-            torch.tensor([layer + 1], dtype=torch.int32, device=device),
-            torch.tensor([k_cache.size(1)], dtype=torch.int32, device=device),
-            (offset.reshape(1).to(torch.int32) + L),
-            torch.tensor([kv_dim], dtype=torch.int32, device=device),
-        ])
-        mutable_slice_update(k_cache, k_flat.unsqueeze(0), begin, end)
-        mutable_slice_update(v_cache, v_flat.unsqueeze(0), begin, end)
+        k_layer = torch.ops.aten.slice_scatter(
+            k_cache[layer], k_flat, dim=1, start=offset, end=offset + L
+        )
+        v_layer = torch.ops.aten.slice_scatter(
+            v_cache[layer], v_flat, dim=1, start=offset, end=offset + L
+        )
+        k_cache[layer].copy_(k_layer)
+        v_cache[layer].copy_(v_layer)
 
         # Read back full context [0:seq_len] and restore head-separated layout
         k_ctx = k_cache[layer].narrow(1, 0, seq_len)
@@ -331,7 +373,7 @@ class FastVLMDecoderBlock(nn.Module):
         position_ids: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        offset: torch.Tensor,
+        offset: int,
         seq_len: int,
     ) -> torch.Tensor:
         r = self.self_attn(
@@ -422,7 +464,20 @@ class FastVLMDecoderStateful(nn.Module):
         # survives torch.export when seq_len is symbolic. Fires as an assertion
         # in eager mode and as a graph-level constraint in the exported program.
         torch._check(seq_len <= self.max_seq_len)
-        offset = torch.tensor(seq_len - query_len, dtype=torch.int32)
+        # offset is intentionally a plain int/SymInt expression, NOT wrapped
+        # in torch.tensor(...). seq_len and query_len come from .shape under
+        # dynamic_shapes tracing, so they are already SymInt — seq_len -
+        # query_len is therefore already a valid symbolic int expression.
+        # An earlier version wrapped this in torch.tensor(..., dtype=torch.int32)
+        # then called .item() at the point of use to "convert back" to a
+        # plain int for slice_scatter's SymInt? start argument. That round
+        # trip does NOT recover the original SymInt under torch.export
+        # tracing — .item() on the re-wrapped tensor produces a value that
+        # still carries FakeTensor semantics, and slice_scatter's schema
+        # rejects it with the same "Expected Optional[int]... found
+        # FakeTensor" error as passing the tensor directly. Keeping offset
+        # as a bare expression avoids the round trip entirely.
+        offset = seq_len - query_len
 
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
