@@ -18,12 +18,10 @@ Compression stages (--compression flag)
     --compression fp16.
 
     Supported levels:
-      fp16            : Cast to float16 (former Stage 2)
-      int8            : coreai-opt weight-only int8 quantization
-      int8-palettized : coreai-opt 8-bit k-means palettization
-      int4            : coreai-opt weight-only int4 quantization
-      int4-palettized : coreai-opt 4-bit k-means palettization
-      all             : Run all five levels in sequence
+      fp16 : Cast to float16 (former Stage 2)
+      int8 : coreai-opt weight-only int8 quantization
+      int4 : coreai-opt weight-only int4 quantization
+      all  : Run all three levels in sequence
 
     These compare compressed output against the fp32 reference to measure
     quality degradation at each precision level. Results directly inform the
@@ -31,11 +29,17 @@ Compression stages (--compression flag)
 
     For KV cache correctness across separate runtime calls, see verify_runtime.py.
 
+VALIDATED PRODUCTION TARGETS
+-----------------------------
+  0.5B : fp16  (unquantized, matches Apple MLX)
+  1.5B : int8  (46.2 dB vs fp16, PASS)
+  7B   : int8  (int4 fails at 22.4 dB due to fp16 pre-cast sensitivity)
+
 USAGE
 -----
   python scripts/verify_decoder.py --variant 1.5b
   python scripts/verify_decoder.py --variant 1.5b --compression fp16
-  python scripts/verify_decoder.py --variant 1.5b --compression int4-palettized
+  python scripts/verify_decoder.py --variant 1.5b --compression int8
   python scripts/verify_decoder.py --variant 1.5b --compression all
 """
 
@@ -216,14 +220,10 @@ def stage_compression(
     print(f"Applying {level} compression...")
     compressed, _ = apply_compression(port, level, example_inputs)
 
-    # For fp16, run the exact same cache-health checks the old Stage 2 did,
-    # since fp16 has unique overflow/NaN failure modes worth diagnosing
-    # separately from just PSNR degradation.
+    # fp16 gets the full cache-health diagnostic path.
     if level == "fp16":
         return _check_fp16_health(compressed, text_cfg, fp32_ref)
 
-    # For quantization/palettization levels: run a forward pass and compare
-    # against the fp32 reference.
     torch.manual_seed(0)
     B, L = 1, 8
     input_ids = torch.randint(1, text_cfg.vocab_size, (B, L), dtype=torch.int32)
@@ -237,25 +237,21 @@ def stage_compression(
 
     score_vs_fp32 = psnr(compressed_out, fp32_ref)
 
-    # For int8/int4 (which cast to fp16 internally), also compare against a
-    # fp16 reference to isolate quantization error from fp16 rounding error.
-    # PSNR vs fp32 = total compression delta (fp16 rounding + quantization).
-    # PSNR vs fp16 = quantization-only delta (what int8/int4 adds beyond fp16).
-    if level in ("int8", "int4"):
-        fp16_port = _build_port(text_cfg, weights_dir, torch.float16)
-        torch.manual_seed(0)
-        with torch.no_grad():
-            if hasattr(fp16_port, "k_cache"):
-                fp16_port.k_cache.zero_()
-                fp16_port.v_cache.zero_()
-            fp16_ref_out = fp16_port(input_ids, pos_ids)
-        score_vs_fp16 = psnr(compressed_out, fp16_ref_out.float())
-        print(f"\nPSNR vs fp32 reference : {score_vs_fp32:.1f} dB  (fp16 rounding + quantization)")
-        print(f"PSNR vs fp16 reference : {score_vs_fp16:.1f} dB  (quantization error only)")
-        score = score_vs_fp16  # gate pass/fail on quantization-only delta
-    else:
-        print(f"\nPSNR vs fp32 reference: {score_vs_fp32:.1f} dB")
-        score = score_vs_fp32
+    # int8/int4: also report vs fp16 to isolate quantization-only error.
+    # PSNR vs fp32 = fp16 rounding + quantization (total).
+    # PSNR vs fp16 = quantization error only. Pass/fail gates on this number.
+    fp16_port = _build_port(text_cfg, weights_dir, torch.float16)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        if hasattr(fp16_port, "k_cache"):
+            fp16_port.k_cache.zero_()
+            fp16_port.v_cache.zero_()
+        fp16_ref_out = fp16_port(input_ids, pos_ids)
+    score_vs_fp16 = psnr(compressed_out, fp16_ref_out.float())
+
+    print(f"\nPSNR vs fp32 reference : {score_vs_fp32:.1f} dB  (fp16 rounding + quantization)")
+    print(f"PSNR vs fp16 reference : {score_vs_fp16:.1f} dB  (quantization error only)")
+    score = score_vs_fp16
 
     if score > COMPRESSION_PASS:
         print(f"[PASS] {score:.1f} dB — {level} compression viable.")
@@ -274,9 +270,7 @@ def _check_fp16_health(
 ) -> bool:
     """
     fp16-specific health checks: NaN/Inf, overflow risk, and cache correctness
-    across a prefill + decode sequence. More thorough than a single PSNR
-    comparison because fp16 pathology often surfaces specifically in the
-    cached multi-step decode path, not on a single forward pass.
+    across a prefill + decode sequence.
     """
     n_prefill, n_decode = 6, 4
     total = n_prefill + n_decode
@@ -284,13 +278,11 @@ def _check_fp16_health(
     input_ids = torch.randint(1, text_cfg.vocab_size, (1, total), dtype=torch.int32)
     pos_full = torch.arange(total, dtype=torch.int32).unsqueeze(0)
 
-    # Full pass reference in fp16
     port_fp16.k_cache.zero_()
     port_fp16.v_cache.zero_()
     with torch.no_grad():
         ref_fp16 = port_fp16(input_ids, pos_full)
 
-    # Cached: prefill then per-token decode
     port_fp16.k_cache.zero_()
     port_fp16.v_cache.zero_()
     cached = torch.zeros_like(ref_fp16)
@@ -374,7 +366,7 @@ if __name__ == "__main__":
 examples:
   python scripts/verify_decoder.py --variant 1.5b
   python scripts/verify_decoder.py --variant 1.5b --compression fp16
-  python scripts/verify_decoder.py --variant 1.5b --compression int4-palettized
+  python scripts/verify_decoder.py --variant 1.5b --compression int8
   python scripts/verify_decoder.py --variant 1.5b --compression all
 """,
     )

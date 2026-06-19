@@ -13,65 +13,59 @@ to any FastVLM component (vision encoder, projector, decoder), used by:
 
 SUPPORTED COMPRESSION LEVELS
 ------------------------------
-  fp16           : Cast model weights to float16. No coreai-opt involved.
-                   Equivalent to the former verify_*.py Stage 2.
-  int8           : coreai-opt weight-only int8 quantization (linear, per-channel
-                   symmetric) via Quantizer.presets.w8().
-  int8-palettized: coreai-opt 8-bit k-means palettization via
-                   KMeansPalettizerConfig.presets.w8().
-  int4           : coreai-opt weight-only int4 quantization (linear, per-channel
-                   symmetric) via Quantizer.presets.w4().
-  int4-palettized: coreai-opt 4-bit k-means palettization via
-                   KMeansPalettizerConfig.presets.w4() (group_size=16 default).
+  fp16 : Cast model weights to float16. No coreai-opt involved.
+         Equivalent to the former verify_*.py Stage 2.
+  int8 : coreai-opt weight-only int8 quantization, grouped asymmetric,
+         block_size=64 along input-channel axis. Matches Apple's MLX
+         int8 scheme for FastVLM 1.5B.
+  int4 : coreai-opt weight-only int4 quantization, same scheme.
+         Matches Apple's MLX int4 scheme for FastVLM 7B.
+
+PRODUCTION COMPRESSION TARGETS (validated)
+-------------------------------------------
+  0.5B decoder : fp16  (Apple ships unquantized; no quality benefit to quantize)
+  1.5B decoder : int8  (46.2 dB vs fp16, PASS; matches Apple MLX quality tier)
+  7B   decoder : int8  (int4 fails at 22.4 dB due to fp16 pre-cast sensitivity)
+  projector    : fp16  (Apple never quantizes it; 14M params, negligible size)
+  vision enc.  : fp16  (CoreML export; quantization not applied)
 
 SIMULATION vs EXPORT DISTINCTION (critical)
 --------------------------------------------
 coreai-opt operates in two distinct modes:
 
   SIMULATION (verify scripts): Call prepare(example_inputs) only.
-    The returned model is a standard nn.Module with fake-quantize or
-    fake-palettize modules inserted around weights. It is directly runnable
-    in PyTorch for forward passes / PSNR comparison. Do NOT call finalize()
-    before using it for PSNR — finalize() converts the model into a
-    backend-specific representation that is no longer runnable as plain
-    PyTorch. This is documented explicitly in KMeansPalettizer.finalize()'s
-    docstring: "For torch-based evaluation, use the model returned by
-    prepare() directly rather than calling finalize."
+    The returned model is a standard nn.Module with fake-quantize modules
+    inserted around weights. It is directly runnable in PyTorch for forward
+    passes / PSNR comparison. Do NOT call finalize() before using it for
+    PSNR — finalize() converts the model into a backend-specific
+    representation that is no longer runnable as plain PyTorch.
 
   EXPORT (export_fastvlm.py): Call prepare(example_inputs), then
     finalize(backend=ExportBackend.CoreAI). The finalized model is what
     gets staged into TorchConverter via add_exported_program(). The
-    finalize step converts fake-quantize/fake-palettize modules into
-    coreai-backend-specific weight representations (lookup tables for
-    palettization, quantized weight tensors for quantization) that
-    TorchConverter knows how to lower to coreai ops.
+    finalize step converts fake-quantize modules into coreai-backend-specific
+    weight representations that TorchConverter knows how to lower to coreai ops.
 
 CALIBRATION
 -----------
-These utilities do NOT perform calibration (sensitivity_path, calibration_mode).
-For verify scripts this is intentional — uncalibrated compression gives a
-conservative (pessimistic) estimate of quality that's sufficient for
-characterizing whether a compression level is viable at all. For production
-export, consider adding calibration via:
-  with compressor.calibration_mode(loss_fn=...):
-      for batch in calibration_data:
-          ...
-after prepare() and before finalize(), using a small representative dataset
-of real images. This is left to a future iteration once the basic pipeline
-is proven.
+These utilities do NOT perform calibration. For verify scripts this is
+intentional — uncalibrated compression gives a conservative (pessimistic)
+estimate of quality sufficient for characterising whether a compression level
+is viable. For production export, calibration via calibration_mode() using
+representative vision-language inputs is a future improvement.
 
 HOW TO USE
 ----------
 For verify scripts (PSNR comparison):
     model = FastVLMDecoder.from_weights(...)
-    ref_out = model(example_input)  # fp32 reference
-    compressed, _ = apply_compression(model, "int4-palettized", (example_input,))
+    ref_out = model(example_input)       # fp32 reference
+    compressed, _ = apply_compression(model, "int8", (example_input,))
     compressed_out = compressed(example_input)
-    psnr = compute_psnr(ref_out, compressed_out)
+    score = psnr(ref_out, compressed_out)
 
 For export scripts (before TorchConverter):
     model = FastVLMDecoder.from_weights(...)
-    compressed, compressor = apply_compression(model, "int4-palettized", (example_input,))
+    compressed, compressor = apply_compression(model, "int8", (example_input,))
     export_ready = finalize_for_export(compressed, compressor)
     exported = torch.export.export(export_ready, ...)
     converter.add_exported_program(exported, ...)
@@ -85,8 +79,6 @@ import torch
 import torch.nn as nn
 
 from coreai_opt.common import ExportBackend
-from coreai_opt.palettization.config import KMeansPalettizerConfig
-from coreai_opt.palettization.kmeans import KMeansPalettizer
 from coreai_opt.quantization import Quantizer, QuantizerConfig
 from coreai_opt.quantization.spec import PerBlockGranularity, QuantizationSpec, QuantizationScheme
 from coreai_opt.quantization.config import ModuleQuantizerConfig
@@ -96,25 +88,17 @@ from coreai_opt.quantization.config import ModuleQuantizerConfig
 COMPRESSION_LEVELS = [
     "fp16",
     "int8",
-    "int8-palettized",
     "int4",
-    "int4-palettized",
 ]
 
-CompressionLevel = Literal[
-    "fp16",
-    "int8",
-    "int8-palettized",
-    "int4",
-    "int4-palettized",
-]
+CompressionLevel = Literal["fp16", "int8", "int4"]
 
 
 def apply_compression(
     model: nn.Module,
     level: CompressionLevel,
     example_inputs: tuple[torch.Tensor, ...],
-) -> tuple[nn.Module, KMeansPalettizer | Quantizer | None]:
+) -> tuple[nn.Module, Quantizer | None]:
     """
     Apply the specified compression level to a FastVLM component.
 
@@ -132,35 +116,30 @@ def apply_compression(
         level: Compression level. One of COMPRESSION_LEVELS.
         example_inputs: Tuple of example input tensors matching the model's
                         forward() signature. Used by coreai-opt to trace the
-                        model for fake-quantize/palettize module insertion.
+                        model for fake-quantize module insertion.
                         Content doesn't affect compression quality for
-                        weight-only compression (int8/int4/palettized);
-                        random tensors of the right shape are sufficient.
+                        weight-only compression; random tensors of the right
+                        shape are sufficient.
 
     Returns:
         (compressed_model, compressor):
           compressed_model: nn.Module with compression applied in simulation mode.
-          compressor: KMeansPalettizer | Quantizer | None — needed for export.
+          compressor: Quantizer | None — needed for export.
     """
     model.eval()
 
     if level == "fp16":
-        # Plain cast — no coreai-opt. Equivalent to the former verify_*.py
-        # Stage 2 fp16 health check. Returns a copy so the caller's fp32
+        # Plain cast — no coreai-opt. Returns a copy so the caller's fp32
         # reference model is not modified in place.
         return model.half(), None
 
     if level == "int8":
-        # Simulates Apple's MLX int8 scheme (FastVLM 1.5B) as closely as
-        # coreai-opt allows. Apple's scheme is a two-part compression:
-        #   1. Non-linear tensors (RMSNorm scales, attention biases, etc.)
-        #      stored as fp16 — not quantized.
+        # Matches Apple's MLX int8 scheme (FastVLM 1.5B):
+        #   1. Non-linear tensors (RMSNorm scales, attention biases) → fp16.
         #   2. nn.Linear weight matrices: grouped asymmetric int8,
-        #      group_size=64 along input-channel axis, per-group scale +
+        #      block_size=64 along input-channel axis, per-group scale +
         #      zero-point in fp16.
-        # We replicate by casting the full model to fp16 first, then applying
-        # block quantization only to nn.Linear weights. PSNR reflects TOTAL
-        # quality delta from fp32 (fp16 rounding + int8 quantization combined).
+        # PSNR reflects total quality delta from fp32 (fp16 rounding + int8).
         model = model.half()
         weight_spec = QuantizationSpec(
             dtype=torch.int8,
@@ -177,20 +156,11 @@ def apply_compression(
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
 
-    if level == "int8-palettized":
-        # Cast non-Linear tensors to fp16 for consistency with the int8/int4
-        # approach and with a real export where everything not palettized
-        # would be stored at fp16.
-        model = model.half()
-        compressor = KMeansPalettizer(model, KMeansPalettizerConfig.presets.w8())
-        prepared = compressor.prepare(example_inputs)
-        return prepared, compressor
-
     if level == "int4":
-        # Same two-part scheme as int8 above, matching Apple's MLX 7B:
+        # Same two-part scheme as int8, matching Apple's MLX 7B:
         # fp16 for non-linear tensors, grouped asymmetric int4 for nn.Linear
-        # weights (group_size=64, axis=1). PSNR reflects total quality delta
-        # from fp32 (fp16 rounding + int4 quantization combined).
+        # weights (block_size=64, axis=1).
+        # PSNR reflects total quality delta from fp32 (fp16 rounding + int4).
         model = model.half()
         weight_spec = QuantizationSpec(
             dtype=torch.int4,
@@ -207,12 +177,6 @@ def apply_compression(
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
 
-    if level == "int4-palettized":
-        model = model.half()
-        compressor = KMeansPalettizer(model, KMeansPalettizerConfig.presets.w4())
-        prepared = compressor.prepare(example_inputs)
-        return prepared, compressor
-
     raise ValueError(
         f"Unknown compression level: {level!r}. "
         f"Must be one of: {COMPRESSION_LEVELS}"
@@ -221,7 +185,7 @@ def apply_compression(
 
 def finalize_for_export(
     compressed_model: nn.Module,
-    compressor: KMeansPalettizer | Quantizer | None,
+    compressor: Quantizer | None,
 ) -> nn.Module:
     """
     Finalize a compressed model for coreai-torch export.
@@ -243,7 +207,6 @@ def finalize_for_export(
         TorchConverter.add_exported_program().
     """
     if compressor is None:
-        # fp16 — no finalization needed.
         return compressed_model
 
     return compressor.finalize(
@@ -268,4 +231,7 @@ def psnr(ref: torch.Tensor, test: torch.Tensor) -> float:
     max_val = ref_f.abs().max().item()
     if max_val == 0.0:
         return float("inf")
-    return 20.0 * torch.log10(torch.tensor(max_val)).item() - 10.0 * torch.log10(torch.tensor(mse)).item()
+    return (
+        20.0 * torch.log10(torch.tensor(max_val)).item()
+        - 10.0 * torch.log10(torch.tensor(mse)).item()
+    )
