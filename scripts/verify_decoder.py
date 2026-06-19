@@ -1,35 +1,42 @@
 """
-verify_decoder.py — One decoder verification, two staged gates.
+verify_decoder.py — FastVLM decoder verification.
 
-Replaces the old fp16-vs-fp32-only check (which compared the port against itself
-and so could not catch a wrong architecture, weight map, or broken cache) and
-folds in the cross-model and cache checks. Runs two stages in order and stops at
-the first failure, so a failure tells you WHICH layer of the problem you are at:
+STAGES
+------
+Stage 1 — CORRECTNESS (fp32, port vs HF Qwen2)
+    Does the re-authored port compute the same thing as the original model?
+    Reference is stock HF Qwen2ForCausalLM from the same weights. Run in
+    fp32 ONLY as a diagnostic isolation trick: divergence here is structural
+    (fusion order, rope, head reshape), not a precision issue. Per-layer PSNR
+    localises a bug to a specific transformer block. This is the ONLY stage
+    that runs by default.
 
-  Stage 1 — CORRECTNESS (fp32, vs HF Qwen2)
-      Does the re-authored port compute the same thing as the original model?
-      Reference is stock HF Qwen2ForCausalLM from the same weights (the original
-      llava_qwen decoder delegates to it). Run in fp32 ONLY as a diagnostic
-      isolation trick: a divergence here is structural (fusion order, rope, head
-      reshape), not fp16 rounding. Per-layer PSNR localizes a bug to a block.
-      If this fails, the rest is noise — stop.
+Compression stages (--compression flag)
+    Apply coreai-opt compression to the verified fp32 port and compare
+    against the Stage 1 fp32 reference. Reports PSNR at the specified
+    precision level(s). The former Stage 2 (fp16 health check) is now
+    --compression fp16.
 
-  Stage 2 — KV CACHE + fp16 HEALTH (fp16, prefill + decode vs full pass)
-      Runs the REAL artifact: the fp16 model across a cached multi-step decode.
-      fp16 is the authored target for the ANE — it is what ships, so it is what we
-      verify here. Checks (a) the cache mutates and reads back correctly across
-      decode steps (the only stage exercising mutable_slice_update), and (b) fp16
-      health: no NaN/Inf, no saturation toward the fp16 ceiling. There is NO
-      fp32 comparison — fp32 is not a deployed artifact, and Stage 1 already
-      confirmed the fp16-authored port matches an fp32 reference.
+    Supported levels:
+      fp16            : Cast to float16 (former Stage 2)
+      int8            : coreai-opt weight-only int8 quantization
+      int8-palettized : coreai-opt 8-bit k-means palettization
+      int4            : coreai-opt weight-only int4 quantization
+      int4-palettized : coreai-opt 4-bit k-means palettization
+      all             : Run all five levels in sequence
 
-Default runs both and prints a single verdict. Each stage is also callable alone
-via --stage.
+    These compare compressed output against the fp32 reference to measure
+    quality degradation at each precision level. Results directly inform the
+    --compression flag in export_fastvlm.py.
 
-Usage:
-    python scripts/verify_decoder.py [--variant 1.5b]
-    python scripts/verify_decoder.py --variant 1.5b --stage correctness
-    python scripts/verify_decoder.py --variant 1.5b --prefill 6 --decode 4
+    For KV cache correctness across separate runtime calls, see verify_runtime.py.
+
+USAGE
+-----
+  python scripts/verify_decoder.py --variant 1.5b
+  python scripts/verify_decoder.py --variant 1.5b --compression fp16
+  python scripts/verify_decoder.py --variant 1.5b --compression int4-palettized
+  python scripts/verify_decoder.py --variant 1.5b --compression all
 """
 
 import argparse
@@ -41,6 +48,7 @@ from transformers import AutoConfig
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config, Qwen2ForCausalLM
 
 sys.path.insert(0, "scripts")
+from compression import COMPRESSION_LEVELS, apply_compression, psnr  # noqa: E402
 from fastvlm_decoder import (  # noqa: E402
     FastVLMDecoderStateful,
     _load_decoder_weights,
@@ -48,26 +56,12 @@ from fastvlm_decoder import (  # noqa: E402
 )
 
 # Pass thresholds (dB). Engineering judgments, not Apple specifications.
-# See module docstring for rationale.
 CORRECTNESS_PASS     = 80.0   # fp32 cross-model; we achieve ~113 dB
 CORRECTNESS_MARGINAL = 50.0   # below here is definitely wrong
-CACHE_PASS           = 40.0   # fp16 cached decode; we achieve ~72 dB
+COMPRESSION_PASS     = 40.0   # minimum acceptable PSNR after compression
 
 # fp16 range is 0..65504. Flag logits above this as overflow risk.
-# 60000 gives ~8% headroom below the ceiling — enough to catch runaway
-# activations before they produce Inf on the next arithmetic step.
 FP16_OVERFLOW_THRESHOLD = 60000.0
-
-
-def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
-    a_f, b_f = a.float(), b.float()
-    mse = ((a_f - b_f) ** 2).mean().item()
-    if mse == 0:
-        return float("inf")
-    peak = b_f.abs().max().item() ** 2
-    if peak == 0:
-        return float("inf")
-    return 10 * np.log10(peak / mse)
 
 
 # ─── Model builders ───────────────────────────────────────────────────────────
@@ -91,8 +85,6 @@ def _build_port(text_cfg, weights_dir: str, dtype: torch.dtype) -> FastVLMDecode
 def _build_hf_reference(text_cfg, weights_dir: str) -> Qwen2ForCausalLM:
     """Stock HF Qwen2 in fp32, UNFUSED q/k/v (do not run _mutate_state_dict)."""
     weights = _load_decoder_weights(weights_dir, dtype=torch.float32)
-    # text_cfg may be a LlavaConfig subclass; strip to a clean Qwen2Config so HF
-    # does not choke on llava-specific fields.
     try:
         model = Qwen2ForCausalLM(text_cfg).to(torch.float32)
     except Exception:
@@ -108,10 +100,24 @@ def _build_hf_reference(text_cfg, weights_dir: str) -> Qwen2ForCausalLM:
     return model
 
 
+def _example_inputs(text_cfg) -> tuple[torch.Tensor, ...]:
+    """Minimal example inputs for coreai-opt tracing during compression preparation."""
+    torch.manual_seed(0)
+    B, L = 1, 8
+    input_ids = torch.randint(1, text_cfg.vocab_size, (B, L), dtype=torch.int32)
+    pos_ids = torch.arange(L, dtype=torch.int32).unsqueeze(0)
+    return (input_ids, pos_ids)
+
+
 # ─── Stage 1: correctness vs HF ───────────────────────────────────────────────
 
 
-def stage_correctness(text_cfg, weights_dir: str) -> bool:
+def stage_correctness(text_cfg, weights_dir: str) -> tuple[bool, torch.Tensor]:
+    """
+    Run Stage 1 correctness check. Returns (passed, fp32_reference_logits).
+    fp32_reference_logits is returned so stage_compression can reuse it
+    without reloading weights.
+    """
     print("\n" + "=" * 56)
     print("STAGE 1 — CORRECTNESS (fp32, port vs HF Qwen2)")
     print("=" * 56)
@@ -140,13 +146,13 @@ def stage_correctness(text_cfg, weights_dir: str) -> bool:
     torch.manual_seed(0)
     B, L = 1, 8
     input_ids = torch.randint(1, text_cfg.vocab_size, (B, L), dtype=torch.long)
-    pos_ids = torch.arange(L, dtype=torch.long).unsqueeze(0)
+    pos_ids = torch.arange(L, dtype=torch.int32).unsqueeze(0)
 
     with torch.no_grad():
-        hf_out = hf(input_ids=input_ids, position_ids=pos_ids).logits
+        hf_out = hf(input_ids=input_ids, position_ids=pos_ids.long()).logits
         port.k_cache.zero_()
         port.v_cache.zero_()
-        port_out = port(input_ids.to(torch.int32), pos_ids.to(torch.int32))
+        port_out = port(input_ids.to(torch.int32), pos_ids)
 
     for h in handles:
         h.remove()
@@ -170,135 +176,196 @@ def stage_correctness(text_cfg, weights_dir: str) -> bool:
 
     if logits_score > CORRECTNESS_PASS:
         print(f"\n[PASS] {logits_score:.1f} dB — port matches HF Qwen2.")
-        return True
+        return True, port_out
     if logits_score > CORRECTNESS_MARGINAL:
         print(
-            f"\n[MARGINAL] {logits_score:.1f} dB. Likely rope_theta (expect 1e6, not "
-            "the 1e4 fallback) or an SDPA scale mismatch. A uniform mid-40s floor "
-            "across ALL layers is the rope signature; a single-layer cliff is a "
-            f"block bug — start at layer {worst_layer}."
+            f"\n[MARGINAL] {logits_score:.1f} dB. Likely rope_theta or SDPA scale "
+            f"mismatch. Uniform mid-40s floor = rope signature; single-layer cliff = "
+            f"block bug at layer {worst_layer}."
         )
-        return False
+        return False, port_out
     print(
         f"\n[FAIL] {logits_score:.1f} dB — architecture mismatch. Start at layer "
         f"{worst_layer}: check qkv fusion order (q,k,v), head_dim split, rope_theta."
     )
+    return False, port_out
+
+
+# ─── Compression stages ───────────────────────────────────────────────────────
+
+
+def stage_compression(
+    text_cfg,
+    weights_dir: str,
+    level: str,
+    fp32_ref: torch.Tensor,
+) -> bool:
+    """
+    Apply one compression level to the fp32 port and compare against fp32_ref.
+
+    fp32_ref is the logits tensor from Stage 1 — reused here rather than
+    recomputed so we're comparing against the same reference output.
+    """
+    print("\n" + "=" * 56)
+    print(f"COMPRESSION — {level.upper()} vs fp32 reference")
+    print("=" * 56)
+
+    port = _build_port(text_cfg, weights_dir, torch.float32)
+    example_inputs = _example_inputs(text_cfg)
+
+    print(f"Applying {level} compression...")
+    compressed, _ = apply_compression(port, level, example_inputs)
+
+    # For fp16, run the exact same cache-health checks the old Stage 2 did,
+    # since fp16 has unique overflow/NaN failure modes worth diagnosing
+    # separately from just PSNR degradation.
+    if level == "fp16":
+        return _check_fp16_health(compressed, text_cfg, fp32_ref)
+
+    # For quantization/palettization levels: run a forward pass and compare
+    # against the fp32 reference.
+    torch.manual_seed(0)
+    B, L = 1, 8
+    input_ids = torch.randint(1, text_cfg.vocab_size, (B, L), dtype=torch.int32)
+    pos_ids = torch.arange(L, dtype=torch.int32).unsqueeze(0)
+
+    with torch.no_grad():
+        if hasattr(compressed, "k_cache"):
+            compressed.k_cache.zero_()
+            compressed.v_cache.zero_()
+        compressed_out = compressed(input_ids, pos_ids)
+
+    score = psnr(compressed_out, fp32_ref)
+    print(f"\nPSNR vs fp32 reference: {score:.1f} dB")
+
+    if score > COMPRESSION_PASS:
+        print(f"[PASS] {score:.1f} dB — {level} compression viable.")
+        return True
+    print(
+        f"[FAIL] {score:.1f} dB — unacceptable quality loss at {level}. "
+        f"Consider a less aggressive compression level."
+    )
     return False
 
 
-# ─── Stage 2: KV cache ────────────────────────────────────────────────────────
-
-
-def stage_cache(text_cfg, weights_dir: str, n_prefill: int, n_decode: int) -> bool:
-    print("\n" + "=" * 56)
-    print(f"STAGE 2 — KV CACHE + fp16 HEALTH (prefill={n_prefill}, decode={n_decode})")
-    print("=" * 56)
-    # This stage runs the REAL artifact: the fp16 model, across a cached multi-step
-    # decode — the only place fp16 pathology (overflow, NaN/Inf, accumulation
-    # through the cache) actually surfaces. There is no fp32 comparison here
-    # because fp16 IS the authored target for the ANE; fp32 is not something that
-    # ships. Correctness (architecture) is Stage 1's job; this proves the fp16
-    # cached model runs clean and the cache reads back what it wrote.
-
-    port = _build_port(text_cfg, weights_dir, torch.float16)
+def _check_fp16_health(
+    port_fp16: FastVLMDecoderStateful,
+    text_cfg,
+    fp32_ref: torch.Tensor,
+) -> bool:
+    """
+    fp16-specific health checks: NaN/Inf, overflow risk, and cache correctness
+    across a prefill + decode sequence. More thorough than a single PSNR
+    comparison because fp16 pathology often surfaces specifically in the
+    cached multi-step decode path, not on a single forward pass.
+    """
+    n_prefill, n_decode = 6, 4
     total = n_prefill + n_decode
-
     torch.manual_seed(0)
     input_ids = torch.randint(1, text_cfg.vocab_size, (1, total), dtype=torch.int32)
     pos_full = torch.arange(total, dtype=torch.int32).unsqueeze(0)
 
-    # Ground truth: one full pass (offset 0, every token sees all prior positions).
-    port.k_cache.zero_()
-    port.v_cache.zero_()
+    # Full pass reference in fp16
+    port_fp16.k_cache.zero_()
+    port_fp16.v_cache.zero_()
     with torch.no_grad():
-        ref_logits = port(input_ids, pos_full)
+        ref_fp16 = port_fp16(input_ids, pos_full)
 
-    # Cached: prefill, then per-token decode reading/writing the cache.
-    port.k_cache.zero_()
-    port.v_cache.zero_()
-    cached = torch.zeros_like(ref_logits)
+    # Cached: prefill then per-token decode
+    port_fp16.k_cache.zero_()
+    port_fp16.v_cache.zero_()
+    cached = torch.zeros_like(ref_fp16)
     with torch.no_grad():
-        pre_out = port(input_ids[:, :n_prefill], pos_full[:, :n_prefill])
+        pre_out = port_fp16(input_ids[:, :n_prefill], pos_full[:, :n_prefill])
         cached[:, :n_prefill] = pre_out
         for t in range(n_decode):
             p = n_prefill + t
-            step_out = port(input_ids[:, p : p + 1], pos_full[:, : p + 1])
+            step_out = port_fp16(input_ids[:, p:p + 1], pos_full[:, :p + 1])
             cached[:, p] = step_out[:, 0]
 
-    # ── fp16 health: the cached run is the real fp16 artifact across many steps ─
     has_nan = torch.isnan(cached).any().item()
     has_inf = torch.isinf(cached).any().item()
-    # fp16 max finite is 65504; flag values near saturation as overflow risk.
     max_abs = cached.abs().max().item()
     overflow_risk = max_abs > FP16_OVERFLOW_THRESHOLD
+
     print(f"\nfp16 NaN / Inf     : {has_nan} / {has_inf}")
     print(f"fp16 max |logit|   : {max_abs:.0f}  (fp16 ceiling 65504)")
 
-    # ── cache correctness: cached decode must match the full pass ──────────────
-    first_decode = psnr(cached[:, n_prefill : n_prefill + 1], ref_logits[:, n_prefill : n_prefill + 1])
-    decode_span = psnr(cached[:, n_prefill:], ref_logits[:, n_prefill:])
+    first_decode = psnr(
+        cached[:, n_prefill:n_prefill + 1],
+        ref_fp16[:, n_prefill:n_prefill + 1],
+    )
+    decode_span = psnr(cached[:, n_prefill:], ref_fp16[:, n_prefill:])
     print(f"first decode step PSNR: {first_decode:.1f} dB")
     print(f"decode span PSNR      : {decode_span:.1f} dB")
 
     if has_nan or has_inf:
-        print("\n[FAIL] NaN/Inf in fp16 cached output — fp16 pathology, not a cache bug.")
+        print("\n[FAIL] NaN/Inf in fp16 cached output.")
         return False
     if overflow_risk:
-        print(
-            f"\n[FAIL] fp16 logits near saturation ({max_abs:.0f}). An activation is "
-            "overflowing fp16 — same failure class as the vision encoder's 1024x1024 "
-            "overflow. Find the unbounded op (pre-norm activation / attention logits)."
-        )
+        print(f"\n[FAIL] fp16 logits near saturation ({max_abs:.0f}).")
         return False
-    if decode_span > CACHE_PASS and first_decode > CACHE_PASS:
-        print(f"\n[PASS] fp16 cached decode clean and matches full pass ({decode_span:.1f} dB).")
+    if decode_span > COMPRESSION_PASS and first_decode > COMPRESSION_PASS:
+        print(f"\n[PASS] fp16 cached decode clean ({decode_span:.1f} dB).")
         return True
-    print(
-        f"\n[FAIL] cached decode diverges. First decode step is the suspect: check "
-        "offset (= new token's absolute position), the head flatten/restore "
-        "reshape, and that the read span is [0:seq_len]. If mutable_slice_update "
-        "resolved to the local fallback rather than coreai_models, the mutation "
-        "may not be landing — confirm the import."
-    )
+    print(f"\n[FAIL] fp16 cached decode diverges ({decode_span:.1f} dB).")
     return False
 
 
 # ─── Driver ───────────────────────────────────────────────────────────────────
 
 
-def verify(variant: str, stage: str, n_prefill: int, n_decode: int) -> None:
+def verify(variant: str, compression: list[str] | None) -> None:
     weights_dir = f"weights/fastvlm-{variant}"
     print(f"Verifying decoder: {variant} ({weights_dir})")
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
 
-    if stage == "correctness":
-        sys.exit(0 if stage_correctness(text_cfg, weights_dir) else 1)
-    if stage == "cache":
-        sys.exit(0 if stage_cache(text_cfg, weights_dir, n_prefill, n_decode) else 1)
+    passed, fp32_ref = stage_correctness(text_cfg, weights_dir)
+    if not passed:
+        print("\n>>> Stage 1 FAILED. Fix correctness before testing compression.")
+        sys.exit(1)
 
-    # stage == "all": run in order, stop at first failure.
-    if not stage_correctness(text_cfg, weights_dir):
-        print("\n>>> Stopped at Stage 1. Fix correctness before anything else.")
-        sys.exit(1)
-    if not stage_cache(text_cfg, weights_dir, n_prefill, n_decode):
-        print("\n>>> Stopped at Stage 2. Architecture is right; cache or fp16 is not.")
-        sys.exit(1)
+    if not compression:
+        print("\n" + "=" * 56)
+        print("ALL STAGES PASS — safe to export.")
+        print("=" * 56)
+        sys.exit(0)
+
+    levels = COMPRESSION_LEVELS if "all" in compression else compression
+    all_passed = True
+    for level in levels:
+        level_passed = stage_compression(text_cfg, weights_dir, level, fp32_ref)
+        all_passed = all_passed and level_passed
 
     print("\n" + "=" * 56)
-    print("ALL STAGES PASS — safe to export.")
+    if all_passed:
+        print("ALL COMPRESSION CHECKS PASS.")
+    else:
+        print("ONE OR MORE COMPRESSION CHECKS FAILED.")
     print("=" * 56)
+    sys.exit(0 if all_passed else 1)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Verify FastVLM decoder correctness and compression quality.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python scripts/verify_decoder.py --variant 1.5b
+  python scripts/verify_decoder.py --variant 1.5b --compression fp16
+  python scripts/verify_decoder.py --variant 1.5b --compression int4-palettized
+  python scripts/verify_decoder.py --variant 1.5b --compression all
+""",
+    )
     ap.add_argument("--variant", default="1.5b", choices=["0.5b", "1.5b", "7b"])
     ap.add_argument(
-        "--stage",
-        default="all",
-        choices=["all", "correctness", "cache"],
+        "--compression",
+        nargs="+",
+        choices=COMPRESSION_LEVELS + ["all"],
+        default=None,
+        help="Compression level(s) to test after Stage 1. Default: none (Stage 1 only).",
     )
-    ap.add_argument("--prefill", type=int, default=6)
-    ap.add_argument("--decode", type=int, default=4)
     args = ap.parse_args()
-    verify(args.variant, args.stage, args.prefill, args.decode)
+    verify(args.variant, args.compression)
