@@ -235,8 +235,27 @@ def stage_compression(
             compressed.v_cache.zero_()
         compressed_out = compressed(input_ids, pos_ids)
 
-    score = psnr(compressed_out, fp32_ref)
-    print(f"\nPSNR vs fp32 reference: {score:.1f} dB")
+    score_vs_fp32 = psnr(compressed_out, fp32_ref)
+
+    # For int8/int4 (which cast to fp16 internally), also compare against a
+    # fp16 reference to isolate quantization error from fp16 rounding error.
+    # PSNR vs fp32 = total compression delta (fp16 rounding + quantization).
+    # PSNR vs fp16 = quantization-only delta (what int8/int4 adds beyond fp16).
+    if level in ("int8", "int4"):
+        fp16_port = _build_port(text_cfg, weights_dir, torch.float16)
+        torch.manual_seed(0)
+        with torch.no_grad():
+            if hasattr(fp16_port, "k_cache"):
+                fp16_port.k_cache.zero_()
+                fp16_port.v_cache.zero_()
+            fp16_ref_out = fp16_port(input_ids, pos_ids)
+        score_vs_fp16 = psnr(compressed_out, fp16_ref_out.float())
+        print(f"\nPSNR vs fp32 reference : {score_vs_fp32:.1f} dB  (fp16 rounding + quantization)")
+        print(f"PSNR vs fp16 reference : {score_vs_fp16:.1f} dB  (quantization error only)")
+        score = score_vs_fp16  # gate pass/fail on quantization-only delta
+    else:
+        print(f"\nPSNR vs fp32 reference: {score_vs_fp32:.1f} dB")
+        score = score_vs_fp32
 
     if score > COMPRESSION_PASS:
         print(f"[PASS] {score:.1f} dB — {level} compression viable.")

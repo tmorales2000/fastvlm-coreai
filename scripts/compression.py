@@ -88,6 +88,8 @@ from coreai_opt.common import ExportBackend
 from coreai_opt.palettization.config import KMeansPalettizerConfig
 from coreai_opt.palettization.kmeans import KMeansPalettizer
 from coreai_opt.quantization import Quantizer, QuantizerConfig
+from coreai_opt.quantization.spec import PerBlockGranularity, QuantizationSpec, QuantizationScheme
+from coreai_opt.quantization.config import ModuleQuantizerConfig
 
 # All supported compression levels. Matches the --compression CLI flag values
 # in verify_*.py and export_fastvlm.py.
@@ -149,30 +151,64 @@ def apply_compression(
         return model.half(), None
 
     if level == "int8":
-        # axis=0 is specified explicitly rather than using the preset default
-        # of axis=None. With axis=None, coreai-opt tries to auto-resolve the
-        # quantization axis from the module type — but this fails for our
-        # custom composite ops (RoPE, SDPA, RMSNorm) which are not nn.Linear
-        # or nn.Conv2d and have no registered axis defaults. axis=0 is the
-        # correct output-channel axis for nn.Linear weight matrices (shape
-        # [out_features, in_features]) and is applied uniformly across all
-        # module types without requiring auto-resolution.
-        compressor = Quantizer(model, QuantizerConfig.presets.w8(axis=0))
+        # Simulates Apple's MLX int8 scheme (FastVLM 1.5B) as closely as
+        # coreai-opt allows. Apple's scheme is a two-part compression:
+        #   1. Non-linear tensors (RMSNorm scales, attention biases, etc.)
+        #      stored as fp16 — not quantized.
+        #   2. nn.Linear weight matrices: grouped asymmetric int8,
+        #      group_size=64 along input-channel axis, per-group scale +
+        #      zero-point in fp16.
+        # We replicate by casting the full model to fp16 first, then applying
+        # block quantization only to nn.Linear weights. PSNR reflects TOTAL
+        # quality delta from fp32 (fp16 rounding + int8 quantization combined).
+        model = model.half()
+        weight_spec = QuantizationSpec(
+            dtype=torch.int8,
+            qscheme=QuantizationScheme.ASYMMETRIC,
+            granularity=PerBlockGranularity(axis=1, block_size=64),
+        )
+        linear_config = ModuleQuantizerConfig(
+            op_input_spec={},
+            op_output_spec={},
+            op_state_spec={"weight": weight_spec},
+        )
+        config = QuantizerConfig(global_config=None).set_module_type(torch.nn.Linear, linear_config)
+        compressor = Quantizer(model, config)
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
 
     if level == "int8-palettized":
+        # Cast non-Linear tensors to fp16 for consistency with the int8/int4
+        # approach and with a real export where everything not palettized
+        # would be stored at fp16.
+        model = model.half()
         compressor = KMeansPalettizer(model, KMeansPalettizerConfig.presets.w8())
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
 
     if level == "int4":
-        # Same axis=0 rationale as int8 above.
-        compressor = Quantizer(model, QuantizerConfig.presets.w4(axis=0))
+        # Same two-part scheme as int8 above, matching Apple's MLX 7B:
+        # fp16 for non-linear tensors, grouped asymmetric int4 for nn.Linear
+        # weights (group_size=64, axis=1). PSNR reflects total quality delta
+        # from fp32 (fp16 rounding + int4 quantization combined).
+        model = model.half()
+        weight_spec = QuantizationSpec(
+            dtype=torch.int4,
+            qscheme=QuantizationScheme.ASYMMETRIC,
+            granularity=PerBlockGranularity(axis=1, block_size=64),
+        )
+        linear_config = ModuleQuantizerConfig(
+            op_input_spec={},
+            op_output_spec={},
+            op_state_spec={"weight": weight_spec},
+        )
+        config = QuantizerConfig(global_config=None).set_module_type(torch.nn.Linear, linear_config)
+        compressor = Quantizer(model, config)
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
 
     if level == "int4-palettized":
+        model = model.half()
         compressor = KMeansPalettizer(model, KMeansPalettizerConfig.presets.w4())
         prepared = compressor.prepare(example_inputs)
         return prepared, compressor
