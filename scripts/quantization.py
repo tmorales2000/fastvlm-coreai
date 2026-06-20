@@ -24,10 +24,22 @@ Precision -> Quantization) for where this fits in the overall pipeline.
 SUPPORTED QUANTIZATION LEVELS
 -------------------------------
   int8 : coreai-opt weight-only int8 quantization, grouped asymmetric,
-         block_size=64 along input-channel axis. Matches Apple's MLX
-         int8 scheme for FastVLM 1.5B.
+         block_size=64 along the reduction axis (axis=1 for both
+         nn.Linear and nn.Embedding). Matches Apple's MLX int8 scheme
+         for FastVLM 1.5B.
   int4 : coreai-opt weight-only int4 quantization, same scheme.
          Matches Apple's MLX int4 scheme for FastVLM 7B.
+
+QUANTIZATION SCOPE (verified by scripts/audit_weight_dtypes.py)
+-------------------------------------------------------------------
+Both nn.Linear AND nn.Embedding weights are quantized -- this matches
+Apple's MLX output exactly, confirmed by an exhaustive tensor-by-tensor
+audit across all three variants. Quantized: embed_tokens, lm_head, all
+mlp.{gate,up,down}_proj, all self_attn.{q,k,v,o}_proj. NOT quantized
+(stay fp16): RMSNorm weights, all Linear/Embedding biases. This was
+NOT always the case in this module's history -- an earlier version only
+quantized nn.Linear, missing embed_tokens entirely. See audit script
+output for the full per-module-kind verification.
 
 Mutually exclusive — a model is exported as either int8 or int4, never both,
 and there is no "all" option. (verify_decoder.py runs each level as a
@@ -155,17 +167,29 @@ def apply_quantization(
     model.eval()
     model = model.half()
 
+    # block_size=64, axis=1, ASYMMETRIC is shared by nn.Linear and
+    # nn.Embedding -- coreai-opt's per-block axis default for both is 1
+    # (the reduction/embedding_dim axis), matching Apple's MLX scheme
+    # exactly for both module types. Confirmed by exhaustive audit
+    # (audit_weight_dtypes.py) that Apple quantizes embed_tokens, lm_head,
+    # all mlp.*, all self_attn.{q,k,v,o}_proj, and both projector Linear
+    # layers -- i.e. every weight-bearing nn.Linear AND the nn.Embedding
+    # table. Only norms and biases are excluded (never quantized by Apple).
     weight_spec = QuantizationSpec(
         dtype=_DTYPE[level],
         qscheme=QuantizationScheme.ASYMMETRIC,
         granularity=PerBlockGranularity(axis=1, block_size=64),
     )
-    linear_config = ModuleQuantizerConfig(
+    module_config = ModuleQuantizerConfig(
         op_input_spec={},
         op_output_spec={},
         op_state_spec={"weight": weight_spec},
     )
-    config = QuantizerConfig(global_config=None).set_module_type(torch.nn.Linear, linear_config)
+    config = (
+        QuantizerConfig(global_config=None)
+        .set_module_type(torch.nn.Linear, module_config)
+        .set_module_type(torch.nn.Embedding, module_config)
+    )
     quantizer = Quantizer(model, config)
     prepared = quantizer.prepare(example_inputs)
     return prepared, quantizer
