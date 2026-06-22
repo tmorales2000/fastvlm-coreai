@@ -35,14 +35,14 @@ from safetensors import safe_open
 VARIANT_CONFIG = {
     "1.5b": {
         "hf_path": "weights/fastvlm-1.5b",
-        "mlx_path": "~/git/tmorales2000/ml-fastvlm/checkpoints/llava-fastvithd_1.5b_stage3_llm.int8",
+        "mlx_path": "weights/fastvlm-1.5b-int8",  # HF MLX weights (Aug 2025)
         "bits": 8,
         "group_size": 64,
         "layer_count": 28,
     },
     "7b": {
         "hf_path": "weights/fastvlm-7b",
-        "mlx_path": "~/git/tmorales2000/ml-fastvlm/checkpoints/llava-fastvithd_7b_stage3_llm.int4",
+        "mlx_path": "weights/fastvlm-7b-int4",    # HF MLX weights (Aug 2025)
         "bits": 4,
         "group_size": 64,
         "layer_count": 28,
@@ -109,74 +109,40 @@ def mlx_dequantize(w_q: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor
     return torch.from_numpy(unpacked)
 
 
-def our_dequantize(w_fp32: torch.Tensor, bits: int, group_size: int) -> torch.Tensor:
+def our_dequantize(w_bf16: torch.Tensor, bits: int, group_size: int) -> torch.Tensor:
     """
-    Quantize a fp32 weight tensor using our coreai-opt scheme
-    (PerBlockGranularity, axis=1, block_size=group_size, ASYMMETRIC)
-    then dequantize back to fp32 by running a forward pass through the
-    fake-quantize modules inserted by prepare().
+    Simulate our coreai-opt quantization scheme (fp16->int8/int4, PerBlock
+    axis=1 block_size=64, ASYMMETRIC) by implementing the quantization
+    math directly in numpy — identical to how mlx_dequantize works for
+    Apple's weights, but applied from fp16 input (matching our Stage 3 pipeline).
 
-    Key insight: finalize() converts to Core AI ops, not readable fp32.
-    The prepared model's fake-quantize modules simulate quantization
-    during forward pass — so we extract the simulated (quantized→dequantized)
-    weight by reading the fake-quantize output directly.
-
-    We don't call finalize() here — we use the prepared model for evaluation,
-    as recommended by the coreai-opt docs for torch-based evaluation.
+    Uses the same asymmetric affine formula:
+      scale  = (max - min) / (2^bits - 1)
+      zero   = round(-min / scale)   [standard asymmetric zero-point]
+      q      = clamp(round(w/scale) + zero, 0, 2^bits-1)
+      w_dq   = (q - zero) * scale    == scale*q + bias  where bias = -zero*scale
     """
-    from coreai_opt.quantization import Quantizer, QuantizerConfig
-    from coreai_opt.quantization.spec import (
-        PerBlockGranularity, QuantizationSpec, QuantizationScheme
-    )
-    from coreai_opt.quantization.config import ModuleQuantizerConfig
+    import numpy as np
 
-    dtype = torch.int8 if bits == 8 else torch.int4
+    # Cast bf16->fp16, matching our Stage 3 pipeline
+    w = w_bf16.to(torch.float16).float().numpy()  # [out_f, in_f]
+    out_f, in_f = w.shape
+    n_groups = in_f // group_size
+    n_levels = (1 << bits) - 1  # 255 for int8, 15 for int4
+    result = np.zeros_like(w)
 
-    weight_spec = QuantizationSpec(
-        dtype=dtype,
-        qscheme=QuantizationScheme.ASYMMETRIC,
-        granularity=PerBlockGranularity(axis=1, block_size=group_size),
-    )
-    linear_config = ModuleQuantizerConfig(
-        op_input_spec={},
-        op_output_spec={},
-        op_state_spec={"weight": weight_spec},
-    )
+    for g in range(n_groups):
+        col = slice(g * group_size, (g + 1) * group_size)
+        block = w[:, col]  # [out_f, group_size]
+        w_min = block.min(axis=1, keepdims=True)
+        w_max = block.max(axis=1, keepdims=True)
+        scale = (w_max - w_min) / n_levels
+        scale = np.where(scale == 0, 1e-8, scale)
+        zero = np.round(-w_min / scale).clip(0, n_levels)
+        q = np.round(block / scale + zero).clip(0, n_levels)
+        result[:, col] = (q - zero) * scale
 
-    out_f, in_f = w_fp32.shape
-    layer = torch.nn.Linear(in_f, out_f, bias=False)
-    layer.weight = torch.nn.Parameter(w_fp32.clone())
-    layer.eval()
-
-    config = QuantizerConfig().set_module_type(torch.nn.Linear, linear_config)
-    quantizer = Quantizer(layer, config)
-    example = (torch.zeros(1, in_f),)
-    prepared = quantizer.prepare(example)
-    prepared.eval()
-
-    # Run a forward pass — fake-quantize modules apply simulated quantization
-    # to the weight during forward. We capture the weight AFTER fake-quantize
-    # by hooking into the fake-quantize module directly.
-    # The fake-quantize module is a child of the prepared linear layer.
-    fq_weight = None
-    for name, mod in prepared.named_modules():
-        # coreai-opt inserts fake-quantize as a child; run it on the weight
-        cls_name = type(mod).__name__.lower()
-        if "fakequant" in cls_name or "fake_quantize" in cls_name:
-            with torch.no_grad():
-                fq_weight = mod(layer.weight.detach())
-            break
-
-    if fq_weight is not None:
-        return fq_weight.float()
-
-    # Fallback: run forward pass and compare output difference
-    # If fake-quantize is graph-level, extract via weight comparison
-    with torch.no_grad():
-        x = torch.eye(in_f)  # identity input to read out weight rows directly
-        out_orig = layer(x).T  # [out_f, in_f]
-        out_quant = prepared(x).T
-    return out_quant.float()
+    return torch.from_numpy(result).float()
 
 
 def load_hf_weights(hf_path: str, layer_indices: list, modules: list) -> dict:
@@ -208,7 +174,7 @@ def main():
 
     cfg = VARIANT_CONFIG[args.variant]
     hf_path = cfg["hf_path"]
-    mlx_path = os.path.expanduser(cfg["mlx_path"])
+    mlx_path = cfg["mlx_path"]
     bits = cfg["bits"]
     group_size = cfg["group_size"]
     layer_count = cfg["layer_count"]

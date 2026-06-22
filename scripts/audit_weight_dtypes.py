@@ -34,14 +34,25 @@ WHAT IT REPORTS, PER VARIANT
 
 USAGE
 -----
-  # HF checkpoint audit only (no MLX comparison, no external path needed):
+  # Full audit (HF PyTorch + HF MLX weights in weights/ directory):
   python scripts/audit_weight_dtypes.py
 
-  # Full audit including Apple MLX checkpoints:
-  python scripts/audit_weight_dtypes.py --mlx-checkpoints-dir /path/to/ml-fastvlm/checkpoints
+  # HF PyTorch weights only (no MLX comparison):
+  python scripts/audit_weight_dtypes.py --no-mlx
 
-  # Single variant, full audit:
-  python scripts/audit_weight_dtypes.py --variant 7b --mlx-checkpoints-dir /path/to/ml-fastvlm/checkpoints
+  # Single variant:
+  python scripts/audit_weight_dtypes.py --variant 7b
+
+  # Legacy CDN layout (not recommended -- CDN weights are April 2025,
+  # HF weights are August 2025; use HF weights):
+  python scripts/audit_weight_dtypes.py --mlx-checkpoints-dir ~/path/to/checkpoints
+
+MLX WEIGHTS SETUP
+-----------------
+Download the current HF MLX weights before running:
+  hf download apple/FastVLM-0.5B-fp16 --local-dir weights/fastvlm-0.5b-fp16
+  hf download apple/FastVLM-1.5B-int8 --local-dir weights/fastvlm-1.5b-int8
+  hf download apple/FastVLM-7B-int4   --local-dir weights/fastvlm-7b-int4
 
 The MLX checkpoint subdirectory NAMES (e.g. llava-fastvithd_7b_stage3_llm.int4)
 are fixed by Apple/mlx-vlm's own naming convention and are hardcoded in
@@ -69,23 +80,43 @@ HF_PATHS = {
 # was cloned) and must never be hardcoded. Supplied via --mlx-checkpoints-dir;
 # if omitted, MLX audit steps are skipped entirely and only the HF checkpoint
 # audit runs.
-MLX_DIR_NAMES = {
-    "0.5b": "llava-fastvithd_0.5b_stage3_llm.fp16",
-    "1.5b": "llava-fastvithd_1.5b_stage3_llm.int8",
-    "7b":   "llava-fastvithd_7b_stage3_llm.int4",
+# MLX checkpoint paths relative to the repo weights/ directory.
+# These are the HF-sourced MLX weights (apple/FastVLM-*-fp16/int8/int4),
+# downloaded via: hf download apple/FastVLM-<variant>-<precision>
+#   --local-dir weights/fastvlm-<variant>-<precision>
+# DO NOT use the CDN checkpoints (llava-fastvithd_*_stage3_llm.*)
+# -- those are April 2025 vintage and predate the August 2025 HF release.
+MLX_WEIGHT_DIRS = {
+    "0.5b": "weights/fastvlm-0.5b-fp16",
+    "1.5b": "weights/fastvlm-1.5b-int8",
+    "7b":   "weights/fastvlm-7b-int4",
 }
 
 
 def _mlx_paths(mlx_checkpoints_dir: str | None) -> dict[str, str]:
     """
-    Build the variant -> full MLX checkpoint path mapping from a
-    user-supplied parent directory. Returns an empty dict (all variants
-    skipped) if mlx_checkpoints_dir is None.
+    Build the variant -> full MLX checkpoint path mapping.
+
+    If --mlx-checkpoints-dir is supplied, use it as the parent directory
+    of the MLX checkpoint subdirectories (legacy CDN layout).
+    If omitted, use the default weights/ directory paths in MLX_WEIGHT_DIRS,
+    which expect the HF MLX weights to be downloaded via:
+      hf download apple/FastVLM-<variant>-<precision> --local-dir weights/fastvlm-<variant>-<precision>
     """
-    if mlx_checkpoints_dir is None:
-        return {}
-    base = os.path.expanduser(mlx_checkpoints_dir)
-    return {variant: os.path.join(base, name) for variant, name in MLX_DIR_NAMES.items()}
+    if mlx_checkpoints_dir is not None:
+        # Legacy: CDN layout with subdirectory names
+        base = os.path.expanduser(mlx_checkpoints_dir)
+        # Try to find matching dirs by scanning for known patterns
+        result = {}
+        for variant in ["0.5b", "1.5b", "7b"]:
+            for d in os.listdir(base):
+                if variant.replace(".", "") in d.lower() and os.path.isdir(os.path.join(base, d)):
+                    if any(f.endswith(".safetensors") for f in os.listdir(os.path.join(base, d))):
+                        result[variant] = os.path.join(base, d)
+                        break
+        return result
+    # Default: HF MLX weights in weights/ directory
+    return {v: p for v, p in MLX_WEIGHT_DIRS.items() if os.path.isdir(p)}
 
 EXPECTED_NON_FP16_OK = set()  # nothing is expected to deviate; flag everything
 
@@ -360,25 +391,28 @@ examples:
     ap.add_argument("--variant", choices=["0.5b", "1.5b", "7b"], default=None,
                      help="Audit a single variant only. Default: all three.")
     ap.add_argument("--mlx-checkpoints-dir", default=None,
-                     help="Parent directory containing Apple's MLX checkpoint "
-                          "subdirectories (e.g. .../ml-fastvlm/checkpoints). "
-                          "The subdirectory NAMES are fixed (Apple's own "
-                          "naming convention, see MLX_DIR_NAMES) but this "
-                          "parent path is environment-specific and is never "
-                          "hardcoded. If omitted, only the HF checkpoint "
-                          "audit runs and all MLX comparison is skipped.")
+                     help="Legacy: parent directory of CDN-layout MLX checkpoint "
+                          "subdirectories. If omitted, uses HF MLX weights from "
+                          "weights/fastvlm-*-fp16/int8/int4 by default.")
+    ap.add_argument("--no-mlx", action="store_true", default=False,
+                     help="Skip MLX comparison entirely.")
     args = ap.parse_args()
 
     variants = [args.variant] if args.variant else ["0.5b", "1.5b", "7b"]
-    mlx_paths = _mlx_paths(args.mlx_checkpoints_dir)
+    mlx_paths = {} if getattr(args, "no_mlx", False) else _mlx_paths(args.mlx_checkpoints_dir)
 
     print("=" * 72)
     print("FastVLM weight dtype/quantization audit")
     print("=" * 72)
 
     if not mlx_paths:
-        print("\n[INFO] --mlx-checkpoints-dir not supplied — running HF-only audit.")
-        print("       Pass --mlx-checkpoints-dir <path> to also audit Apple's MLX weights.")
+        print("\n[INFO] No MLX weights found — running HF PyTorch-only audit.")
+        print("       Download HF MLX weights to weights/ to enable comparison:")
+        print("         hf download apple/FastVLM-0.5B-fp16 --local-dir weights/fastvlm-0.5b-fp16")
+        print("         hf download apple/FastVLM-1.5B-int8 --local-dir weights/fastvlm-1.5b-int8")
+        print("         hf download apple/FastVLM-7B-int4   --local-dir weights/fastvlm-7b-int4")
+    else:
+        print(f"\n[INFO] MLX weights found for variants: {sorted(mlx_paths.keys())}")
 
     mlx_results: dict[str, dict[str, str]] = {}
 
