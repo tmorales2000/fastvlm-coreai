@@ -11,21 +11,25 @@ Stage 1 — CORRECTNESS (HF weights -> fp32 port)
     localises a bug to a specific transformer block. PSNR is measured against
     the HF reference output. This is the ONLY stage that runs by default.
 
-Stage 2 — PRECISION (fp32 -> fp16)
-    Cast the verified fp32 port to float16 — the mandatory ANE execution
-    precision. NOT optional, NOT "compression": every decoder export goes
-    through this stage regardless of whether quantization follows. PSNR is
-    measured against the Stage 1 fp32 port (not the original HF weights) —
-    this isolates the fp16 cast's own error from any residual Stage 1
-    structural imprecision. Includes NaN/Inf/overflow checks and a cached
-    prefill+decode health check, since fp16 failure modes often only surface
-    in the cached multi-step decode path. Always runs after Stage 1 passes.
+Stage 2 — PRECISION (bf16 -> fp16)
+    Load weights directly as float16 (bf16 -> fp16, one direct cast, no fp32
+    intermediate) — the mandatory ANE execution precision. NOT optional, NOT
+    "compression": every decoder export goes through this stage regardless of
+    whether quantization follows. PSNR is measured against a matching fp32
+    port over the same token sequence — fp32 is used as a high-precision
+    reference ONLY here, not as an intermediate in the actual precision path.
+    Includes NaN/Inf/overflow checks and a cached prefill+decode health
+    check, since fp16 failure modes often only surface in the cached
+    multi-step decode path. Always runs after Stage 1 passes.
 
 Stage 3 — QUANTIZATION (fp16 -> int8 | int4), optional
-    Apply coreai-opt weight-only quantization on top of the Stage 2 fp16
-    model. Mutually exclusive: int8 or int4, never both, no "all". PSNR is
-    measured against the Stage 2 fp16 output — this isolates quantization-only
-    error from the fp16 cast's error. Only runs if --quantize is passed.
+    Apply coreai-opt weight-only quantization from fp16, matching Apple's
+    MLX pipeline exactly. Confirmed: mlx_vlm.convert casts bf16->fp16 for
+    ALL tensors before quantization (verified via 0.5B MLX checkpoint — no
+    quantization, yet every tensor is fp16). Apple's pipeline is therefore
+    fp16->int8/int4 for linear/embedding weights; non-linears stay fp16.
+    Mutually exclusive: int8 or int4, never both, no "all". PSNR is
+    measured against the Stage 2 fp16 output. Only runs if --quantize is passed.
 
     Results directly inform the --quantize flag in export_fastvlm.py.
 
@@ -34,7 +38,7 @@ Stage 3 — QUANTIZATION (fp16 -> int8 | int4), optional
 VALIDATED PRODUCTION TARGETS
 -----------------------------
   0.5B : Stage 2 only, no quantization (matches Apple MLX, unquantized)
-  1.5B : Stage 3 int8  (46.2 dB vs fp16, PASS)
+  1.5B : Stage 3 int8  (49.6 dB vs fp16, PASS — includes embed_tokens quantization)
   7B   : Stage 3 int8  (int4 fails at 22.4 dB vs fp16 — fp16 pre-cast
                         sensitivity; see psnr_results.md)
 
@@ -58,7 +62,6 @@ from quantization import QUANTIZATION_LEVELS, apply_quantization, psnr  # noqa: 
 from fastvlm_decoder import (  # noqa: E402
     FastVLMDecoderStateful,
     _load_decoder_weights,
-    _mutate_state_dict,
 )
 
 # Pass thresholds (dB). Engineering judgments, not Apple specifications.
@@ -76,7 +79,6 @@ FP16_OVERFLOW_THRESHOLD = 60000.0
 
 def _build_port(text_cfg, weights_dir: str, dtype: torch.dtype) -> FastVLMDecoderStateful:
     weights = _load_decoder_weights(weights_dir, dtype=dtype)
-    _mutate_state_dict(weights)
     weights = {k.removeprefix("model."): v for k, v in weights.items()}
     model = FastVLMDecoderStateful(text_cfg).to(dtype=dtype)
     missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
@@ -119,10 +121,11 @@ def _example_inputs(text_cfg) -> tuple[torch.Tensor, ...]:
 # ─── Stage 1: correctness vs HF ───────────────────────────────────────────────
 
 
-def stage_correctness(text_cfg, weights_dir: str) -> tuple[bool, torch.Tensor]:
+def stage_correctness(text_cfg, weights_dir: str) -> bool:
     """
-    Stage 1 — CORRECTNESS. Returns (passed, fp32_port_logits).
-    fp32_port_logits is the Stage 1 output, reused as the Stage 2 reference.
+    Stage 1 — CORRECTNESS. Returns passed (bool) only.
+    Each subsequent stage loads its own fresh port from bf16 weights.
+    Stage 2 builds its own fp32 reference independently.
     """
     print("\n" + "=" * 56)
     print("STAGE 1 — CORRECTNESS (HF weights -> fp32 port)")
@@ -189,19 +192,19 @@ def stage_correctness(text_cfg, weights_dir: str) -> tuple[bool, torch.Tensor]:
 
     if logits_score > CORRECTNESS_PASS:
         print(f"\n[PASS] {logits_score:.1f} dB — port matches HF Qwen2.")
-        return True, port_out
+        return True
     if logits_score > CORRECTNESS_MARGINAL:
         print(
             f"\n[MARGINAL] {logits_score:.1f} dB. Likely rope_theta or SDPA scale "
             f"mismatch. Uniform mid-40s floor = rope signature; single-layer cliff = "
             f"block bug at layer {worst_layer}."
         )
-        return False, port_out
+        return False
     print(
         f"\n[FAIL] {logits_score:.1f} dB — architecture mismatch. Start at layer "
-        f"{worst_layer}: check qkv fusion order (q,k,v), head_dim split, rope_theta."
+        f"{worst_layer}: check head_dim split, rope_theta, RoPE application order."
     )
-    return False, port_out
+    return False
 
 
 # ─── Stage 2: precision (fp32 -> fp16) ─────────────────────────────────────────
@@ -210,22 +213,18 @@ def stage_correctness(text_cfg, weights_dir: str) -> tuple[bool, torch.Tensor]:
 def stage_precision(
     text_cfg,
     weights_dir: str,
-) -> tuple[bool, FastVLMDecoderStateful]:
+) -> bool:
     """
-    Stage 2 — PRECISION. Cast to fp16 and run NaN/Inf/overflow + cached
-    decode health checks. PSNR is measured against a freshly-built fp32
-    port run over the SAME prefill+decode token sequence used here — NOT
-    the Stage 1 8-token-only reference, which has a different sequence
-    length and can't be sliced against the decode span. Building a
-    dedicated fp32 reference (rather than reusing Stage 1's output)
-    still isolates the fp16 cast's own error, since both fp32 and fp16
-    runs use the identical port and the identical input sequence.
-
-    Returns (passed, fp16_port) — fp16_port is reused as the Stage 3 base
-    model.
+    Stage 2 — PRECISION. Builds a fresh fp16 port (bf16->fp16 direct cast)
+    and runs NaN/Inf/overflow + cached prefill/decode health checks.
+    PSNR is measured against a matching fp32 port over the SAME token
+    sequence — fp32 is used here ONLY as a high-precision reference to
+    quantify the fp16 cast's own error, NOT as an intermediate in the
+    actual bf16->fp16 path. Each stage is fully self-contained: loads
+    its own fresh port from bf16 weights, applies its own transformation.
     """
     print("\n" + "=" * 56)
-    print("STAGE 2 — PRECISION (fp32 -> fp16)")
+    print("STAGE 2 — PRECISION (bf16 -> fp16)")
     print("=" * 56)
 
     port_fp32 = _build_port(text_cfg, weights_dir, torch.float32)
@@ -274,15 +273,15 @@ def stage_precision(
 
     if has_nan or has_inf:
         print("\n[FAIL] NaN/Inf in fp16 cached output.")
-        return False, port_fp16
+        return False
     if overflow_risk:
         print(f"\n[FAIL] fp16 logits near saturation ({max_abs:.0f}).")
-        return False, port_fp16
+        return False
     if decode_span > PRECISION_PASS and first_decode > PRECISION_PASS:
         print(f"\n[PASS] fp16 cached decode clean ({decode_span:.1f} dB).")
-        return True, port_fp16
+        return True
     print(f"\n[FAIL] fp16 cached decode diverges ({decode_span:.1f} dB).")
-    return False, port_fp16
+    return False
 
 
 # ─── Stage 3: quantization (fp16 -> int8 | int4), optional ───────────────────
@@ -295,16 +294,20 @@ def stage_quantization(
 ) -> bool:
     """
     Stage 3 — QUANTIZATION. Applies int8 or int4 weight-only quantization
-    to a fresh fp32 port (apply_quantization performs its own fp32->fp16
-    cast internally, matching Apple's two-part scheme). PSNR is measured
-    against a freshly-built Stage 2 fp16 reference — isolates
-    quantization-only error.
+    from fp16, matching Apple's MLX pipeline (bf16->fp16 happens in
+    mlx_vlm.convert before quantization, not during it). PSNR is measured
+    against a freshly-built fp16 reference — isolates quantization-only error.
     """
     print("\n" + "=" * 56)
     print(f"STAGE 3 — QUANTIZATION ({level.upper()}, fp16 -> {level})")
     print("=" * 56)
 
-    port = _build_port(text_cfg, weights_dir, torch.float32)
+    # Load at fp16 (bf16->fp16), matching Apple's MLX pipeline exactly.
+    # mlx_vlm.convert casts ALL tensors bf16->fp16 during basic conversion,
+    # before and independent of quantization — confirmed by the 0.5B MLX
+    # checkpoint (unquantized, yet every tensor is fp16, not bf16).
+    # Quantization then goes fp16->int8/int4 for targeted weights.
+    port = _build_port(text_cfg, weights_dir, torch.float16)
     example_inputs = _example_inputs(text_cfg)
 
     print(f"Applying {level} quantization...")
@@ -351,12 +354,12 @@ def verify(variant: str, quantize: str | None) -> None:
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
 
-    passed, fp32_ref = stage_correctness(text_cfg, weights_dir)
+    passed = stage_correctness(text_cfg, weights_dir)
     if not passed:
         print("\n>>> Stage 1 FAILED. Fix correctness before Stage 2.")
         sys.exit(1)
 
-    passed, _ = stage_precision(text_cfg, weights_dir)
+    passed = stage_precision(text_cfg, weights_dir)
     if not passed:
         print("\n>>> Stage 2 FAILED. Fix fp16 precision issues before Stage 3.")
         sys.exit(1)

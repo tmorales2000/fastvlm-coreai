@@ -8,8 +8,31 @@ Key decisions:
   - RMSNormImpl, SDPA, RoPE are composite ops (externalized via ExternalizeSpec)
   - nn.LayerNorm and nn.BatchNorm2d handled automatically by get_decomp_table()
   - KV cache uses register_buffer + state_names (NOT readonly KV cache pattern)
-  - QKV projections fused in _mutate_state_dict before weight loading
+  - q_proj, k_proj, v_proj are SEPARATE nn.Linear layers (NOT fused)
   - KV cache writes use coreai::mutable_slice_update (not plain slice-assign)
+
+QKV FUSION DECISION
+-------------------
+An earlier version of this file fused q/k/v into a single qkv_proj Linear
+(via _mutate_state_dict) to match Apple's Core AI reference implementation
+(coreai-models/qwen2.py, USE_FUSED_KV = True). However, Apple's MLX
+inference weights (llava-fastvithd_*b_stage3_llm.*) keep q/k/v UNFUSED and
+independently quantized — verified by scripts/audit_weight_dtypes.py showing
+self_attn.q_proj.weight, k_proj.weight, v_proj.weight each as separate
+QUANTIZED tensors.
+
+Fusing QKV before quantization merges three projections with different weight
+distributions into one matrix, giving the quantizer a blunter instrument
+to represent all three — particularly v_proj, which has inherently higher
+weight variance and reconstructs 6-10 dB worse than q_proj in both 1.5B
+and 7B per our compare_weights.py analysis. Keeping them unfused lets the
+per-group scales for each projection adapt independently.
+
+We depart from Apple's Core AI reference architecture here deliberately, to
+match Apple's actual quantization practice. The coreai-torch SDPA composite
+op takes separate q, k, v tensors regardless — qkv fusion was never a
+coreai-torch requirement, only our earlier choice. Unfusing has no export
+impact and should improve quantization quality, especially at int4 for 7B.
 
 KV CACHE DESIGN
 ---------------
@@ -93,6 +116,15 @@ class FastVLMRMSNorm(nn.Module):
 
 
 class FastVLMAttention(nn.Module):
+    """
+    Qwen2 attention with separate q_proj, k_proj, v_proj (NOT fused).
+
+    Keeping projections separate gives the quantizer independent per-group
+    scales for each projection, matching Apple's MLX quantization scheme
+    exactly (verified by audit_weight_dtypes.py: each proj is a separate
+    QUANTIZED tensor in Apple's shipped MLX weights).
+    """
+
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -100,10 +132,14 @@ class FastVLMAttention(nn.Module):
         self.n_heads = config.num_attention_heads
         self.n_kv_heads = config.num_key_value_heads
         self.head_dim = dim // self.n_heads
-        total = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
+        q_dim = self.n_heads * self.head_dim
+        kv_dim_proj = self.n_kv_heads * self.head_dim
 
-        self.qkv_proj = nn.Linear(dim, total, bias=True)
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
+        # Separate projections — intentionally NOT fused. See module docstring.
+        self.q_proj = nn.Linear(dim, q_dim, bias=True)
+        self.k_proj = nn.Linear(dim, kv_dim_proj, bias=True)
+        self.v_proj = nn.Linear(dim, kv_dim_proj, bias=True)
+        self.o_proj = nn.Linear(q_dim, dim, bias=False)
 
         self.sdpa = SDPA(is_causal=True)
         self.rope = RoPE(base=float(getattr(config, "rope_theta", 1e6)))
@@ -122,18 +158,17 @@ class FastVLMAttention(nn.Module):
         kv_dim = n_kv_heads * head_dim
         layer = self.layer_idx
 
-        qkv = (
-            self.qkv_proj(x)
-            .reshape(B, L, n_heads + 2 * n_kv_heads, head_dim)
-            .permute(0, 2, 1, 3)
-        )
-        qk = qkv.narrow(1, 0, n_heads + n_kv_heads)
-        v  = qkv.narrow(1, n_heads + n_kv_heads, n_kv_heads)
+        # Separate projections → reshape to head layout
+        q = self.q_proj(x).reshape(B, L, n_heads, head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, n_kv_heads, head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, n_kv_heads, head_dim).permute(0, 2, 1, 3)
 
-        # RoPE: narrow to the query positions within the full context
+        # RoPE on q and k together (fused for efficiency, standard Qwen2 pattern)
         torch._check_is_size(seq_len)
         rope_positions = position_ids.narrow(-1, seq_len - L, L)
-        qk = self.rope(qk, position_ids=rope_positions)
+        qk = self.rope(
+            torch.cat([q, k], dim=1), position_ids=rope_positions
+        )
         q = qk.narrow(1, 0, n_heads)
         k = qk.narrow(1, n_heads, n_kv_heads)
 
@@ -266,7 +301,6 @@ class FastVLMDecoderStateful(nn.Module):
         """Load from SafeTensors weights directory."""
         model = cls(config).to(dtype=torch.float16)
         weights = _load_decoder_weights(weights_dir)
-        _mutate_state_dict(weights)
         weights = {k.removeprefix("model."): v for k, v in weights.items()}
         missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
         actual_missing = set(missing) - {"k_cache", "v_cache"}
@@ -297,6 +331,11 @@ def _load_decoder_weights(
 
     Excludes vision tower and projector weights. Casts bfloat16 (the storage
     dtype in Apple's checkpoint) to the target dtype on load.
+
+    Note: _mutate_state_dict (QKV fusion) has been removed. Weights are
+    loaded as-is from HF with separate q_proj/k_proj/v_proj, which now
+    load directly into FastVLMAttention's separate q_proj/k_proj/v_proj
+    nn.Linear modules without any key remapping needed.
     """
     st_files = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
     result = {}
@@ -310,28 +349,3 @@ def _load_decoder_weights(
                     t = t.to(dtype)
                 result[key] = t
     return result
-
-
-def _mutate_state_dict(state_dict: dict[str, torch.Tensor]) -> None:
-    """
-    Fuse separate q_proj, k_proj, v_proj -> qkv_proj in-place.
-    Matches the _mutate_state_dict pattern in coreai-models/qwen2.py.
-    Fusion order is [q, k, v] — confirmed by Stage 1 PSNR 113.2 dB vs HF.
-    """
-    layer_indices = set()
-    for k in state_dict:
-        if k.startswith("model.layers.") and ".self_attn.q_proj.weight" in k:
-            layer_indices.add(int(k.split(".")[2]))
-
-    for i in sorted(layer_indices):
-        weights, biases = [], []
-        for proj in ["q_proj", "k_proj", "v_proj"]:
-            wk = f"model.layers.{i}.self_attn.{proj}.weight"
-            bk = f"model.layers.{i}.self_attn.{proj}.bias"
-            if wk not in state_dict:
-                break
-            weights.append(state_dict.pop(wk))
-            biases.append(state_dict.pop(bk))
-        else:
-            state_dict[f"model.layers.{i}.self_attn.qkv_proj.weight"] = torch.cat(weights)
-            state_dict[f"model.layers.{i}.self_attn.qkv_proj.bias"] = torch.cat(biases)
