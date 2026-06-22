@@ -12,11 +12,11 @@ Stage 1 — CORRECTNESS (HF weights -> fp32 port)
     stage is a structural sanity check (shapes, key coverage, clean forward
     pass) rather than a cross-model PSNR comparison.
 
-Stage 2 — PRECISION (fp32 -> fp16)
-    Cast the fp32 port to float16 — the mandatory ANE execution precision.
-    NOT optional, NOT "compression": every projector export goes through
-    this stage. PSNR is measured against the Stage 1 fp32 port (not
-    original HF weights) — isolates the fp16 cast's own error.
+Stage 2 — PRECISION (bf16 -> fp16)
+    Load weights directly as float16 (bf16 -> fp16, one direct cast, no fp32
+    intermediate) — the mandatory ANE execution precision. NOT optional.
+    PSNR is measured against the Stage 1 fp32 port used as a high-precision
+    reference only — fp32 is NOT an intermediate in the actual precision path.
 
 Stage 3 — QUANTIZATION (fp16 -> int8 | int4), optional
     Apply coreai-opt weight-only quantization to BOTH projector Linear
@@ -40,9 +40,9 @@ VALIDATED PRODUCTION TARGETS
 -----------------------------
   0.5B : Stage 2 only, fp16, no quantization (Apple ships 0.5B fully
          unquantized across every component, decoder included).
-  1.5B : Stage 3 int8 (matches decoder's int8 target).
-  7B   : Stage 3 int8 (matches decoder's int8 target — int4 not attempted
-         here yet given the decoder's int4 instability; revisit together).
+  1.5B : Stage 3 int8  (68.2 dB vs fp16, PASS).
+  7B   : Stage 3 int8  (not yet measured; run verify_projector --variant 7b
+         --quantize int8 to confirm).
 
 USAGE
 -----
@@ -136,11 +136,12 @@ def stage_precision(
     test_input: torch.Tensor,
 ) -> bool:
     """
-    Stage 2 — PRECISION. Cast to fp16 and compare against the Stage 1 fp32
-    port (not original HF weights) to isolate the fp16 cast's own error.
+    Stage 2 — PRECISION. Builds a fresh fp16 port (bf16->fp16 direct cast)
+    and compares against the Stage 1 fp32 port as a high-precision reference,
+    isolating the fp16 cast's own error.
     """
     print("\n" + "=" * 56)
-    print("STAGE 2 — PRECISION (fp32 -> fp16)")
+    print("STAGE 2 — PRECISION (bf16 -> fp16)")
     print("=" * 56)
 
     port_fp16 = _build_port(config, weights_dir, torch.float16)
@@ -180,7 +181,10 @@ def stage_quantization(config, weights_dir: str, level: str) -> bool:
     print(f"STAGE 3 — QUANTIZATION ({level.upper()}, fp16 -> {level})")
     print("=" * 56)
 
-    port = _build_port(config, weights_dir, torch.float32)
+    # Load at fp16 (bf16->fp16), matching Apple's MLX pipeline exactly.
+    # mlx_vlm.convert casts all tensors bf16->fp16 before quantization,
+    # confirmed by the 0.5B unquantized MLX checkpoint being entirely fp16.
+    port = _build_port(config, weights_dir, torch.float16)
     example_inputs = _example_inputs(config)  # fp16 -- see docstring above
     x = example_inputs[0]
 
