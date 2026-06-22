@@ -14,9 +14,9 @@ to the FastVLM decoder, used by:
 NAMING NOTE
 -----------
 This module is intentionally NOT about "compression" in the general sense.
-fp32 -> fp16 is a mandatory precision cast both the decoder and projector
-go through for ANE execution — it is not optional and not what this module
-calls "quantization." Quantization here means INT8 or INT4 weight-only
+bf16 -> fp16 is a mandatory precision cast both the decoder and projector
+go through for ANE execution (loaded directly as fp16, one step, no fp32
+intermediate) — it is not optional and not what this module calls "quantization." Quantization here means INT8 or INT4 weight-only
 quantization, applied only to the decoder, only optionally, on top of the
 fp16 cast. See verify_decoder.py's three-stage structure (Correctness ->
 Precision -> Quantization) for where this fits in the overall pipeline.
@@ -47,11 +47,12 @@ separate invocation if you want to compare them.)
 
 PRODUCTION QUANTIZATION TARGETS (validated)
 ----------------------------------------------
-  0.5B decoder : no quantization (fp16 only; Apple ships unquantized)
-  1.5B decoder : int8  (PSNR vs fp16: 46.2 dB, PASS; matches Apple MLX tier)
-  7B   decoder : int8  (int4 fails — 22.4 dB vs fp16, due to fp16 pre-cast
-                        sensitivity; see psnr_results.md)
-  projector    : no quantization (fp16 only; Apple never quantizes it)
+  0.5B decoder : no quantization (fp16 only; Apple ships 0.5B unquantized)
+  1.5B decoder : int8  (49.6 dB vs fp16, PASS; includes embed_tokens)
+  7B   decoder : int8  (int4 fails — 22.7 dB vs fp16; 7B fp16 baseline
+                        too sensitive at 44.8 dB for int4 to be viable)
+  projector    : int8  (68.2 dB vs fp16, PASS; Apple quantizes projector
+                        Linear weights — confirmed by audit_weight_dtypes.py)
   vision enc.  : no quantization (fp16 only; CoreML export)
 
 SIMULATION vs EXPORT DISTINCTION (critical)
@@ -80,14 +81,15 @@ vision-language inputs is a future improvement.
 HOW TO USE
 ----------
 For verify scripts (PSNR comparison vs the fp16 Stage 2 output):
-    fp16_model = ...            # Stage 2 output
+    fp16_model = _build_port(..., torch.float16)  # bf16->fp16 direct
     fp16_out = fp16_model(example_input)
-    quantized, _ = apply_quantization(fp32_model, "int8", (example_input,))
+    quantized, _ = apply_quantization(fp16_model, "int8", (example_input,))
     quantized_out = quantized(example_input)
     score = psnr(fp16_out, quantized_out)
 
 For export scripts (before TorchConverter):
-    quantized, quantizer = apply_quantization(fp32_model, "int8", (example_input,))
+    fp16_model = _build_port(..., torch.float16)
+    quantized, quantizer = apply_quantization(fp16_model, "int8", (example_input,))
     export_ready = finalize_for_export(quantized, quantizer)
     exported = torch.export.export(export_ready, ...)
     converter.add_exported_program(exported, ...)
@@ -127,13 +129,16 @@ def apply_quantization(
     """
     Apply the specified quantization level to the FastVLM decoder.
 
-    The input model should be the fp32 Stage 1 port (NOT pre-cast to fp16
-    by the caller) — this function performs the fp32 -> fp16 cast itself
-    as part of replicating Apple's two-part scheme:
-      1. Non-linear tensors (RMSNorm scales, attention biases, etc.) -> fp16.
-      2. nn.Linear weight matrices -> grouped asymmetric int8/int4,
-         block_size=64 along the input-channel axis, per-group scale +
-         zero-point in fp16.
+    The input model MUST already be fp16. Apple's MLX pipeline casts
+    ALL tensors bf16->fp16 during mlx_vlm.convert, before and independent
+    of quantization (confirmed: 0.5B MLX checkpoint, no quantization, yet
+    every tensor is fp16). Load with dtype=torch.float16 before calling.
+
+    Apple's two-part scheme, which this replicates exactly:
+      1. Non-linear tensors (RMSNorm weights, biases, etc.) stay fp16.
+      2. nn.Linear and nn.Embedding weight matrices -> grouped asymmetric
+         int8/int4, block_size=64 along the reduction axis (axis=1 for
+         both module types), per-group scale + zero-point in fp16.
 
     Returns (quantized_model, quantizer) where:
       - quantized_model is directly runnable for PSNR comparison
@@ -145,8 +150,8 @@ def apply_quantization(
     see module docstring.
 
     Args:
-        model: The fp32-verified FastVLM decoder (Stage 1 output). Must
-               already be in eval() mode and on CPU.
+        model: The fp16 FastVLM decoder or projector (loaded bf16->fp16
+               directly). Must already be in eval() mode and on CPU.
         level: One of QUANTIZATION_LEVELS ("int8" or "int4").
         example_inputs: Tuple of example input tensors matching the model's
                         forward() signature. Used by coreai-opt to trace the
@@ -165,7 +170,15 @@ def apply_quantization(
         )
 
     model.eval()
-    model = model.half()
+    # Caller must pass an fp16 model (bf16->fp16 direct cast, matching
+    # Apple's MLX pipeline). mlx_vlm.convert casts ALL tensors bf16->fp16
+    # during basic conversion before quantization -- confirmed by the 0.5B
+    # MLX checkpoint (unquantized, yet every tensor is fp16, not bf16).
+    # Apple's quantization is therefore fp16->int8/int4 for linear/embedding
+    # weights; non-linears stay fp16. fp32 is NOT accepted.
+    assert next(model.parameters()).dtype == torch.float16, (
+        "apply_quantization expects an fp16 model (matching Apple's MLX "        "pipeline: bf16->fp16 in mlx_vlm.convert before quantization). "        "Load weights with dtype=torch.float16 before calling."
+    )
 
     # block_size=64, axis=1, ASYMMETRIC is shared by nn.Linear and
     # nn.Embedding -- coreai-opt's per-block axis default for both is 1
