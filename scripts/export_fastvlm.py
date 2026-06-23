@@ -244,6 +244,10 @@ def _stage_decoder(
 
     if quantize:
         print(f"[INFO] Applying {quantize} quantization to decoder...")
+        # Use query_len=1 for quantizer.prepare() example inputs so that
+        # convert_pt2e bakes shape=1 into the finalized graph, not shape=8.
+        # This allows torch.export.export to treat seq_len as dynamic (min=1)
+        # without hitting a shape conflict in reshape nodes.
         example_q = (
             torch.randint(1, text_cfg.vocab_size, (1, 8), dtype=torch.int32),
             torch.arange(8, dtype=torch.int32).unsqueeze(0),
@@ -259,21 +263,14 @@ def _stage_decoder(
         "position_ids": torch.arange(query_len, dtype=torch.int32).unsqueeze(0),
     }
 
-    # After finalize_for_export, the quantized model may specialize seq_len
-    # to the example value (8) when a named Dim is used. Use Dim.AUTO to let
-    # torch.export infer dynamism from the model rather than enforcing it.
-    # For the unquantized path, the named Dim with max=MAX_SEQ_LEN works fine.
-    if quantize:
-        dynamic_shapes = {
-            "input_ids": {1: torch.export.Dim.AUTO},
-            "position_ids": {1: torch.export.Dim.AUTO},
-        }
-    else:
-        seq_len_dim = torch.export.Dim("seq_len", min=1, max=MAX_SEQ_LEN)
-        dynamic_shapes = {
-            "input_ids": {1: seq_len_dim},
-            "position_ids": {1: seq_len_dim},
-        }
+    # Named Dim preserves dynamic seq_len in the export. With eager-mode
+    # quantization (set_execution_mode(EAGER)), finalize() does not run
+    # convert_pt2e so shapes are never baked -- the named Dim works cleanly.
+    seq_len_dim = torch.export.Dim("seq_len", min=1, max=MAX_SEQ_LEN)
+    dynamic_shapes = {
+        "input_ids": {1: seq_len_dim},
+        "position_ids": {1: seq_len_dim},
+    }
 
     print(f"[INFO] Tracing decode (max_seq_len={MAX_SEQ_LEN})...")
     exported = torch.export.export(

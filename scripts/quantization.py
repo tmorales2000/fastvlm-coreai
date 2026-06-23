@@ -103,6 +103,7 @@ import torch
 import torch.nn as nn
 
 from coreai_opt.common import ExportBackend
+from coreai_opt.quantization import ExecutionMode
 from coreai_opt.quantization import Quantizer, QuantizerConfig
 from coreai_opt.quantization.spec import PerBlockGranularity, QuantizationSpec, QuantizationScheme
 from coreai_opt.quantization.config import ModuleQuantizerConfig
@@ -202,6 +203,13 @@ def apply_quantization(
         QuantizerConfig(global_config=None)
         .set_module_type(torch.nn.Linear, module_config)
         .set_module_type(torch.nn.Embedding, module_config)
+        .set_execution_mode(ExecutionMode.EAGER)
+        # EAGER mode is required for export with dynamic seq_len.
+        # Graph mode (default) runs convert_pt2e during finalize(), which
+        # bakes the prepare() example shapes as constants in the fx.GraphModule,
+        # making torch.export.export unable to treat seq_len as dynamic.
+        # Eager mode inserts fake-quantize modules into the nn.Module directly
+        # without graph tracing, so shapes remain symbolic at export time.
     )
     quantizer = Quantizer(model, config)
     prepared = quantizer.prepare(example_inputs)
