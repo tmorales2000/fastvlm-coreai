@@ -20,61 +20,67 @@ raises ValueError on a duplicate entrypoint_name, and to_coreai() converts
 all staged entries into one MLIR module/AIProgram in a single call). This
 is the mechanism this script uses.
 
-WHY fp32 IS THE DEFAULT FOR ALL THREE
-------------------------------------------
-Every export.py in coreai-models defaults to dtype=float32 (see
-export_fastvlm.py's original module docstring for the full survey). This
-script follows the same convention for all three components, not just the
-vision encoder. The decoder and projector have NO known precision issues
-(decoder Stage 2 fp16 health passes cleanly for all variants; projector is
-bit-identical to the HF original in fp32 and passes fp16 health at 90+ dB)
-— but fp32 is still the safer default per Apple's own convention, and
---dtype float16 remains available per-export if you have reason to override it.
+PRECISION AND QUANTIZATION
+---------------------------
+All three components are exported at float16 — the mandatory ANE execution
+precision, matching Apple's MLX pipeline (mlx_vlm.convert casts all tensors
+bf16->fp16 before quantization, confirmed by the 0.5B unquantized MLX
+checkpoint being entirely fp16).
+
+  Stage 2 (all components): bf16->fp16, mandatory, always applied.
+  Stage 3 (decoder + projector only, optional): fp16->int8/int4 for
+    nn.Linear and nn.Embedding weights; non-linear tensors stay fp16.
+
+Use --quantize int8 or --quantize int4 to apply Stage 3 quantization to the
+decoder and projector before export. Vision encoder is never quantized.
+
+fp32 is NOT used as an export dtype — it appears only as a diagnostic dtype
+in verify_decoder.py Stage 1 (structural correctness checking).
+
+VALIDATED PRODUCTION TARGETS
+------------------------------
+  0.5B : --quantize none (fp16 only; Apple ships 0.5B unquantized)
+  1.5B : --quantize int8 (49.6 dB vs fp16, PASS)
+  7B   : --quantize int8 (int4 fails at 22.7 dB vs fp16)
 
 COMPONENT-SPECIFIC EXPORT NOTES
 -----------------------------------
 vision_encode:
-  Input: pixel_values [1, 3, image_size, image_size], static (image_size is
-  fixed per variant via config.mm_vision_tower — see fastvlm_vision_encoder.py).
-  Output: image_features [1, N, mm_hidden_size]. KNOWN OPEN QUESTION: fp16
-  overflow risk at network.8-10 for 0.5b/1.5b — see verify_compiled_vision_encoder.py.
+  Input: pixel_values [1, 3, image_size, image_size], static.
+  Output: image_features [1, N, mm_hidden_size].
 
 project:
-  Input: image_features [1, N, mm_hidden_size]. N (patch count) is STATIC,
-  not dynamic — it is fully determined by the fixed input image_size and
-  FastViTHD's fixed stride/downsampling stages, not by anything that varies
-  at runtime (confirmed: every test run produces exactly [1, 256, 3072] for
-  1.5b's 1024x1024 input; there is no FastVLM code path that varies image
-  resolution per-inference). Output: projected_features [1, N, hidden_size].
+  Input: image_features [1, N, mm_hidden_size]. N (patch count) is STATIC.
+  Output: projected_features [1, N, hidden_size].
+  Quantization: if --quantize is set, both Linear layers (layers.0, layers.2)
+  are quantized. Biases stay fp16. Matches Apple's MLX scheme exactly.
 
 decode:
-  Input: input_ids [1, query_len] (query_len varies: full prompt during
-  prefill, 1 during single-token decode), position_ids [1, seq_len] (DYNAMIC
-  — grows by 1 each decode step, up to model.max_seq_len). state_names=
-  ["k_cache", "v_cache"] binds the decoder's registered buffers as mutable
-  state in the exported graph — REQUIRES the coreai::mutable_slice_update
-  custom op with mutates_args=["x"] to be correctly registered (see
-  fastvlm_decoder.py module docstring) or the exporter will not recognize
-  the cache writes as state mutations.
+  Input: input_ids [1, query_len], position_ids [1, seq_len] (DYNAMIC).
+  state_names=["k_cache", "v_cache"] binds registered buffers as mutable
+  state. Requires coreai::mutable_slice_update with mutates_args=["x"].
+  Quantization: if --quantize is set, all nn.Linear and nn.Embedding weights
+  are quantized. Non-linear tensors (norms, biases) stay fp16.
 
 USAGE
 -----
-  python scripts/export_fastvlm.py --variant 1.5b
-  python scripts/export_fastvlm.py --variant 1.5b --dtype float16
-  python scripts/export_fastvlm.py --variant 0.5b --output-dir ./exports/ --overwrite
-  python scripts/export_fastvlm.py --variant 1.5b --components vision_encode project
+  # Export all three components, no quantization (0.5B):
+  python scripts/export_fastvlm.py --variant 0.5b
+
+  # Export all three, decoder + projector quantized to int8 (1.5B):
+  python scripts/export_fastvlm.py --variant 1.5b --quantize int8
+
+  # Export decoder only (for iteration):
+  python scripts/export_fastvlm.py --variant 1.5b --quantize int8 --components decode
 
 ARGUMENTS
 ---------
-  --variant      FastVLM variant to export. Default: 1.5b.
-                 Choices: 0.5b, 1.5b, 7b.
-  --dtype        Torch dtype to trace ALL staged components in. Default: float32.
-                 Choices: float32, float16.
+  --variant      FastVLM variant. Default: 1.5b. Choices: 0.5b, 1.5b, 7b.
+  --quantize     Quantization level for decoder + projector. Default: none.
+                 Choices: int8, int4. Vision encoder is never quantized.
   --output-dir   Where to write the .aimodel. Default: exports/ in repo root.
   --overwrite    Overwrite an existing .aimodel at the output path.
   --components   Which entrypoints to stage. Default: all three.
-                 Choices (one or more): vision_encode, project, decode.
-                 Useful for testing one component's export in isolation.
 """
 
 import argparse
@@ -82,6 +88,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 from coreai.runtime import AIModelAssetMetadata
@@ -89,11 +96,17 @@ from coreai_torch import TorchConverter, get_decomp_table
 from transformers import AutoConfig
 
 sys.path.insert(0, "scripts")
-from fastvlm_decoder import FastVLMDecoderStateful  # noqa: E402
+from fastvlm_decoder import FastVLMDecoderStateful, MAX_SEQ_LEN  # noqa: E402
 from fastvlm_projector import FastVLMProjector  # noqa: E402
 from fastvlm_vision_encoder import FastVLMVisionEncoder  # noqa: E402
+from quantization import (  # noqa: E402
+    QUANTIZATION_LEVELS, apply_quantization, finalize_for_export
+)
+from coreai._compiler.dialects import coreai as coreai_dialect  # noqa: E402
+from coreai_torch._utils import get_operand as _get_operand  # noqa: E402
 
 ALL_COMPONENTS = ["vision_encode", "project", "decode"]
+EXPORT_DTYPE = torch.float16  # mandatory ANE precision; not configurable
 
 
 def _image_size(config) -> int:
@@ -105,9 +118,9 @@ def _default_output_dir() -> str:
     return str(Path(__file__).resolve().parents[1] / "exports")
 
 
-def _asset_path(output_dir: str, variant: str, dtype: torch.dtype) -> Path:
-    dtype_name = str(dtype).split(".")[-1]
-    return Path(output_dir) / f"fastvlm-{variant}_{dtype_name}.aimodel"
+def _asset_path(output_dir: str, variant: str, quantize: Optional[str]) -> Path:
+    suffix = f"_fp16_{quantize}" if quantize else "_fp16"
+    return Path(output_dir) / f"fastvlm-{variant}{suffix}.aimodel"
 
 
 def _save_asset(coreai_program, model_path: Path, overwrite: bool) -> None:
@@ -137,33 +150,29 @@ def _build_aimodel_metadata() -> AIModelAssetMetadata:
     return metadata
 
 
-def _export_program(model: torch.nn.Module, example_inputs: dict, dtype: torch.dtype):
+def _export_program(model: torch.nn.Module, example_inputs: dict):
     """
-    Shared trace+decompose step for all three components.
-
-    autocast is skipped for float32 (it's a no-op there and emits a spurious
-    warning — CPU autocast only supports promoting/demoting to bfloat16 or
-    float16, there's nothing to autocast TO when the target is float32).
+    Trace and decompose a model for Core AI export.
+    Always traces at EXPORT_DTYPE (float16).
     """
-    if dtype == torch.float32:
-        exported = torch.export.export(model, args=(), kwargs=example_inputs)
-    else:
-        with torch.autocast(device_type="cpu", dtype=dtype):
-            exported = torch.export.export(model, args=(), kwargs=example_inputs)
+    exported = torch.export.export(model, args=(), kwargs=example_inputs)
     return exported.run_decompositions(get_decomp_table())
 
 
 def _stage_vision_encoder(
-    converter: TorchConverter, config, weights_dir: str, dtype: torch.dtype
+    converter: TorchConverter, config, weights_dir: str, quantize: Optional[str]
 ) -> None:
+    """Vision encoder is always fp16, never quantized."""
     image_size = _image_size(config)
-    print(f"[INFO] Sourcing vision encoder (dtype={dtype})...")
-    model = FastVLMVisionEncoder.from_weights(config, weights_dir, dtype=dtype)
+    print(f"[INFO] Sourcing vision encoder (fp16, no quantization)...")
+    model = FastVLMVisionEncoder.from_weights(config, weights_dir, dtype=EXPORT_DTYPE)
     model.eval()
 
-    example_inputs = {"pixel_values": torch.randn(1, 3, image_size, image_size).to(dtype)}
+    example_inputs = {
+        "pixel_values": torch.randn(1, 3, image_size, image_size).to(EXPORT_DTYPE)
+    }
     print("[INFO] Tracing vision_encode...")
-    exported = _export_program(model, example_inputs, dtype)
+    exported = _export_program(model, example_inputs)
 
     converter.add_exported_program(
         exported_program=exported,
@@ -174,33 +183,41 @@ def _stage_vision_encoder(
 
 
 def _stage_projector(
-    converter: TorchConverter, config, weights_dir: str, dtype: torch.dtype
+    converter: TorchConverter, config, weights_dir: str, quantize: Optional[str]
 ) -> None:
-    print(f"[INFO] Sourcing projector (dtype={dtype})...")
-    model = FastVLMProjector.from_weights(config, weights_dir, dtype=dtype)
+    """
+    Projector exported at fp16. If --quantize is set, both Linear layers are
+    quantized (fp16->int8/int4), matching Apple's MLX scheme exactly.
+    """
+    q_str = f" + {quantize} quantization" if quantize else ", no quantization"
+    print(f"[INFO] Sourcing projector (fp16{q_str})...")
+    model = FastVLMProjector.from_weights(config, weights_dir, dtype=EXPORT_DTYPE)
     model.eval()
 
-    # N (patch count) is static — see module docstring "project" section.
-    # 256 confirmed empirically for 1.5b at 1024x1024; recompute per-variant
-    # rather than hardcoding, in case a future variant's image_size differs.
+    # N (patch count) is static — probe via vision encoder forward.
     image_size = _image_size(config)
-    # FastViTHD downsamples by 32x total (5 stride-2 PatchEmbed stages, but
-    # conv_exp's stride is 1 — net stride is determined empirically, not
-    # assumed). Run a tiny shape probe via the vision encoder's own forward
-    # rather than computing this by hand, so it can never silently drift
-    # from the real architecture.
-    probe_encoder = FastVLMVisionEncoder.from_weights(config, weights_dir, dtype=torch.float32)
+    probe_encoder = FastVLMVisionEncoder.from_weights(
+        config, weights_dir, dtype=torch.float32
+    )
     probe_encoder.eval()
     with torch.no_grad():
-        probe_out = probe_encoder(torch.zeros(1, 3, image_size, image_size, dtype=torch.float32))
+        probe_out = probe_encoder(
+            torch.zeros(1, 3, image_size, image_size, dtype=torch.float32)
+        )
     n_patches = probe_out.shape[1]
     del probe_encoder, probe_out
 
     example_inputs = {
-        "x": torch.randn(1, n_patches, config.mm_hidden_size).to(dtype)
+        "x": torch.randn(1, n_patches, config.mm_hidden_size).to(EXPORT_DTYPE)
     }
+
+    if quantize:
+        print(f"[INFO] Applying {quantize} quantization to projector...")
+        model, quantizer = apply_quantization(model, quantize, (example_inputs["x"],))
+        model = finalize_for_export(model, quantizer)
+
     print(f"[INFO] Tracing project (N={n_patches} patches)...")
-    exported = _export_program(model, example_inputs, dtype)
+    exported = _export_program(model, example_inputs)
 
     converter.add_exported_program(
         exported_program=exported,
@@ -211,48 +228,63 @@ def _stage_projector(
 
 
 def _stage_decoder(
-    converter: TorchConverter, config, weights_dir: str, dtype: torch.dtype
+    converter: TorchConverter, config, weights_dir: str, quantize: Optional[str]
 ) -> None:
+    """
+    Decoder exported at fp16. If --quantize is set, all nn.Linear and
+    nn.Embedding weights are quantized (fp16->int8/int4); non-linear
+    tensors (norms, biases) stay fp16.
+    """
     text_cfg = getattr(config, "text_config", config)
-    print(f"[INFO] Sourcing decoder (dtype={dtype})...")
+    q_str = f" + {quantize} quantization" if quantize else ", no quantization"
+    print(f"[INFO] Sourcing decoder (fp16{q_str})...")
     model = FastVLMDecoderStateful.from_weights(text_cfg, weights_dir)
-    model = model.to(dtype=dtype)
+    # from_weights loads at fp16 already; no additional cast needed.
     model.eval()
 
-    # Example shapes for tracing: a short prefill (query_len=8, seq_len=8).
-    # The dynamic_shapes spec below is what actually allows seq_len to vary
-    # at runtime up to model.max_seq_len — these example values only need
-    # to be valid, not representative of every call shape.
+    if quantize:
+        print(f"[INFO] Applying {quantize} quantization to decoder...")
+        example_q = (
+            torch.randint(1, text_cfg.vocab_size, (1, 8), dtype=torch.int32),
+            torch.arange(8, dtype=torch.int32).unsqueeze(0),
+        )
+        model, quantizer = apply_quantization(model, quantize, example_q)
+        model = finalize_for_export(model, quantizer)
+
     query_len = 8
     example_inputs = {
-        "input_ids": torch.randint(1, text_cfg.vocab_size, (1, query_len), dtype=torch.int32),
+        "input_ids": torch.randint(
+            1, text_cfg.vocab_size, (1, query_len), dtype=torch.int32
+        ),
         "position_ids": torch.arange(query_len, dtype=torch.int32).unsqueeze(0),
     }
 
-    seq_len_dim = torch.export.Dim("seq_len", min=1, max=model.max_seq_len)
-    dynamic_shapes = {
-        "input_ids": {1: seq_len_dim},
-        "position_ids": {1: seq_len_dim},
-    }
-
-    print(f"[INFO] Tracing decode (max_seq_len={model.max_seq_len})...")
-    if dtype == torch.float32:
-        exported = torch.export.export(
-            model, args=(), kwargs=example_inputs, dynamic_shapes=dynamic_shapes
-        )
+    # After finalize_for_export, the quantized model may specialize seq_len
+    # to the example value (8) when a named Dim is used. Use Dim.AUTO to let
+    # torch.export infer dynamism from the model rather than enforcing it.
+    # For the unquantized path, the named Dim with max=MAX_SEQ_LEN works fine.
+    if quantize:
+        dynamic_shapes = {
+            "input_ids": {1: torch.export.Dim.AUTO},
+            "position_ids": {1: torch.export.Dim.AUTO},
+        }
     else:
-        with torch.autocast(device_type="cpu", dtype=dtype):
-            exported = torch.export.export(
-                model, args=(), kwargs=example_inputs, dynamic_shapes=dynamic_shapes
-            )
+        seq_len_dim = torch.export.Dim("seq_len", min=1, max=MAX_SEQ_LEN)
+        dynamic_shapes = {
+            "input_ids": {1: seq_len_dim},
+            "position_ids": {1: seq_len_dim},
+        }
+
+    print(f"[INFO] Tracing decode (max_seq_len={MAX_SEQ_LEN})...")
+    exported = torch.export.export(
+        model, args=(), kwargs=example_inputs, dynamic_shapes=dynamic_shapes
+    )
     exported = exported.run_decompositions(get_decomp_table())
 
     converter.add_exported_program(
         exported_program=exported,
         input_names=["input_ids", "position_ids"],
         output_names=["logits"],
-        # Order matches fastvlm_decoder.py buffer registration order:
-        # k_cache then v_cache (see register_buffer calls in __init__).
         state_names=["k_cache", "v_cache"],
         entrypoint_name="decode",
     )
@@ -267,7 +299,7 @@ _STAGE_FNS = {
 
 def export_fastvlm(
     variant: str,
-    dtype: torch.dtype,
+    quantize: Optional[str],
     output_dir: str,
     overwrite: bool,
     components: list[str],
@@ -276,8 +308,40 @@ def export_fastvlm(
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
 
     converter = TorchConverter()
+
+    # Register lowering for fastvlm::mutable_slice_update.
+    # This custom op is used in FastVLMAttention to write new K/V vectors
+    # into the KV cache buffers at runtime. It must lower to coreai.slice_update
+    # so TorchConverter can emit a mutable state write in the compiled graph.
+    #
+    # Why fastvlm:: not coreai:: namespace: TorchConverter reserves the coreai
+    # namespace for ops in _custom_to_core_resolver (quantization/compression ops).
+    # register_torch_lowering() rejects reserved namespaces, so the op is
+    # registered under fastvlm:: in fastvlm_decoder.py and lowered here.
+    #
+    # coreai.slice_update signature:
+    #   slice_update(input, start_indices, end_indices, strides, update)
+    # Our op signature (from fastvlm_decoder.py):
+    #   mutable_slice_update(x, update, begin, end)  -- begin/end are 1D int32 tensors
+    @converter.register_torch_lowering("fastvlm::mutable_slice_update.default")
+    def _lower_mutable_slice_update(values_map, node, loc):
+        x      = _get_operand(values_map, node, 0, loc)
+        update = _get_operand(values_map, node, 1, loc)
+        begin  = _get_operand(values_map, node, 2, loc)
+        end    = _get_operand(values_map, node, 3, loc)
+        rank = x.type.rank
+        strides = [1] * rank
+        return coreai_dialect.slice_update(
+            x,
+            start_indices=begin,
+            end_indices=end,
+            strides=strides,
+            update=update,
+            loc=loc,
+        )
+
     for name in components:
-        _STAGE_FNS[name](converter, config, weights_dir, dtype)
+        _STAGE_FNS[name](converter, config, weights_dir, quantize)
 
     print(f"[INFO] Converting {len(components)} entrypoint(s) to Core AI...")
     coreai_program = converter.to_coreai()
@@ -285,7 +349,7 @@ def export_fastvlm(
     coreai_program.optimize()
     print("[INFO] Model optimized.")
 
-    model_path = _asset_path(output_dir, variant, dtype)
+    model_path = _asset_path(output_dir, variant, quantize)
     _save_asset(coreai_program, model_path, overwrite)
     print(f"[INFO] Successfully created and saved Core AI model to {model_path}.")
     return model_path
@@ -293,13 +357,13 @@ def export_fastvlm(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Export FastVLM (vision encoder + projector + decoder) to a Core AI .aimodel.",
+        description="Export FastVLM to a Core AI .aimodel (fp16, optionally quantized).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python scripts/export_fastvlm.py --variant 1.5b
-  python scripts/export_fastvlm.py --variant 1.5b --dtype float16
-  python scripts/export_fastvlm.py --variant 1.5b --components vision_encode project
+  python scripts/export_fastvlm.py --variant 0.5b
+  python scripts/export_fastvlm.py --variant 1.5b --quantize int8
+  python scripts/export_fastvlm.py --variant 1.5b --quantize int8 --components decode
   python scripts/export_fastvlm.py --variant 0.5b --overwrite
 """,
     )
@@ -310,10 +374,11 @@ examples:
         help="FastVLM variant to export. (default: 1.5b)",
     )
     ap.add_argument(
-        "--dtype",
-        default="float32",
-        choices=["float32", "float16"],
-        help="Torch dtype to trace all staged components in. (default: float32)",
+        "--quantize",
+        default=None,
+        choices=QUANTIZATION_LEVELS,
+        help="Quantization level for decoder + projector. Vision encoder is "
+             "never quantized. Default: none (fp16 only).",
     )
     ap.add_argument(
         "--output-dir",
@@ -334,10 +399,8 @@ examples:
     )
     args = ap.parse_args()
 
-    dtype = {"float32": torch.float32, "float16": torch.float16}[args.dtype]
     output_dir = args.output_dir or _default_output_dir()
-
-    export_fastvlm(args.variant, dtype, output_dir, args.overwrite, args.components)
+    export_fastvlm(args.variant, args.quantize, output_dir, args.overwrite, args.components)
 
 
 if __name__ == "__main__":

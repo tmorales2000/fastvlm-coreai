@@ -9,7 +9,7 @@ Key decisions:
   - nn.LayerNorm and nn.BatchNorm2d handled automatically by get_decomp_table()
   - KV cache uses register_buffer + state_names (NOT readonly KV cache pattern)
   - q_proj, k_proj, v_proj are SEPARATE nn.Linear layers (NOT fused)
-  - KV cache writes use coreai::mutable_slice_update (not plain slice-assign)
+  - KV cache writes use aten.slice_scatter with scalar shape-symint indices
 
 QKV FUSION DECISION
 -------------------
@@ -41,9 +41,9 @@ where kv_dim = head_dim * num_key_value_heads (flattened head layout).
 
 Each attention layer writes its new K/V vectors into the cache at
 offset = seq_len - query_len, then reads back the full context [0:seq_len]
-for attention. The write MUST use coreai::mutable_slice_update — not a plain
-slice-assign — so that TorchConverter correctly binds the buffer as mutable
-state in the exported graph.
+for attention. The cache write uses aten.slice_scatter with scalar symint
+begin/end, avoiding auto_functionalized_v2 (from mutates_args custom ops)
+and the MPSGraph runtime crash with tensor begin indices (FB23024751).
 
 FORWARD SIGNATURE
 -----------------
@@ -70,27 +70,14 @@ from safetensors import safe_open
 MAX_SEQ_LEN = 4096
 
 
-# ─── KV cache state mutation op ──────────────────────────────────────────────
+# ─── KV cache write helper ───────────────────────────────────────────────────
 #
-# mutable_slice_update MUST be the coreai custom op — not a plain slice-assign.
-# mutates_args=["x"] tells torch.export the buffer is mutated in place, so
-# TorchConverter correctly binds it as mutable state via state_names.
-# This is a verbatim copy of Apple's _ops.py from coreai_models/primitives/.
-#
-@torch.library.custom_op("coreai::mutable_slice_update", mutates_args=["x"])
-def mutable_slice_update(
-    x: torch.Tensor, update: torch.Tensor, begin: torch.Tensor, end: torch.Tensor
-) -> torch.Tensor:
-    b = torch.split(begin, 1, dim=0)
-    e = torch.split(end, 1, dim=0)
-    slices = tuple(slice(bb.item(), ee.item()) for bb, ee in zip(b, e, strict=False))
-    x[slices] = update
-    return x.clone()
-
-
-@mutable_slice_update.register_fake
-def _mutable_slice_update_fake(x, update, begin, end):
-    return x.clone()
+# Uses aten.slice_scatter with scalar shape-symint begin/end rather than a
+# mutates_args custom op. A mutates_args custom op produces auto_functionalized_v2
+# in the exported graph, which coreai-torch 0.4.0 cannot lower (no handler in
+# _higher_order_resolver). aten.slice_scatter is already in _aten_to_core_resolver
+# and lowers cleanly. Scalar symint begin/end also avoids the MPSGraph runtime
+# crash with runtime-tensor begin indices (FB23024751, apple/coreai-models#5).
 
 
 # ─── Composite op wrappers ────────────────────────────────────────────────────
@@ -150,13 +137,18 @@ class FastVLMAttention(nn.Module):
         position_ids: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        offset: torch.Tensor,
         seq_len: int,
     ) -> torch.Tensor:
         B, L, _ = x.shape
         n_heads, n_kv_heads, head_dim = self.n_heads, self.n_kv_heads, self.head_dim
         kv_dim = n_kv_heads * head_dim
         layer = self.layer_idx
+        # Compute offset as a shape symint (not a runtime tensor) so MPSGraph
+        # can lower the slice_update. The bug (FB23024751, apple/coreai-models#5)
+        # is that MPSGraph crashes when begin is a runtime-tensor index but runs
+        # correctly when begin is derived from shape dimensions (symints).
+        # position_ids.shape[-1] == seq_len and x.shape[1] == query_len (== L).
+        offset = position_ids.shape[-1] - x.shape[1]
 
         # Separate projections → reshape to head layout
         q = self.q_proj(x).reshape(B, L, n_heads, head_dim).permute(0, 2, 1, 3)
@@ -177,22 +169,37 @@ class FastVLMAttention(nn.Module):
         v_flat = v.permute(0, 2, 1, 3).reshape(B, L, kv_dim)
 
         # Write new K/V into cache at [layer, :, offset:offset+L, :]
-        device = k_cache.device
-        z = torch.zeros(1, dtype=torch.int32, device=device)
-        begin = torch.cat([
-            torch.tensor([layer], dtype=torch.int32, device=device),
-            z,
-            offset.reshape(1).to(torch.int32),
-            z,
-        ])
-        end = torch.cat([
-            torch.tensor([layer + 1], dtype=torch.int32, device=device),
-            torch.tensor([k_cache.size(1)], dtype=torch.int32, device=device),
-            (offset.reshape(1).to(torch.int32) + L),
-            torch.tensor([kv_dim], dtype=torch.int32, device=device),
-        ])
-        mutable_slice_update(k_cache, k_flat.unsqueeze(0), begin, end)
-        mutable_slice_update(v_cache, v_flat.unsqueeze(0), begin, end)
+        # slice_scatter with scalar symint begin/end: no custom op, no tensors.
+        # Cache shape: [num_layers, 1, MAX_SEQ_LEN, kv_dim]
+        # k_flat/v_flat shape: [1, L, kv_dim] — insert at dim=0 for layer idx,
+        # dim=2 for sequence position.
+        # Cache shape: [num_layers, 1, MAX_SEQ_LEN, kv_dim]
+        # k_flat shape: [1, L, kv_dim] -> unsqueeze to [1, 1, L, kv_dim]
+        # We need to write k_flat into k_cache[layer, :, offset:offset+L, :].
+        # Strategy: slice k_cache to the single layer row, scatter into it,
+        # then scatter the updated row back into the full cache.
+        k_flat_4d = k_flat.unsqueeze(0)  # [1, 1, L, kv_dim]
+        v_flat_4d = v_flat.unsqueeze(0)
+
+        # Step 1: extract the layer row [1, 1, MAX_SEQ_LEN, kv_dim]
+        k_row = k_cache[layer:layer+1]
+        v_row = v_cache[layer:layer+1]
+
+        # Step 2: scatter new tokens into the row at dim=2 (sequence dim)
+        k_row_new = torch.ops.aten.slice_scatter(
+            k_row, k_flat_4d, dim=2, start=offset, end=offset + L
+        )
+        v_row_new = torch.ops.aten.slice_scatter(
+            v_row, v_flat_4d, dim=2, start=offset, end=offset + L
+        )
+
+        # Step 3: scatter the updated row back into the full cache at dim=0
+        k_cache.copy_(torch.ops.aten.slice_scatter(
+            k_cache, k_row_new, dim=0, start=layer, end=layer + 1
+        ))
+        v_cache.copy_(torch.ops.aten.slice_scatter(
+            v_cache, v_row_new, dim=0, start=layer, end=layer + 1
+        ))
 
         # Read back full context [0:seq_len] and restore head-separated layout
         k_ctx = k_cache[layer].narrow(1, 0, seq_len)
@@ -237,11 +244,10 @@ class FastVLMDecoderBlock(nn.Module):
         position_ids: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        offset: torch.Tensor,
         seq_len: int,
     ) -> torch.Tensor:
         r = self.self_attn(
-            self.input_layernorm(x), position_ids, k_cache, v_cache, offset, seq_len
+            self.input_layernorm(x), position_ids, k_cache, v_cache, seq_len
         )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
@@ -288,11 +294,12 @@ class FastVLMDecoderStateful(nn.Module):
         seq_len = position_ids.shape[-1]
         torch._check_is_size(query_len)
         torch._check_is_size(seq_len)
-        offset = torch.tensor(seq_len - query_len, dtype=torch.int32)
+        # offset is NOT computed as a runtime tensor here — each attention layer
+        # derives it from shape symints directly. See FastVLMAttention.forward.
 
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
-            h = layer(h, position_ids, self.k_cache, self.v_cache, offset, seq_len)
+            h = layer(h, position_ids, self.k_cache, self.v_cache, seq_len)
         h = self.norm(h)
         return self.lm_head(h)
 
