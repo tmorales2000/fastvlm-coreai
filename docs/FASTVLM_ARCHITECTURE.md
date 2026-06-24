@@ -589,6 +589,107 @@ The runtime automatically selects the correct specialization for the executing d
 
 ---
 
+## Image Preprocessing
+
+FastVLM uses `CLIPImageProcessor` for preprocessing, configured in
+`llava_qwen.py` with the following parameters:
+
+```python
+CLIPImageProcessor(
+    crop_size  = {"height": 1024, "width": 1024},
+    image_mean = [0.0, 0.0, 0.0],   # no-op
+    image_std  = [1.0, 1.0, 1.0],   # no-op
+    size       = {"shortest_edge": 1024},
+)
+```
+
+**Mean and std are both no-ops.** FastVLM does not apply ImageNet normalization
+(despite FastViTHD's timm config referencing `IMAGENET_DEFAULT_MEAN` / `IMAGENET_DEFAULT_STD`
+— those are overridden at inference time). Pixel values pass through as-is.
+
+The complete preprocessing pipeline for a camera frame is:
+
+1. Resize shortest edge to 1024 (bicubic)
+2. Pad to 1024×1024 square (`image_aspect_ratio: pad`)
+3. Convert to float32 in range [0.0, 1.0]
+4. Rearrange from interleaved `[H, W, C]` → planar `[C, H, W]`
+5. Add batch dimension → `[1, 3, 1024, 1024]` float32
+
+No mean subtraction, no std division. This is the tensor passed to
+`vision_encode` as `pixel_values`.
+
+For the Metal preprocessing pipeline, this means the compute shader only
+needs to handle resize, pad, channel reorder, and float conversion — not
+normalization. See `FASTVLM_SWIFT_INTEGRATION.md` for the Metal pipeline design.
+
+---
+
+## Weight Key Structure
+
+### PyTorch HF safetensors
+
+Vision encoder weights are doubly-nested in the HF checkpoint:
+
+```
+model.vision_tower.vision_tower.model.network.0.0.convffn.conv.conv.weight
+└─ prefix: model.vision_tower.vision_tower.model.
+           └─ stripped key: network.0.0.convffn.conv.conv.weight
+```
+
+The double nesting (`vision_tower.vision_tower`) is a quirk of the LLaVA-Qwen
+model structure. Our `_load_vision_weights()` strips this prefix via
+`_VISION_PREFIX = "model.vision_tower.vision_tower.model."`.
+
+Decoder weights use standard Qwen2 HF key structure:
+```
+model.embed_tokens.weight
+model.layers.0.self_attn.q_proj.weight
+model.layers.0.self_attn.k_proj.weight
+model.layers.0.self_attn.v_proj.weight
+model.layers.0.self_attn.o_proj.weight
+model.layers.0.mlp.gate_proj.weight
+model.layers.0.mlp.up_proj.weight
+model.layers.0.mlp.down_proj.weight
+model.layers.0.input_layernorm.weight
+model.layers.0.post_attention_layernorm.weight
+model.norm.weight
+lm_head.weight
+```
+
+Projector weights:
+```
+model.mm_projector.0.weight   (Linear mm_hidden_size → hidden_size)
+model.mm_projector.0.bias
+model.mm_projector.2.weight   (Linear hidden_size → hidden_size)
+model.mm_projector.2.bias
+```
+
+### MLX weight keys
+
+MLX weights use a flat key structure without the `model.` prefix and with
+different component naming. Quantized Linear weights are split into three tensors:
+
+```
+# Unquantized (0.5B fp16):
+language_model.model.embed_tokens.weight         [151936, 896]   float16
+language_model.model.layers.0.self_attn.q_proj.weight  [896, 896]  float16
+
+# Quantized (1.5B int8, 7B int4):
+language_model.model.layers.0.self_attn.q_proj.weight  [384, 1536]  uint32  ← packed
+language_model.model.layers.0.self_attn.q_proj.scales  [384, 24]    float16
+language_model.model.layers.0.self_attn.q_proj.biases  [384, 24]    float16
+```
+
+Inspect any variant's full key structure:
+```bash
+python scripts/inspect_model.py --variant 1.5b --source pytorch --mode layers
+python scripts/inspect_model.py --variant 1.5b --source mlx    --mode layers
+diff <(python scripts/inspect_model.py --variant 1.5b --source pytorch --mode layers) \
+     <(python scripts/inspect_model.py --variant 1.5b --source mlx    --mode layers)
+```
+
+---
+
 ## The Role of llava_qwen.py
 
 Each variant weights directory contains a copy of `llava_qwen.py` — Apple's
