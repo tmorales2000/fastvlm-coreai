@@ -263,12 +263,18 @@ class FastVLMVisionEncoder(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pixel_values: [B, 3, H, W]  (H=W=1024 for FastVLM)
+            pixel_values: [B, 3, H, W]  (H=W=1024 for FastVLM), float32.
+                Callers always pass fp32 image data. The cast to fp16 happens
+                here as the first op so the compiled Core AI entrypoint accepts
+                fp32 input while running fp16 internally on the ANE.
 
         Returns:
             image_features: [B, H'*W', C]  patch embeddings, matching
             MobileCLIPVisionTower.feature_select() exactly.
         """
+        # Cast input to model dtype (fp16 for ANE export, fp32 for reference).
+        # This preserves the public fp32 input contract for callers.
+        pixel_values = pixel_values.to(dtype=next(self.parameters()).dtype)
         x = self.model.forward_embeddings(pixel_values)  # patch_embed
         x = self.model.forward_tokens(x)                 # network stages
         x = self.model.conv_exp(x)                        # [B, C, H', W'] == "image_embeddings"

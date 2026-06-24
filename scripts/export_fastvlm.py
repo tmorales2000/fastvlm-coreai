@@ -169,7 +169,7 @@ def _stage_vision_encoder(
     model.eval()
 
     example_inputs = {
-        "pixel_values": torch.randn(1, 3, image_size, image_size).to(EXPORT_DTYPE)
+        "pixel_values": torch.randn(1, 3, image_size, image_size)  # fp32: model casts internally
     }
     print("[INFO] Tracing vision_encode...")
     exported = _export_program(model, example_inputs)

@@ -122,7 +122,11 @@ def _psnr(ref: np.ndarray, test: np.ndarray) -> float:
     return 20 * np.log10(max_val) - 10 * np.log10(mse) if max_val > 0 else float("inf")
 
 
-def _to_ndarray(t: torch.Tensor) -> NDArray:
+def _to_ndarray(t: torch.Tensor, dtype: torch.dtype | None = None) -> NDArray:
+    """Convert a torch.Tensor to an NDArray, optionally casting dtype first."""
+    if dtype is not None:
+        t = t.to(dtype=dtype)
+    # fp16 tensors must be viewed as float16 numpy arrays
     return NDArray(t.detach().cpu().numpy())
 
 
@@ -200,8 +204,8 @@ async def verify_runtime(
         ref_logits = decoder_model(prefill_ids, prefill_positions)
     rt_out = await decode_fn(
         inputs={
-            "input_ids": _to_ndarray(prefill_ids),
-            "position_ids": _to_ndarray(prefill_positions),
+            "input_ids": _to_ndarray(prefill_ids, dtype=torch.int32),
+            "position_ids": _to_ndarray(prefill_positions, dtype=torch.int32),
         },
         state=state,
     )
@@ -220,8 +224,8 @@ async def verify_runtime(
             ref_logits = decoder_model(next_id, next_position)
         rt_out = await decode_fn(
             inputs={
-                "input_ids": _to_ndarray(next_id),
-                "position_ids": _to_ndarray(next_position),
+                "input_ids": _to_ndarray(next_id, dtype=torch.int32),
+                "position_ids": _to_ndarray(next_position, dtype=torch.int32),
             },
             state=state,  # SAME dict object — carries the cache forward.
         )
