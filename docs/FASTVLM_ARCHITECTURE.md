@@ -589,5 +589,103 @@ The runtime automatically selects the correct specialization for the executing d
 
 ---
 
+## The Role of llava_qwen.py
+
+Each variant weights directory contains a copy of `llava_qwen.py` — Apple's
+original FastVLM model code. Its role in this repo is narrow and specific.
+
+### What it is
+
+`llava_qwen.py` is Apple's full LLaVA-Qwen training and inference codebase. It
+contains the FastViTHD vision encoder, the LlavaQwen2 multimodal model, the
+projector, the image token injection logic (`prepare_inputs_labels_for_multimodal`),
+and training utilities. It is the canonical definition of FastVLM's architecture.
+
+### How HuggingFace finds it
+
+`config.json` in each weights directory declares a custom model type via `auto_map`:
+
+```json
+{
+  model_type: llava_qwen2,
+  auto_map: {
+    AutoConfig: llava_qwen.LlavaConfig,
+    AutoModelForCausalLM: llava_qwen.LlavaQwen2ForCausalLM
+  }
+}
+```
+
+When `AutoModelForCausalLM.from_pretrained(weights_dir, trust_remote_code=True)`
+is called, HuggingFace reads `auto_map`, finds `llava_qwen.py` co-located with
+`config.json` in the weights directory, and dynamically imports it. The
+`trust_remote_code=True` flag explicitly permits execution of this arbitrary
+Python from the weights directory.
+
+This is why `llava_qwen.py` is duplicated across all three variant directories —
+`weights/fastvlm-{0.5b,1.5b,7b}/` — rather than living in `scripts/`. HuggingFace
+resolves the import relative to the weights directory being loaded.
+
+### Where it is actually used in this repo
+
+**`verify_vision_encoder.py` — indirectly, via HuggingFace auto machinery:**
+This is the only place `llava_qwen.py` is executed. The verify script calls
+`AutoModelForCausalLM.from_pretrained(weights_dir, trust_remote_code=True)`,
+which triggers the dynamic import. The resulting model provides the FastViTHD
+reference implementation that our re-authored `FastVLMVisionEncoder` is compared
+against. `llava_qwen.py` is never imported directly — the import statement is
+nowhere in our codebase.
+
+**Everywhere else — not used at all:**
+- Weight loading uses direct safetensors reads — no `llava_qwen.py`
+- The exported graph comes from our re-authored `fastvlm_*.py` scripts — no `llava_qwen.py`
+- The decoder verify scripts use `Qwen2ForCausalLM` from standard `transformers` — no `llava_qwen.py`
+- The Core AI runtime has zero dependency on `llava_qwen.py`
+
+### What we re-authored and why
+
+FastViTHD is not in `transformers` or any standard library. It exists only in
+`llava_qwen.py`. To export it to Core AI we needed to control the graph precisely —
+replacing `LayerNormChannel` with `F.layer_norm`, replacing manual attention with
+the `SDPA` composite op, adding the fp32 input contract. A direct export of
+`llava_qwen.py`'s FastViTHD would have produced a graph full of unsupported ops.
+
+The decoder (`Qwen2ForCausalLM`) and projector (`mlp2x_gelu`) were also re-authored
+for similar reasons: stateful KV cache export, eager-mode quantization compatibility,
+and op-level control. Standard `transformers` Qwen2 exports cleanly enough for
+reference but not for the stateful KV cache pattern we need.
+
+### What llava_qwen.py contains that does NOT apply to FastVLM
+
+`prepare_inputs_labels_for_multimodal` has two branches:
+
+- `flat` — simple concat of projected image embeddings with text embeddings. **This is what FastVLM uses.**
+- `spatial_unpad` — anyres tiling with learned `image_newline` tokens inserted between tile rows. More complex, requires an additional model parameter.
+
+FastVLM uses the flat path, confirmed from `config.json`:
+```
+mm_patch_merge_type: flat
+image_aspect_ratio:  pad
+image_newline in weights: False
+```
+
+This means the Swift prefill assembly is simply: concatenate the 256 projected
+image embeddings with the text token embeddings. No tiling, no `image_newline`
+parameter, no anyres logic.
+
+### When you would actually need to run llava_qwen.py directly
+
+1. **Fine-tuning FastVLM** on custom data — the training loop, loss computation,
+   and adapter fine-tuning utilities live here.
+2. **Running FastVLM inference the original HF way** — if you want to sanity-check
+   the weights produce sensible output using Apple's original code before going
+   through the export pipeline. The vision encoder is only available here since
+   FastViTHD is not in `transformers`.
+
+For all export, verification, inspection, and Swift integration work, `llava_qwen.py`
+is a reference document. Its presence in the weights directories is required only
+to keep `verify_vision_encoder.py` working via HuggingFace's dynamic import.
+
+---
+
 *Generated June 2026. Based on Apple FastVLM HF weights (August 2025 release),
 coreai-torch 0.4.0, coreai-opt 0.2.0, coreai-core 1.0.0b1, Xcode 27 beta.*
