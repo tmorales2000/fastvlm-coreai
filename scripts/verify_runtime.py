@@ -105,6 +105,14 @@ async def verify_runtime(
     embed_ref   = FastVLMEmbedTokens.from_weights(str(weights_dir)).eval()
     decoder_ref = FastVLMDecoder.from_weights(text_cfg, str(weights_dir)).eval()
 
+    # Initialize decoder_ref KV cache to max_ctx size (0 is only a placeholder for export).
+    n_layers   = text_cfg.num_hidden_layers
+    n_kv_heads = text_cfg.num_key_value_heads
+    head_dim   = text_cfg.hidden_size // text_cfg.num_attention_heads
+    max_ctx    = 4096
+    decoder_ref.k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+    decoder_ref.v_cache = torch.zeros_like(decoder_ref.k_cache)
+
     # ── Load compiled models ──────────────────────────────────────────────────
     print("[INFO] Loading compiled bundle...")
     vision_model  = await AIModel.load(bundle_path / "vision.aimodel")
@@ -215,9 +223,7 @@ async def verify_runtime(
     print(f"\n[INFO] Stage 6: decode loop ({decode_steps} steps)")
     current_seq_len = seq_len
 
-    # Reset decoder_ref KV cache for decode steps
-    decoder_ref.k_cache = torch.zeros_like(decoder_ref.k_cache)
-    decoder_ref.v_cache = torch.zeros_like(decoder_ref.v_cache)
+    # decoder_ref KV cache persists (same as compiled model state)
 
     for step in range(decode_steps):
         current_seq_len += 1

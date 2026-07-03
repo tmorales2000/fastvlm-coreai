@@ -70,7 +70,7 @@ async def inspect_aimodel(path: Path) -> bool:
             shape = list(d.shape)
             print(f"    state   {sname:<25} dtype={str(d.dtype):<12} shape={_fmt_shape(shape)}")
 
-            if sname in ("k_cache", "v_cache"):
+            if sname in ("k_cache", "v_cache", "keyCache", "valueCache"):
                 # seq dim is axis 3 in Apple's 5D layout [n_layers,1,n_kv,seq,head]
                 note = _check_dynamic(shape, 3, sname)
                 if note:
@@ -109,7 +109,9 @@ async def inspect_aimodel(path: Path) -> bool:
             # Decoder: expects inputs_embeds + position_ids, stateful KV
             has_embeds = "inputs_embeds" in desc.input_names or "in_embeddings" in desc.input_names
             has_pos    = "position_ids" in desc.input_names
-            has_kv     = set(desc.state_names) >= {"k_cache", "v_cache"}
+            # Accept both naming conventions: k_cache/v_cache (old) and keyCache/valueCache (Apple)
+            has_kv = (set(desc.state_names) >= {"k_cache", "v_cache"} or
+                      set(desc.state_names) >= {"keyCache", "valueCache"})
             has_logits = "logits" in desc.output_names
 
             print(f"    {'✓' if has_embeds else '✗'} inputs_embeds input present")
