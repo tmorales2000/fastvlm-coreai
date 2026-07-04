@@ -95,7 +95,7 @@ wheels = [
 
 [[package]]
 name = "coreai-core"
-version = "1.0.0b1"
+version = "1.0.0b2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ml-dtypes" },
@@ -105,11 +105,12 @@ dependencies = [
     { name = "yuvio" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/69/44/80b6c29aede01b3efee65425e9e63ebe46a0139722fc11c53253c48b8262/coreai_core-1.0.0b1-cp311-cp311-macosx_26_0_arm64.whl", hash = "sha256:1484d3492ae1a681f4d6994b46e07158e6ef7aa09d890ee86302e1cdd3826c0c", size = 23881803, upload-time = "2026-06-08T18:05:04.499Z" },
-    { url = "https://files.pythonhosted.org/packages/be/1a/2ac5241f57bc06ccaa30ca430048122cfadc1e4819cc46648c3fc6370e51/coreai_core-1.0.0b1-cp311-cp311-manylinux1_x86_64.whl", hash = "sha256:f0a563947afb130945aca24866ad40a628ac20502e2885e38e69fcdb9e033114", size = 63854679, upload-time = "2026-06-08T18:13:42.916Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/4b/211f459e9504afbf0ef3b7409c058812433b5a1d0c3333d364deb0d448db/coreai_core-1.0.0b1-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:649bd98ccc2024fe1b173f21302dd533e0fef7b53189a765fc35858c702b7348", size = 23883079, upload-time = "2026-06-08T18:04:55.954Z" },
-    { url = "https://files.pythonhosted.org/packages/40/4c/a583066b77180a8e7e07f3d3efc906e5028b935a0cb0a4531bdc708065ef/coreai_core-1.0.0b1-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:23c3fe6ab89b5f1176122fd81bd0966dd41a33a25e5112dbb3e36f7f0ec53bdc", size = 63857436, upload-time = "2026-06-08T18:24:37.063Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/ea/8fcb40bde6efc8d9edd79407e4f65fe09535593e1c76f28c00419eeb3c37/coreai_core-1.0.0b1-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:1f7a5705c5b08ae68280dbb5531933b313030aab3307ab8a38d2dca08853e67a", size = 63858278, upload-time = "2026-06-08T18:23:44.529Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/59/6beb993e2c446918a1549293cc13e2c57a93c3cfefae5b81a8ab48864bc4/coreai_core-1.0.0b2-cp311-cp311-macosx_26_0_arm64.whl", hash = "sha256:b56e27df17f908fbb2e2b2a2352a54432dc7e2d01186ccebdcaf393740cd38b5", size = 21348090, upload-time = "2026-07-01T21:14:47.009Z" },
+    { url = "https://files.pythonhosted.org/packages/69/65/fc74611dd1d6586519abe555892181ecbe070155630fe7a45e7578f12e92/coreai_core-1.0.0b2-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:243d4e02f60b1e945c9b79c4e187be5d0f6a493e51282c9135db98f116f49ad6", size = 63325814, upload-time = "2026-07-01T21:15:05.428Z" },
+    { url = "https://files.pythonhosted.org/packages/db/6f/13884f1546862f2eebb4a532a0fb967f570f826a038659c0ce8979813e5b/coreai_core-1.0.0b2-cp312-cp312-macosx_26_0_arm64.whl", hash = "sha256:abea920426c142ffbb6d916b463c77dc88b61439070d4d644fac1adc5bafbbfd", size = 21349085, upload-time = "2026-07-01T21:15:13.296Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/c5/d7d2acae903682a28843ea557eea06660134f204cd918dbc53fa3359c5e2/coreai_core-1.0.0b2-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:d4998c5713af9e1bbff2a97d906a54a1d8f265723ebfdafb267f3c35191a1b8e", size = 63327435, upload-time = "2026-07-01T21:15:30.882Z" },
+    { url = "https://files.pythonhosted.org/packages/68/f4/484ed1ec7131d9ef55c184510be021cd12684d31e2fddf139091998d01d9/coreai_core-1.0.0b2-cp313-cp313-macosx_26_0_arm64.whl", hash = "sha256:6b9a92d3d6ee0447cd5265d7b52dabdb57215aa8701f7a941ef83de2ecd474ea", size = 21349442, upload-time = "2026-07-01T21:15:39.434Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/29/c7501960ffbd5483afa71ca218bfaa5cd1b6e054f1e4a53ebd108dcbfd0f/coreai_core-1.0.0b2-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:42ac86903bde5d013280b8865e4c05f999632de7f772a0ef96b69c59a97fbeca", size = 63328183, upload-time = "2026-07-01T21:15:56.625Z" },
 ]
 
 [[package]]
@@ -133,7 +134,7 @@ wheels = [
 
 [[package]]
 name = "coreai-torch"
-version = "0.4.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coreai-core" },
@@ -149,9 +150,9 @@ dependencies = [
     { name = "torch" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/b7/e1e6b3039c5e37f9602de8df2f2a07659ec7b946b2e537a1b4c824013edf/coreai_torch-0.4.0.tar.gz", hash = "sha256:9ced8d080f3dcdb804eaaa9cc471df94a9f754e7a8dda8720204b810e193f3e6", size = 204907, upload-time = "2026-06-08T18:12:35.212Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/38/c1/0677a598a38c0c8a6af7156318015bcc2c8f4b59c68d091442690902459d/coreai_torch-0.4.1.tar.gz", hash = "sha256:2499429cc94f9e487122420b36b84c83b39a142505c4a54572572147bccc50fa", size = 212648, upload-time = "2026-07-01T23:11:02.067Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/5d/d84f5d62f2ab2588e0d8b4581d040b9e7fe97777a584d821a2ee103b88e8/coreai_torch-0.4.0-py3-none-any.whl", hash = "sha256:b109c0090d83b0a8eb7302fea2314cf3cb8da957477f7b31b8ec36480a94a247", size = 192974, upload-time = "2026-06-08T18:12:33.881Z" },
+    { url = "https://files.pythonhosted.org/packages/53/bd/0f377299bfd8d29cb44f3e803dcdadcee345d047097de84ce64199579ed9/coreai_torch-0.4.1-py3-none-any.whl", hash = "sha256:e2aae98339413b62c03132363dc397936f2b0d90747766852390ba220d085f54", size = 199132, upload-time = "2026-07-01T23:11:00.783Z" },
 ]
 
 [[package]]
@@ -257,6 +258,7 @@ name = "fastvlm-coreai"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "coreai-core" },
     { name = "coreai-opt" },
     { name = "coreai-torch" },
     { name = "huggingface-hub" },
@@ -268,6 +270,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "coreai-core" },
     { name = "coreai-opt" },
     { name = "coreai-torch" },
     { name = "huggingface-hub" },

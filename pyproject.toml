@@ -5,6 +5,7 @@ description = "FastVLM to Core AI .aimodel conversion pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "coreai-torch",
+    "coreai-core",
     "coreai-opt",
     "safetensors",
     "huggingface-hub",
