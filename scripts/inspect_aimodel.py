@@ -237,11 +237,18 @@ async def inspect_bundle(bundle_path: Path) -> bool:
             print(f"      image_mean:        {vis.get('image_mean', '?')}")
             print(f"      image_std:         {vis.get('image_std', '?')}")
 
-        # Model-specific extra blocks
+        # Model-specific extra blocks (e.g. fastvlm, source)
+        skip = {"metadata_version", "kind", "name", "assets", "language", "vision", "source"}
         for key in meta:
-            if key not in ("metadata_version", "kind", "name", "assets",
-                           "language", "vision", "source"):
-                print(f"    {key}: {json.dumps(meta[key], indent=6)}")
+            if key in skip:
+                continue
+            val = meta[key]
+            if isinstance(val, dict):
+                print(f"    {key}:")
+                for k2, v2 in val.items():
+                    print(f"      {k2}: {v2}")
+            else:
+                print(f"    {key}: {val}")
     else:
         print(f"  ⚠ No metadata.json found")
 
