@@ -141,6 +141,8 @@ Bundle [PASS]: fastvlm-0.5b.vlmasset
 
 ### Verify numerical correctness
 
+Run on M1 Pro — see [Known Issues](#known-issues) for M4 Pro:
+
 ```bash
 python scripts/verify_runtime.py --variant 0.5b
 python scripts/verify_runtime.py --variant 0.5b --decode-steps 5
@@ -167,15 +169,33 @@ xcrun coreai-build compile \
 
 ## Scripts
 
+### Export pipeline
+
 | Script | Purpose |
 |--------|---------|
-| `export_fastvlm.py` | Main export script. Produces the full `.vlmasset` bundle. |
-| `inspect_aimodel.py` | Inspect any CoreAI VLM bundle or `.aimodel` file. Works on FastVLM and Qwen3-VL. |
-| `verify_runtime.py` | End-to-end PSNR verification against PyTorch reference. |
-| `verify_decoder.py` | PyTorch-only decoder verification (no CoreAI runtime needed). |
-| `fastvlm_decoder.py` | Re-authored Qwen2 decoder for CoreAI export. |
-| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder for CoreAI export. |
-| `fastvlm_projector.py` | mlp2x_gelu projector for CoreAI export. |
+| `export_fastvlm.py` | Main export script. Produces the full `.vlmasset` bundle. Supports `--variant`, `--quantize`, `--kv-cache`, `--max-context-length`. |
+| `fastvlm_decoder.py` | Re-authored Qwen2 decoder module for CoreAI export. Imported by `export_fastvlm.py`. |
+| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder module. Imported by `export_fastvlm.py`. |
+| `fastvlm_projector.py` | mlp2x_gelu projector module. Imported by `export_fastvlm.py`. |
+| `quantization.py` | `apply_quantization()` and `finalize_for_export()` helpers. Imported by `export_fastvlm.py`. |
+
+### Inspection and verification
+
+| Script | Purpose |
+|--------|---------|
+| `inspect_aimodel.py` | Inspect any CoreAI VLM bundle or `.aimodel` file. Works on FastVLM (`.vlmasset`) and Qwen3-VL (`.llmasset`). Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
+| `verify_runtime.py` | End-to-end PSNR verification against PyTorch reference. Runs all 6 stages of the VLM pipeline. Run on M1 Pro (see Known Issues). |
+| `verify_decoder.py` | PyTorch-only decoder verification — no CoreAI runtime needed. Useful on any machine. |
+
+### Diagnostics and discovery
+
+| Script | Purpose |
+|--------|---------|
+| `discover_weights.py` | Dump weight shapes and dtypes from HF safetensors to `discovery/`. Run when adding a new variant. |
+| `inspect_weights.py` | Human-readable PyTorch/MLX weight inspection. Complements `inspect_aimodel.py` (which inspects compiled CoreAI models). |
+| `probe_activations.py` | Profile intermediate activation magnitudes in the vision encoder's network stages. Used to identify fp16 overflow risk at `network.8-10`. |
+| `audit_weight_dtypes.py` | Exhaustive dtype/shape audit across HF and Apple MLX checkpoints. Used to verify that `quantization.py` matches Apple's exact quantization scope. |
+| `compare_weights.py` | Compare Apple's MLX quantized weights against HF bf16 source by dequantizing and measuring PSNR. Requires Apple's MLX checkpoints locally. |
 
 ---
 
