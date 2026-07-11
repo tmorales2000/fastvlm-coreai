@@ -426,6 +426,27 @@ async def export_fastvlm(
     bundle_path = _bundle_path(variant, output_dir)
     bundle_path.mkdir(parents=True, exist_ok=True)
 
+    # Guard: max_ctx must not exceed model's max_position_embeddings
+    max_pos = getattr(text_cfg, "max_position_embeddings", None)
+    if max_pos is not None and max_ctx > max_pos:
+        raise ValueError(
+            f"--max-context-length {max_ctx} exceeds the model's "
+            f"max_position_embeddings={max_pos}. The model was not trained on "
+            f"position IDs beyond {max_pos}. Use --max-context-length <= {max_pos}."
+        )
+    if max_pos is not None:
+        head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
+        kv_mem_mb = (
+            text_cfg.num_hidden_layers
+            * text_cfg.num_key_value_heads
+            * head_dim
+            * max_ctx * 2 * 2  # K+V, fp16=2 bytes
+            / 1_048_576
+        )
+        alloc_desc = "pre-allocated" if kv_cache == "static" else "ceiling (dynamic)"
+        print(f"[INFO] max_position_embeddings: {max_pos}")
+        print(f"[INFO] KV cache at max_ctx={max_ctx}: {kv_mem_mb:.1f} MB ({alloc_desc})")
+
     print(f"\n[INFO] Exporting FastVLM {variant.upper()} → {bundle_path}")
     print(f"[INFO] Components: {components}")
 
@@ -479,8 +500,18 @@ def main():
         choices=["static", "dynamic"],
         default="static",
         help=(
-            "static: StaticKVCache, ceiling fixed at export time (default, matches Apple). "
-            "dynamic: GrowingKVCache, Swift app controls ceiling, lower initial memory."
+            "KV cache allocation strategy. In both modes --max-context-length is the "
+            "hard ceiling — the compiled graph rejects inputs beyond it. "
+            "static (default): pre-allocates max_ctx tokens of Metal memory upfront. "
+            "Matches Apple vlm/export.py. StaticKVCache in Swift. "
+            "Best for predictable memory and mostly-full context windows. "
+            "dynamic: cache starts at 256 tokens, grows 2x as needed up to max_ctx. "
+            "GrowingKVCache in Swift. Lower initial memory — best when exporting with "
+            "a large max_ctx (e.g. 16384) but expecting mostly short conversations. "
+            "FastVLM 0.5B uses only 12KB/token, so static max_ctx=32768 (393MB) is "
+            "feasible on device — unlike larger models such as Qwen3-VL-2B (115KB/token "
+            "= 3.6GB at 32768, requiring dynamic). "
+            "max_ctx is capped at the model's max_position_embeddings (32768 for FastVLM)."
         ),
     )
     parser.add_argument("--overwrite", action="store_true")
