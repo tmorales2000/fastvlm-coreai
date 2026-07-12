@@ -23,9 +23,9 @@ Supported variants: `0.5b`, `1.5b`, `7b`
 ## Requirements
 
 ### Hardware
-- Apple Silicon Mac (M1 or later)
-- macOS 26+ (macOS 27 beta has an MPSGraph bug affecting Python runtime
-  verification on M4 Pro — see [Known Issues](#known-issues))
+- Apple Silicon Mac
+- macOS 26.5+ (macOS 27 beta has an MPSGraph bug affecting Python runtime
+  verification on macOS 27 beta — see [Known Issues](#known-issues))
 
 ### Software
 - Python 3.11
@@ -80,9 +80,37 @@ uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
 ### 5. Download FastVLM weights
 
 ```bash
-hf download apple/FastVLM-0.5b --local-dir weights/fastvlm-0.5b
-# Repeat for 1.5b and 7b as needed
+hf download apple/FastVLM-0.5B --local-dir weights/fastvlm-0.5b
+# Repeat for 1.5b and 7b as needed:
+# hf download apple/FastVLM-1.5B --local-dir weights/fastvlm-1.5b
+# hf download apple/FastVLM-7B   --local-dir weights/fastvlm-7b
 ```
+
+### 6. Download benchmark test images
+
+```bash
+python scripts/fetch_test_images.py
+```
+
+This downloads 9 public domain benchmark images to `test_assets/images/`
+for use with `llm-runner` and `run_hf_fastvlm.py`. See
+`test_assets/images/README.md` for the full catalog and test purposes.
+
+### 7. Build llm-runner (Swift inference tool)
+
+Apple's `coreai-models` includes `llm-runner`, a Swift CLI that uses
+`CoreAISequentialVLMEngine` to run any exported VLM bundle end-to-end:
+
+```bash
+cd ~/git/apple/coreai-models
+swift build --product llm-runner
+# Binary: .build/out/Products/Debug/llm-runner
+cd -   # return to fastvlm-coreai
+```
+
+> **Note:** First build takes ~20 seconds. Subsequent builds are incremental.
+> If `swift build --product` doesn't produce a binary, run
+> `swift package clean` first then retry.
 
 ### Verify installation
 
@@ -141,7 +169,7 @@ Bundle [PASS]: fastvlm-0.5b.vlmasset
 
 ### Verify numerical correctness
 
-Run on M1 Pro — see [Known Issues](#known-issues) for M4 Pro:
+Run on macOS 26.5 — see [Known Issues](#known-issues):
 
 ```bash
 python scripts/verify_runtime.py --variant 0.5b
@@ -155,6 +183,62 @@ Expected:
   ✓ decode prefill PSNR: XX.X dB (PASS > 40 dB)
   ✓ decode step 1/3:     XX.X dB (PASS > 40 dB)
 [PASS] All stages match PyTorch reference (> 40 dB PSNR).
+```
+
+### Run inference with llm-runner
+
+`llm-runner` from Apple's `coreai-models` is the primary way to run the
+exported bundle via `CoreAISequentialVLMEngine`:
+
+```bash
+LLM_RUNNER=~/git/apple/coreai-models/.build/out/Products/Debug/llm-runner
+
+# Text only
+$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+  --prompt "What is the capital of France?" \
+  --max-tokens 50
+
+# Image + text (VLM)
+$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+  --image test_assets/images/earthrise.jpg \
+  --prompt "What do you see in this image? Describe the colors and spatial arrangement." \
+  --max-tokens 300 --temperature 0
+
+# Hallucination resistance test
+$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+  --image test_assets/images/pale_blue_dot.png \
+  --prompt "Describe exactly what you see in this image." \
+  --max-tokens 200 --temperature 0
+
+# Verbose timing breakdown (TTFT, throughput, memory)
+$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+  --image test_assets/images/great_wave.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 300 --temperature 0 --verbose
+```
+
+> **`--max-tokens`** is the generation limit (default 50), not the KV cache limit.
+> Set to 300-500 for typical use. The KV cache ceiling is `--max-context-length`
+> set at export time (default 4096).
+
+### Compare with HuggingFace reference
+
+`run_hf_fastvlm.py` runs the original HF model for ground truth comparison:
+
+```bash
+# Run HF model on same image/prompt as llm-runner for direct comparison
+python scripts/run_hf_fastvlm.py \
+  --variant 0.5b \
+  --image test_assets/images/earthrise.jpg \
+  --prompt "What do you see in this image?" \
+  --temperature 0
+
+# MPS acceleration (faster on Apple Silicon)
+python scripts/run_hf_fastvlm.py \
+  --variant 0.5b \
+  --image test_assets/images/great_wave.jpg \
+  --prompt "Describe this image." \
+  --temperature 0 --device mps
 ```
 
 ### Compile for ANE (ahead-of-time)
@@ -184,8 +268,15 @@ xcrun coreai-build compile \
 | Script | Purpose |
 |--------|---------|
 | `inspect_aimodel.py` | Inspect any CoreAI VLM bundle or `.aimodel` file. Works on FastVLM (`.vlmasset`) and Qwen3-VL (`.llmasset`). Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
-| `verify_runtime.py` | End-to-end PSNR verification against PyTorch reference. Runs all 6 stages of the VLM pipeline. Run on M1 Pro (see Known Issues). |
+| `verify_runtime.py` | End-to-end PSNR verification against PyTorch reference. Runs all 6 stages of the VLM pipeline. Run on macOS 26.5 (see Known Issues). |
 | `verify_decoder.py` | PyTorch-only decoder verification — no CoreAI runtime needed. Useful on any machine. |
+
+### Test assets
+
+| Script | Purpose |
+|--------|---------|
+| `fetch_test_images.py` | Download 9 public domain benchmark images to `test_assets/images/`. Uses Wikimedia Commons API. Run once after cloning. |
+| `run_hf_fastvlm.py` | Run FastVLM from original HF weights for ground truth comparison against CoreAI export. Supports `--variant`, `--image`, `--prompt`, `--temperature`, `--device`. |
 
 ### Diagnostics and discovery
 
@@ -290,21 +381,21 @@ normalization.
 
 ## Known Issues
 
-### MPSGraph crash on M4 Pro / macOS 27 beta
+### MPSGraph crash on macOS 27 beta
 
 Python runtime verification (`verify_runtime.py` and `asset.executable()`) crashes
-on M4 Pro with macOS 27 beta:
+on macOS 27 beta:
 
 ```
 MPSGraphExecutable.mm:4442: failed assertion 'Incompatible shape for parameter at index 0'
 ```
 
 This affects Apple's own Qwen3-VL export identically — it is an OS/platform bug,
-not a model or export issue. The same model and script pass on M1 Pro / macOS 26.
+not a model or export issue. The same model and script pass on macOS 26.5.
 
 **Workaround:**
-- Run `verify_runtime.py` on M1 Pro or another non-M4 machine
-- For M4 Pro, use `xcrun coreai-build compile` (ahead-of-time compilation)
+- Run `verify_runtime.py` on macOS 26.5
+- For macOS 27 beta, use `xcrun coreai-build compile` (ahead-of-time compilation)
   and verify via Xcode performance tests or Swift app
 
 A Feedback Assistant report has been filed against Apple.
