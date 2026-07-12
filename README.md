@@ -80,7 +80,7 @@ uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
 ### 5. Download FastVLM weights
 
 ```bash
-hf download apple/FastVLM --local-dir weights/fastvlm-0.5b
+hf download apple/FastVLM-0.5b --local-dir weights/fastvlm-0.5b
 # Repeat for 1.5b and 7b as needed
 ```
 
@@ -279,6 +279,8 @@ normalization.
 
 | File | Contents |
 |------|---------|
+| `docs/PERFORMANCE.md` | Benchmark results — throughput, TTFT, memory, quality |
+| `docs/psnr_results.md` | PSNR verification results (PyTorch and CoreAI runtime) |
 | `docs/FASTVLM_ARCHITECTURE.md` | FastVLM architecture deep-dive |
 | `docs/FASTVLM_MULTIMODAL_PIPELINE.md` | Full multimodal pipeline documentation |
 | `docs/FASTVLM_SWIFT_INTEGRATION.md` | Swift app integration guide |
