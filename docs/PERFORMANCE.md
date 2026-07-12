@@ -117,8 +117,70 @@ defaults the vision tower to `GPU dynamic` rather than potentially using ANE.
 Qwen3-VL's ViT is a recognized architecture and gets optimal compute allocation.
 Investigating ANE for FastViTHD is a future task.
 
+---
+
+## FastVLM 1.5B (fp16)
+
+### Single image VQA — `test.jpeg` (280 tokens: 256 image + 24 text)
+
+| Metric | Value |
+|--------|-------|
+| Model load (warm) | 5,828ms |
+| Warmup (one-time JIT) | 5,376ms |
+| **Prompt throughput** | **823 tok/sec** |
+| **Generation throughput** | **53.7 tok/sec** |
+| Prompt time (280 tokens) | 340ms |
+| Memory (current) | 7,104 MB |
+| Memory (peak) | 11,649 MB |
+
+**Output quality:** Clearly better than 0.5B — richer narrative, more accurate detail,
+added analysis section. "bright pink shirt and a white skirt" ✓, Cuisinart box ✓,
+coat rack ✓. Comparable to or better than Qwen3-VL 2B on this image.
+
+---
+
+## FastVLM 1.5B (int8)
+
+### Single image VQA — `test.jpeg` (280 tokens: 256 image + 24 text)
+
+| Metric | Value | vs 1.5B fp16 |
+|--------|-------|-------------|
+| Model load (warm) | **372ms** | **15× faster** |
+| Warmup (one-time JIT) | 3,858ms | 1.4× faster |
+| **Prompt throughput** | **1,503 tok/sec** | **1.8× faster** |
+| **Generation throughput** | **55.2 tok/sec** | ~same |
+| Prompt time (280 tokens) | 186ms | 1.8× faster |
+| Memory (current) | **5,628 MB** | **21% lower** |
+| Memory (peak) | **8,281 MB** | **29% lower** |
+
+> **Cold vs warm load:** First run (cold) takes 59.3s as CoreAI compiles the model
+> for hardware. Second run (warm, cached) takes 372ms. Warm is the realistic number.
+
+> **Generation speed:** Similar for fp16 and int8 because decode steps are
+> memory-bandwidth bound, not compute bound. int8 helps most for prompt processing
+> (compute-heavy prefill), giving 1.8× faster prefill throughput.
+
+**Output quality:** At temperature=0.7, color descriptions vary between runs.
+Use `--temperature 0` for deterministic output. Both runs: "white skirt" ✓,
+"pink sneakers" ✓, "glasses" ✓. Run 1: "peach-colored short-sleeve top" ✓
+(best color description across all models/runs tested).
+
+---
+
 ## FastVLM 7B (int4) — TBD
 
+---
+
+## Full Comparison Matrix (M4 Pro, macOS 27 beta)
+
+Same image, same prompt, same `llm-runner`.
+
+| Model | Quant | Prompt tok/sec | Gen tok/sec | Memory | Load (warm) |
+|-------|-------|---------------|-------------|--------|-------------|
+| FastVLM 0.5B | fp16 | **3,606** | **115** | 2,761 MB | 250ms |
+| FastVLM 1.5B | fp16 | 823 | 54 | 7,104 MB | 5,828ms |
+| FastVLM 1.5B | int8 | 1,503 | 55 | 5,628 MB | **372ms** |
+| FastVLM 7B | int4 | TBD | TBD | TBD | TBD |
 ---
 
 ## Comparison: CoreAI vs MLX-FastVLM (M4 Pro)
