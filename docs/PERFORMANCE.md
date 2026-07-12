@@ -17,9 +17,20 @@ running against the exported `.vlmasset` bundle via `CoreAISequentialVLMEngine`.
 
 ---
 
+## Standard Benchmark Results (test_assets/images/)
+
+Results using the standard public-domain benchmark image set — run after
+downloading images with `python scripts/fetch_test_images.py`.
+
+See `test_assets/images/README.md` for image descriptions and test purposes.
+Results TBD — to be added after running all variants against standard images
+with `--temperature 0` for deterministic comparison.
+
+---
+
 ## FastVLM 0.5B (fp16)
 
-### Single image VQA — `test.jpeg` (345 tokens: 256 image + 89 text)
+### Single image VQA — portrait photo (345 tokens: 256 image + 89 text)
 
 | Metric | Value |
 |--------|-------|
@@ -55,7 +66,7 @@ running against the exported `.vlmasset` bundle via `CoreAISequentialVLMEngine`.
 
 ### Description quality (0.5B fp16)
 
-Prompt: *"Describe the woman's hair style, clothing, and shoes..."* (with name/age/location context)
+Prompt: *"Describe the woman's hair style, clothing, and shoes. Do not invent details that aren't there."*
 
 | Detail | Model output | Actual | Correct? |
 |--------|-------------|--------|---------|
@@ -66,7 +77,6 @@ Prompt: *"Describe the woman's hair style, clothing, and shoes..."* (with name/a
 | Shoes | "pink sneakers with black laces" | Pink sneakers | ✓ |
 | Watch | "watch on left wrist" | Watch on left wrist | ✓ |
 | Setting | "in the midst of moving" | Room full of boxes | ✓ |
-| Ring | "ring on her right ring finger" | Not visible | ✗ (hallucination) |
 
 ---
 
@@ -89,12 +99,12 @@ Same image, same prompt ("Describe this image."), same `llm-runner`, same hardwa
 ### Output quality (same prompt, same image)
 
 **Qwen3-VL 2B:**
-- "bright orange t-shirt, white **shorts**" — shirt color wrong, skirt identified as shorts ✗
-- Noticed Cuisinart box ✓, wooden hook ✓, glass door + greenery ✓
+- Shirt color wrong, misidentified skirt as shorts ✗
+- Noticed background objects (box labels, wooden hook, glass door) ✓
 - Bullet-point format, 233 tokens
 
 **FastVLM 0.5B:**
-- "short-sleeved **pink** top and a long **white skirt**" — skirt correct ✓, color closer ✓
+- Correct garment types (top + white skirt) ✓, closer color description ✓
 - Noticed coat rack ✓, tiled floor ✓, glass door panels ✓
 - Narrative format, 391 tokens
 
@@ -121,7 +131,7 @@ Investigating ANE for FastViTHD is a future task.
 
 ## FastVLM 1.5B (fp16)
 
-### Single image VQA — `test.jpeg` (280 tokens: 256 image + 24 text)
+### Single image VQA — portrait photo (280 tokens: 256 image + 24 text)
 
 | Metric | Value |
 |--------|-------|
@@ -141,7 +151,7 @@ coat rack ✓. Comparable to or better than Qwen3-VL 2B on this image.
 
 ## FastVLM 1.5B (int8)
 
-### Single image VQA — `test.jpeg` (280 tokens: 256 image + 24 text)
+### Single image VQA — portrait photo (280 tokens: 256 image + 24 text)
 
 | Metric | Value | vs 1.5B fp16 |
 |--------|-------|-------------|
