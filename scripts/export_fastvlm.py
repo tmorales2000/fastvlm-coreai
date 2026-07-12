@@ -343,6 +343,11 @@ def _export_decode(
 
     model = FastVLMDecoder.from_weights(text_cfg, str(weights_dir)).eval()
 
+    hidden     = text_cfg.hidden_size
+    n_layers   = text_cfg.num_hidden_layers
+    n_kv_heads = text_cfg.num_key_value_heads
+    head_dim   = hidden // text_cfg.num_attention_heads
+
     if quantize:
         print(f"[INFO] Applying {quantize} quantization...")
         # Build example inputs for tracing (content doesn't affect weight-only quant)
@@ -357,11 +362,6 @@ def _export_decode(
         model, quantizer = apply_quantization(model, level=quantize, example_inputs=example_inputs)
         model = finalize_for_export(model, quantizer)
         print(f"[INFO] Quantization finalized for CoreAI export")
-
-    hidden     = text_cfg.hidden_size
-    n_layers   = text_cfg.num_hidden_layers
-    n_kv_heads = text_cfg.num_key_value_heads
-    head_dim   = hidden // text_cfg.num_attention_heads
 
     # Build reference inputs exactly as vlm/export.py
     k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
