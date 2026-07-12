@@ -1,0 +1,21 @@
+# Standard prompts for FastVLM benchmark testing.
+# Use --temperature 0 (greedy) for deterministic, comparable results.
+# These prompts are used in docs/PERFORMANCE.md benchmarks.
+
+# GENERAL — works on any image
+GENERAL=Describe this image in detail.
+
+# DETAIL — tests fine-grained visual perception
+DETAIL=Describe exactly what you see in this image. Be specific about colors, objects, and spatial relationships. Do not invent details that are not visible.
+
+# PORTRAIT — for afghan_girl.jpg
+PORTRAIT=Describe this portrait. What is the subject wearing? What color are their eyes? What is the background?
+
+# COUNTING — for lunch_skyscraper.jpg
+COUNTING=How many people are in this image? What are they doing, and where are they located?
+
+# MINIMAL — for pale_blue_dot.png (hallucination resistance)
+MINIMAL=Describe exactly what you see in this image. If the image contains very little visual content, say so clearly.
+
+# SPATIAL — for earthrise.jpg
+SPATIAL=What do you see in this image? Describe the colors and how the objects are arranged spatially.

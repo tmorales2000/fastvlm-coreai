@@ -5,6 +5,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# test_assets — ignore downloaded images, keep documentation and prompts
+test_assets/images/*
+!test_assets/images/README.md
+
 # Model weights — NEVER commit
 weights/*
 !weights/.gitkeep
