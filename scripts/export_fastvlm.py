@@ -58,7 +58,7 @@ from fastvlm_decoder import (
 )
 from fastvlm_projector import FastVLMProjector
 from fastvlm_vision_encoder import FastVLMVisionEncoder
-from quantization import QUANTIZATION_LEVELS, apply_quantization
+from quantization import apply_quantization
 
 # ---------------------------------------------------------------------------
 # Constants (matching vlm/export.py)
@@ -345,7 +345,7 @@ def _export_decode(
 
     if quantize:
         print(f"[INFO] Applying {quantize} quantization...")
-        model = apply_quantization(model, level=QUANTIZATION_LEVELS[quantize])
+        model = apply_quantization(model, level=quantize)
 
     hidden     = text_cfg.hidden_size
     n_layers   = text_cfg.num_hidden_layers
