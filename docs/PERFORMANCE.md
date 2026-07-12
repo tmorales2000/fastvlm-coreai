@@ -70,7 +70,52 @@ Prompt: *"Describe the woman's hair style, clothing, and shoes..."* (with name/a
 
 ---
 
-## FastVLM 1.5B — TBD
+## FastVLM 0.5B vs Qwen3-VL 2B — Head-to-Head (M4 Pro, macOS 27 beta)
+
+Same image, same prompt ("Describe this image."), same `llm-runner`, same hardware.
+
+### Performance
+
+| Metric | FastVLM 0.5B (fp16) | Qwen3-VL 2B (fp16) | FastVLM advantage |
+|--------|--------------------|--------------------|-------------------|
+| Warmup (one-time JIT) | 1,630ms | 14,765ms | **9× faster** |
+| Prompt throughput | 3,606 tok/sec | 639 tok/sec | **5.6× faster** |
+| Generation throughput | 115 tok/sec | 51 tok/sec | **2.3× faster** |
+| Memory (current) | 2,761 MB | 9,140 MB | **3.3× lower** |
+| Memory (peak) | 3,446 MB | 11,847 MB | **3.4× lower** |
+| Image tokens | 256 | 196 | more visual detail |
+| Total tokens generated | 391 | 233 | more verbose |
+
+### Output quality (same prompt, same image)
+
+**Qwen3-VL 2B:**
+- "bright orange t-shirt, white **shorts**" — shirt color wrong, skirt identified as shorts ✗
+- Noticed Cuisinart box ✓, wooden hook ✓, glass door + greenery ✓
+- Bullet-point format, 233 tokens
+
+**FastVLM 0.5B:**
+- "short-sleeved **pink** top and a long **white skirt**" — skirt correct ✓, color closer ✓
+- Noticed coat rack ✓, tiled floor ✓, glass door panels ✓
+- Narrative format, 391 tokens
+
+FastVLM 0.5B produced **more accurate output** than Qwen3-VL 2B on this image
+despite being a 4× smaller model. This suggests our CoreAI export pipeline
+introduces no meaningful quality degradation.
+
+### Architectural differences (from verbose output)
+
+| | FastVLM 0.5B | Qwen3-VL 2B |
+|--|--------------|-------------|
+| Vision entrypoints | `encode_image` + `project` (2 separate) | `encode_image` only (projection fused) |
+| Vision output shape | `[1, 256, 3072]` → project → `[1, 256, 896]` | `[1, 196, 2048]` (already in LM dim) |
+| `Unknown model structure` | Yes (FastViTHD not recognized) | No (Qwen2.5-VL-ViT recognized) |
+| KV cache | StaticKVCache, `[24, 1, 2, 4096, 64]` 24MB | StaticKVCache, `[28, 1, 8, 4096, 128]` 448MB |
+| Stop tokens | Standard Qwen2 | 12 additional VLM stop tokens |
+
+The `Unknown model structure` warning for FastVLM means `CoreAISequentialVLMEngine`
+defaults the vision tower to `GPU dynamic` rather than potentially using ANE.
+Qwen3-VL's ViT is a recognized architecture and gets optimal compute allocation.
+Investigating ANE for FastViTHD is a future task.
 
 ## FastVLM 7B (int4) — TBD
 
