@@ -58,7 +58,7 @@ from fastvlm_decoder import (
 )
 from fastvlm_projector import FastVLMProjector
 from fastvlm_vision_encoder import FastVLMVisionEncoder
-from quantization import apply_quantization
+from quantization import apply_quantization, finalize_for_export
 
 # ---------------------------------------------------------------------------
 # Constants (matching vlm/export.py)
@@ -345,7 +345,18 @@ def _export_decode(
 
     if quantize:
         print(f"[INFO] Applying {quantize} quantization...")
-        model = apply_quantization(model, level=quantize)
+        # Build example inputs for tracing (content doesn't affect weight-only quant)
+        ex_k = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+        ex_v = torch.zeros_like(ex_k)
+        example_inputs = (
+            torch.randn(1, QUERY_LEN, hidden, dtype=torch.float16),  # inputs_embeds
+            torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0),  # position_ids
+            ex_k,   # k_cache
+            ex_v,   # v_cache
+        )
+        model, quantizer = apply_quantization(model, level=quantize, example_inputs=example_inputs)
+        model = finalize_for_export(model, quantizer)
+        print(f"[INFO] Quantization finalized for CoreAI export")
 
     hidden     = text_cfg.hidden_size
     n_layers   = text_cfg.num_hidden_layers
