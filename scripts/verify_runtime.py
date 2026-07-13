@@ -17,7 +17,7 @@ Stages 1-2 (vision) will show NaN PSNR with random pixel_values due to fp16
 saturation — this is expected and not a failure.
 
 USAGE:
-  # Run on macOS 26.5 — macOS 27 beta has MPSGraph bug with stateful KV
+  # Run on MacBook Pro (M1 Pro) — fleetwoodmac has MPSGraph bug with stateful KV
   python scripts/verify_runtime.py --variant 0.5b
   python scripts/verify_runtime.py --variant 0.5b --decode-steps 5 --seed 123
   python scripts/verify_runtime.py --variant 0.5b --bundle-path exports/fastvlm-0.5b.vlmasset
@@ -113,6 +113,7 @@ async def verify_runtime(
     decode_steps: int = 3,
     seed: int = 42,
     max_ctx: int = 4096,
+    image: Path | None = None,
 ) -> bool:
     torch.manual_seed(seed)
     weights_dir = Path(__file__).parent.parent / "weights" / f"fastvlm-{variant}"
@@ -181,7 +182,20 @@ async def verify_runtime(
     # ── Stage 1: vision_encode ────────────────────────────────────────────────
     print("\n[INFO] Stage 1: vision_encode")
     torch.manual_seed(seed)
-    pixel_values = torch.randn(1, 3, image_size, image_size)
+    if image:
+        # Use real image for meaningful PSNR comparison
+        from PIL import Image as PILImage
+        img = PILImage.open(image).convert("RGB")
+        image_processor = vision_ref.image_processor if hasattr(vision_ref, "image_processor") else None
+        if image_processor is not None:
+            pixel_values = image_processor(images=img, return_tensors="pt")["pixel_values"]
+        else:
+            import torchvision.transforms as T
+            pixel_values = T.ToTensor()(img.resize((image_size, image_size))).unsqueeze(0)
+        print(f"[INFO] Using real image: {image}")
+    else:
+        pixel_values = torch.randn(1, 3, image_size, image_size)
+        print("[INFO] Using random pixel_values (vision PSNR will be NaN — use --image for meaningful results)")
 
     if vision_ok:
         with torch.no_grad():
@@ -307,6 +321,11 @@ def main():
         help="Path to .vlmasset bundle (default: exports/fastvlm-{variant}.vlmasset)"
     )
     parser.add_argument("--decode-steps", type=int, default=3)
+    parser.add_argument(
+        "--image", type=Path, default=None,
+        help="Path to a real image for meaningful vision PSNR. "
+             "Without this, random pixel_values produce NaN PSNR for vision stages."
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--max-ctx", type=int, default=4096,
@@ -324,6 +343,7 @@ def main():
         decode_steps=args.decode_steps,
         seed=args.seed,
         max_ctx=args.max_ctx,
+        image=args.image,
     ))
     sys.exit(0 if passed else 1)
 
