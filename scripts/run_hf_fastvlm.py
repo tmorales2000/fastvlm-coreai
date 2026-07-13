@@ -20,8 +20,8 @@ USAGE:
     --prompt "Describe this image." --temperature 0
 
 NOTES:
-  - Runs on CPU by default (safe on all machines, ~30-60 sec for 0.5B)
-  - Use --device mps for GPU acceleration on Apple Silicon (~5-10 sec)
+  - Runs on MPS (Apple Silicon GPU) by default — ~5-10 sec for 0.5B
+  - Use --device cpu as fallback if MPS causes issues
   - The HF model uses trust_remote_code=True (runs llava_qwen.py)
   - Uses the LLaVA-style prompt format: USER: <image>\\nprompt\\nASSISTANT:
     which matches FastVLM's training format
@@ -47,8 +47,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Sampling temperature. 0 = greedy (default, recommended for benchmarking)")
-    parser.add_argument("--device", choices=["cpu", "mps"], default="cpu",
-                        help="Device to run on (cpu is safest, mps for speed on Apple Silicon)")
+    parser.add_argument("--device", choices=["cpu", "mps"], default="mps",
+                        help="Device to run on. Default: mps (GPU on Apple Silicon). Use cpu if mps fails.")
     args = parser.parse_args()
 
     weights_dir = Path(__file__).parent.parent / "weights" / f"fastvlm-{args.variant}"
@@ -81,10 +81,12 @@ def main():
     model_class_name = config.architectures[0] if config.architectures else "unknown"
     print(f"[INFO] Model architecture: {model_class_name}")
 
-    # Load processor
+    # Load tokenizer from local weights
+    from transformers import AutoTokenizer
     t0 = time.time()
-    processor = AutoProcessor.from_pretrained(str(weights_dir), trust_remote_code=True)
-    print(f"[INFO] Processor loaded in {time.time()-t0:.1f}s")
+    tokenizer = AutoTokenizer.from_pretrained(str(weights_dir), trust_remote_code=True)
+    # image_processor loaded from model after model loads (uses model's own config)
+    print(f"[INFO] Tokenizer loaded in {time.time()-t0:.1f}s")
 
     # Load model using auto class (resolves trust_remote_code model class)
     t0 = time.time()
@@ -98,12 +100,10 @@ def main():
         ).eval()
     except Exception:
         # Fallback: load model class directly from llava_qwen.py
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "llava_qwen",
-            weights_dir / "llava_qwen.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
+        import importlib.util, sys as _sys
+        spec = importlib.util.spec_from_file_location("llava_qwen", weights_dir / "llava_qwen.py")
+        mod  = importlib.util.module_from_spec(spec)
+        _sys.modules["llava_qwen"] = mod   # register before exec for timm @register_model
         spec.loader.exec_module(mod)
         ModelClass = getattr(mod, model_class_name, None)
         if ModelClass is None:
@@ -120,35 +120,55 @@ def main():
         model = model.to("mps")
     print(f"[INFO] Model loaded in {time.time()-t0:.1f}s")
 
-    # Build LLaVA-style prompt (matching FastVLM training format)
+    # Use the model's own image processor (loaded from model_cfg["image_cfg"])
+    # This handles FastVLM's pad aspect ratio and exact preprocessing correctly.
+    image_processor = model.get_vision_tower().image_processor
+
+    # Process image
     image = Image.open(args.image).convert("RGB")
-    full_prompt = f"USER: <image>\n{args.prompt}\nASSISTANT:"
+    pixel_values = image_processor(images=image, return_tensors="pt")["pixel_values"]
 
-    # Process inputs
-    inputs = processor(text=full_prompt, images=image, return_tensors="pt")
-    if device == "mps" and torch.backends.mps.is_available():
-        inputs = {k: v.to("mps") if hasattr(v, "to") else v for k, v in inputs.items()}
+    # Tokenize prompt. FastVLM uses IMAGE_TOKEN_INDEX = -200 as sentinel in
+    # input_ids to mark image injection position — not a real vocabulary token.
+    IMAGE_TOKEN_INDEX = -200
+    before_tok = tokenizer("USER: ", return_tensors="pt", add_special_tokens=False)
+    after_tok  = tokenizer(f"\n{args.prompt}\nASSISTANT:", return_tensors="pt", add_special_tokens=False)
 
-    prompt_len = inputs["input_ids"].shape[1]
+    input_ids = torch.cat([
+        before_tok["input_ids"],
+        torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=torch.long),
+        after_tok["input_ids"],
+    ], dim=1)
+    attention_mask = torch.ones_like(input_ids)
+
+    target_device = torch.device(device if (device == "mps" and torch.backends.mps.is_available()) else "cpu")
+    pixel_values  = pixel_values.to(dtype=dtype, device=target_device)
+    input_ids     = input_ids.to(target_device)
+    attention_mask = attention_mask.to(target_device)
+
+    prompt_len = input_ids.shape[1]
     print(f"[INFO] Prompt tokens: {prompt_len}")
     print()
 
-    # Generate
+    # Generate — pass input_ids positionally as LlavaQwen2ForCausalLM.generate()
+    # expects it that way (calls embed_tokens(inputs) internally)
     t0 = time.time()
     do_sample = args.temperature > 0
     with torch.no_grad():
         output = model.generate(
-            **inputs,
+            input_ids,
+            images=[pixel_values[0]],  # pass as list to use batched encode path in llava_qwen
+            attention_mask=attention_mask,
             max_new_tokens=args.max_tokens,
             do_sample=do_sample,
             temperature=args.temperature if do_sample else None,
-            pad_token_id=processor.tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
         )
     elapsed = time.time() - t0
 
     # Decode — only the generated tokens
     generated_ids  = output[0][prompt_len:]
-    response       = processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+    response       = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     generated_tokens = len(generated_ids)
 
     print("=" * 64)
