@@ -236,6 +236,8 @@ async def inspect_bundle(bundle_path: Path) -> bool:
             print(f"      image_token_id:    {vis.get('image_token_id', '?')}")
             print(f"      image_mean:        {vis.get('image_mean', '?')}")
             print(f"      image_std:         {vis.get('image_std', '?')}")
+            if "preprocessing" in vis:
+                print(f"      preprocessing:     {vis.get('preprocessing')}")
 
         # Model-specific extra blocks (e.g. fastvlm, source)
         skip = {"metadata_version", "kind", "name", "assets", "language", "vision", "source"}

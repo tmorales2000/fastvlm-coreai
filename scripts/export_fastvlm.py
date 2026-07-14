@@ -135,6 +135,7 @@ def _write_bundle_metadata(
             "image_mean":        IMAGE_MEAN,
             "image_std":         IMAGE_STD,
             "rescale_factor":    RESCALE_FACTOR,
+            "preprocessing":     "center_crop",
         },
         "source": {
             "hf_model_id":      f"apple/FastVLM-{variant.upper()}",
