@@ -41,14 +41,24 @@ git clone https://github.com/tmorales2000/fastvlm-coreai.git
 cd fastvlm-coreai
 ```
 
-### 2. Clone Apple's coreai-models
+### 2. Clone coreai-models (use this fork)
 
-`coreai-models` is required for the export pipeline but is not available on
-PyPI with a correct Python version constraint. Install from source:
+`coreai-models` is required for the export pipeline. Clone from this fork
+rather than Apple's upstream — the fork includes a fix for image preprocessing
+that is required for correct FastVLM inference ([apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100)).
+Without this fix, `CoreAISequentialVLMEngine` stretch-resizes all images to a
+square, distorting non-square inputs and causing incorrect model output.
 
 ```bash
-git clone https://github.com/apple/coreai-models.git ~/git/apple/coreai-models
+git clone https://github.com/tmorales2000/coreai-models.git ~/git/tmorales2000/coreai-models
+cd ~/git/tmorales2000/coreai-models
+git checkout fix/vlm-image-preprocessing-strategy
+cd -
 ```
+
+> **Note:** A proposal to merge this fix upstream has been filed as
+> [apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
+> Once merged, you can switch back to Apple's upstream repo.
 
 ### 3. Create the Python environment
 
@@ -69,13 +79,13 @@ coreai-opt==0.2.1
 ### 4. Install coreai-models from source
 
 ```bash
-uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
+uv pip install -e ~/git/tmorales2000/coreai-models/python/ --no-deps
 ```
 
 > **Note:** This step must be repeated after every `uv sync` because `uv sync`
 > does not preserve editable installs from local paths outside the project.
 > The PyPI version of `coreai-models` has an incorrect `Python>=3.14` constraint
-> and cannot be used.
+> and cannot be used (see [apple/coreai-models #96](https://github.com/apple/coreai-models/issues/96)).
 
 ### 5. Download FastVLM weights
 
@@ -102,7 +112,7 @@ Apple's `coreai-models` includes `llm-runner`, a Swift CLI that uses
 `CoreAISequentialVLMEngine` to run any exported VLM bundle end-to-end:
 
 ```bash
-cd ~/git/apple/coreai-models
+cd ~/git/tmorales2000/coreai-models
 swift build --product llm-runner
 # Binary: .build/out/Products/Debug/llm-runner
 cd -   # return to fastvlm-coreai
@@ -176,14 +186,19 @@ python scripts/verify_runtime.py --variant 0.5b
 python scripts/verify_runtime.py --variant 0.5b --decode-steps 5
 ```
 
-Expected:
+Expected (with `--image` flag for meaningful vision PSNR):
 ```
+  ✓ vision_encode PSNR:  71.9 dB (PASS)
+  ✓ project PSNR:        67.6 dB (PASS)
   ✓ embed_tokens PSNR:   inf dB  (PASS)
-  ✓ scatter_merge PSNR:  inf dB  (PASS)
-  ✓ decode prefill PSNR: XX.X dB (PASS > 40 dB)
+  ✓ scatter_merge PSNR:  67.7 dB (PASS)
+  ✓ decode prefill PSNR: 50.2 dB (PASS > 40 dB)
   ✓ decode step 1/3:     XX.X dB (PASS > 40 dB)
 [PASS] All stages match PyTorch reference (> 40 dB PSNR).
 ```
+
+Without `--image`, vision stages show NaN (expected — fp16 saturation with random input).
+Use `--image test_assets/images/earthrise.jpg` for meaningful end-to-end verification.
 
 ### Run inference with llm-runner
 
@@ -191,7 +206,7 @@ Expected:
 exported bundle via `CoreAISequentialVLMEngine`:
 
 ```bash
-LLM_RUNNER=~/git/apple/coreai-models/.build/out/Products/Debug/llm-runner
+LLM_RUNNER=~/git/tmorales2000/coreai-models/.build/out/Products/Debug/llm-runner
 
 # Text only
 $LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
@@ -276,7 +291,9 @@ xcrun coreai-build compile \
 | Script | Purpose |
 |--------|---------|
 | `fetch_test_images.py` | Download 9 public domain benchmark images to `test_assets/images/`. Uses Wikimedia Commons API. Run once after cloning. |
+| `generate_test_images.py` | Generate synthetic test images (tall_narrow_circle.png, wide_short_square.png) for preprocessing strategy verification. No external downloads needed. |
 | `run_hf_fastvlm.py` | Run FastVLM from original HF weights for ground truth comparison against CoreAI export. Supports `--variant`, `--image`, `--prompt`, `--temperature`, `--device`. |
+| `probe_vlm_config.py` | Probe any HF VLM config for native resolution and preprocessing metadata. Supports Qwen3-VL (2B/7B/32B/72B), FastVLM, and any HF VLM. |
 
 ### Diagnostics and discovery
 
@@ -333,7 +350,7 @@ pixel_values [1, 3, 1024, 1024]
       ↓ vision.aimodel::encode_image
 image_features [1, 256, 3072]
       ↓ vision.aimodel::project
-projected_features [1, 256, 896]      ← 256 image tokens in LM space
+projected_features [1, 256, hidden]   ← 256 image tokens in LM space (hidden=896/1536/3584 by variant)
       ↓
 all_token_ids [1, 256+N]              ← 256 <image> placeholders + N text tokens
       ↓ embed.aimodel::main
@@ -364,6 +381,13 @@ model for Swift compatibility.
 Qwen3-VL which uses ImageNet stats, FastVLM's vision tower was trained without
 normalization.
 
+**Image preprocessing strategy:** FastVLM's `CLIPImageProcessor` uses shortest-edge
+resize + center crop to 1024×1024 — not stretch resize. The exported bundle declares
+`"preprocessing": "center_crop"` in `metadata.json`, which `CoreAISequentialVLMEngine`
+reads to select `ImagePreprocessor.preprocessCHWCenterCrop()`. Without this, non-square
+images are geometrically distorted before being fed to the vision encoder.
+See [apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
+
 ---
 
 ## Documentation
@@ -372,10 +396,9 @@ normalization.
 |------|---------|
 | `docs/PERFORMANCE.md` | Benchmark results — throughput, TTFT, memory, quality |
 | `docs/psnr_results.md` | PSNR verification results (PyTorch and CoreAI runtime) |
-| `docs/FASTVLM_ARCHITECTURE.md` | FastVLM architecture deep-dive |
-| `docs/FASTVLM_MULTIMODAL_PIPELINE.md` | Full multimodal pipeline documentation |
-| `docs/FASTVLM_SWIFT_INTEGRATION.md` | Swift app integration guide |
-| `docs/STATUS.md` | Current project status and pending items |
+| `docs/FASTVLM_ARCHITECTURE.md` | Architecture deep-dive — components, quantization, export gotchas, image preprocessing |
+| `docs/FASTVLM_SWIFT_INTEGRATION.md` | Swift integration guide — llm-runner, CoreAISequentialVLMEngine, custom app |
+| `docs/STATUS.md` | Current project status, known issues, pending items |
 
 ---
 
@@ -431,3 +454,10 @@ with FastVLM-specific additions:
 
 Adding FastVLM as a first-class recipe in Apple's `coreai-models` is a planned
 future contribution.
+
+### Issues filed against apple/coreai-models
+
+| Issue | Status | Description |
+|-------|--------|-------------|
+| [#96](https://github.com/apple/coreai-models/issues/96) | 🔲 Open | PyPI wheel declares incorrect `Python>=3.14` constraint |
+| [#100](https://github.com/apple/coreai-models/issues/100) | 🔲 Proposed | `CoreAISequentialVLMEngine` stretch-resizes all VLM images — fix with working implementation on fork |

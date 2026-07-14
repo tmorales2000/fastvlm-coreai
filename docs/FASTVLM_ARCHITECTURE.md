@@ -84,7 +84,7 @@ precision.
 
 ```bash
 # Inspect the compiled model's vision_encode entrypoint
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b_fp16.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
 # Look for:
 #   input   pixel_values   dtype=float32   shape=[1, 3, 1024, 1024]
 #   output  image_features dtype=float16   shape=[1, 256, 3072]
@@ -92,9 +92,9 @@ python scripts/inspect_aimodel.py exports/fastvlm-0.5b_fp16.aimodel
 
 ```bash
 # Verify numerical correctness against the HF reference
-python scripts/verify_vision_encoder.py --variant 0.5b
-# Stage 1 (fp32):  should be ~129 dB  (bit-identical to HF)
-# Stage 2 (fp16):  should be ~50 dB   (fp16 rounding from HF bf16)
+python scripts/verify_runtime.py --variant 0.5b --image test_assets/images/earthrise.jpg
+# vision_encode PSNR: 71.9 dB  (PASS)
+# project PSNR:       67.6 dB  (PASS)
 ```
 
 ### Variants: vision encoder is identical across 0.5B, 1.5B, 7B
@@ -160,18 +160,19 @@ The `hidden_size` (896 / 1536 / 3584) matches the decoder's token embedding dime
 
 ```bash
 # Compare all three variants' projector output shapes
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b_fp16.aimodel
-python scripts/inspect_aimodel.py exports/fastvlm-1.5b_fp16_int8.aimodel
-python scripts/inspect_aimodel.py exports/fastvlm-7b_fp16_int4.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-1.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-7b.vlmasset
 # Look at the project entrypoint output shape in each
 ```
 
 ```bash
 # Verify projector numerical quality including quantization
-python scripts/verify_projector.py --variant 1.5b
-# Stage 1 (fp32): ~113 dB
-# Stage 2 (fp16): ~59 dB
-# Stage 3 (int8): ~68 dB vs fp16 reference
+python scripts/verify_runtime.py --variant 1.5b --image test_assets/images/earthrise.jpg
+# vision_encode PSNR: 71.9 dB  (PASS)
+# project PSNR:       67.6 dB  (PASS)
+# embed_tokens PSNR:  inf dB   (PASS)
+# decode steps:       44+ dB   (PASS)
 ```
 
 ```bash
@@ -259,33 +260,33 @@ variant's extended tokenizer.
 
 ```bash
 # Full data flow with tensor shapes at each stage boundary — ground truth for all tables
-python scripts/inspect_model.py --variant 0.5b --source pytorch --mode flow
-python scripts/inspect_model.py --variant 1.5b --source pytorch --mode flow
-python scripts/inspect_model.py --variant 7b   --source pytorch --mode flow
+python scripts/inspect_weights.py --variant 0.5b --source pytorch --mode flow
+python scripts/inspect_weights.py --variant 1.5b --source pytorch --mode flow
+python scripts/inspect_weights.py --variant 7b   --source pytorch --mode flow
 
 # Raw config JSON
-python scripts/inspect_model.py --variant 1.5b --source pytorch --mode config
+python scripts/inspect_weights.py --variant 1.5b --source pytorch --mode config
 
 # Layer-by-layer tensor inventory (designed for diffing PyTorch vs MLX)
-python scripts/inspect_model.py --variant 1.5b --source pytorch --mode layers > /tmp/pt.txt
-python scripts/inspect_model.py --variant 1.5b --source mlx    --mode layers > /tmp/mlx.txt
+python scripts/inspect_weights.py --variant 1.5b --source pytorch --mode layers > /tmp/pt.txt
+python scripts/inspect_weights.py --variant 1.5b --source mlx    --mode layers > /tmp/mlx.txt
 diff /tmp/pt.txt /tmp/mlx.txt
 # Shows exactly which tensors changed dtype and which gained .scales/.biases siblings
 ```
 
 ```bash
 # See KV cache shapes in the compiled model
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b_fp16.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
 # state  k_cache   dtype=float16   shape=[24, 1, 4096, 128]
 # state  v_cache   dtype=float16   shape=[24, 1, 4096, 128]
 # Shape: [n_layers, batch=1, MAX_SEQ_LEN, kv_dim]
 # kv_dim = head_dim * num_key_value_heads = 64 * 2 = 128 for 0.5B
 
-python scripts/inspect_aimodel.py exports/fastvlm-1.5b_fp16_int8.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-1.5b.vlmasset
 # state  k_cache   dtype=float16   shape=[28, 1, 4096, 256]
 # kv_dim = 128 * 2 = 256 for 1.5B
 
-python scripts/inspect_aimodel.py exports/fastvlm-7b_fp16_int4.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-7b.vlmasset
 # state  k_cache   dtype=float16   shape=[28, 1, 4096, 512]
 # kv_dim = 128 * 4 = 512 for 7B
 ```
@@ -294,18 +295,18 @@ python scripts/inspect_aimodel.py exports/fastvlm-7b_fp16_int4.aimodel
 
 | | Shape | Dtype | Notes |
 |---|---|---|---|
-| `input_ids` | `[1, L]` | `int32` | Token IDs; L varies (prefill vs decode) |
+| `inputs_embeds` | `[1, L, hidden]` | `float16` | Pre-computed embeddings (not token IDs) |
 | `position_ids` | `[1, L]` | `int32` | Absolute positions of each token |
 | `logits` (output) | `[1, L, vocab_size]` | `float16` | Raw scores for next token |
-| `k_cache` (state) | `[n_layers, 1, 4096, kv_dim]` | `float16` | Persisted across calls |
-| `v_cache` (state) | `[n_layers, 1, 4096, kv_dim]` | `float16` | Persisted across calls |
+| `k_cache` (state) | `[n_layers, 1, n_kv_heads, 4096, head_dim]` | `float16` | Persisted across calls |
+| `v_cache` (state) | `[n_layers, 1, n_kv_heads, 4096, head_dim]` | `float16` | Persisted across calls |
 
 The `L` dimension is dynamic (`-1` in the compiled model's descriptor), supporting
 both the prefill call (L = 256 image tokens + prompt tokens) and decode steps (L = 1).
 
 ```bash
 # Confirm dynamic L in compiled decode signature
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b_fp16.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
 #   input   input_ids    dtype=int32    shape=[1, -1]
 #   output  logits       dtype=float16  shape=[1, -1, 151936]
 ```
@@ -422,13 +423,12 @@ with `mutates_args=['x']`. This caused `torch.export.export` to wrap it in
 for (bug FB23024751, `apple/coreai-models#5`). Export failed with `UnboundLocalError`
 in `_higher_order_resolver`.
 
-**Core AI export (fix):** Replaced the custom op with `aten.slice_scatter` — a standard
-PyTorch op that coreai-torch already knows how to lower. The two-step write:
-1. Extract the layer's row from the 4D cache
-2. Scatter new tokens into the row at the sequence position
-3. Scatter the updated row back into the full cache
-
-This is semantically identical to in-place assignment but goes through a supported op.
+**Core AI export (fix):** Use `mutable_slice_update` from
+`coreai_models.primitives.macos.cache.KVCache` — the only pattern that creates
+`AutoFunctionalized` nodes that `remove_functionalization` can lower to
+`coreai.slice_update` MLIR. `aten.slice_scatter` is functionally equivalent but
+does NOT work — it doesn't create `AutoFunctionalized` nodes.
+This distinction is completely undocumented and was the hardest bug in the pipeline.
 
 ### 3. Graph-mode quantization → eager-mode quantization
 
@@ -542,11 +542,13 @@ The 1.5B int8 logit PSNR is ~50 dB, the 0.5B fp16 is limited only by fp16 precis
 
 After running `python scripts/export_fastvlm.py --variant <V>`:
 
-| Export | Size | Entrypoints | decode logits shape | KV cache shape |
-|--------|------|-------------|--------------------|--------------------|
-| `fastvlm-0.5b_fp16.aimodel` | 1.24 GB | vision_encode, project, decode | `[1,-1,151936]` | `[24,1,4096,128]` |
-| `fastvlm-1.5b_fp16_int8.aimodel` | 1.87 GB | vision_encode, project, decode | `[1,-1,151936]` | `[28,1,4096,256]` |
-| `fastvlm-7b_fp16_int4.aimodel` | 4.36 GB | vision_encode, project, decode | `[1,-1,152064]` | `[28,1,4096,512]` |
+| Bundle | Decoder | vision.aimodel entrypoints | decode logits shape | KV cache shape |
+|--------|---------|--------------------------|--------------------|--------------------|
+| `fastvlm-0.5b.vlmasset` | fp16 | encode_image, project | `[1,-1,151936]` | `[24,1,2,4096,64]` |
+| `fastvlm-1.5b.vlmasset` | int8 | encode_image, project | `[1,-1,151936]` | `[28,1,2,4096,128]` |
+| `fastvlm-7b.vlmasset` | int4 | encode_image, project | `[1,-1,152064]` | `[28,1,4,4096,128]` |
+
+Note: decoder entrypoint is `main` in `fastvlm-{variant}.aimodel`.
 
 All three pass `python scripts/inspect_aimodel.py <path>` with PASS on all checks.
 
@@ -555,7 +557,7 @@ All three pass `python scripts/inspect_aimodel.py <path>` with PASS on all check
 After running `xcrun coreai-build compile`:
 
 ```bash
-ls exports/fastvlm-0.5b_fp16.*.aimodelc
+ls fastvlm-0.5b.*.aimodelc  # compiled to current dir by default; move to exports/
 # fastvlm-0.5b_fp16.h13c.aimodelc  ← A17 Pro (iPhone 15 Pro)
 # fastvlm-0.5b_fp16.h14c.aimodelc  ← A18 (iPhone 16)
 # fastvlm-0.5b_fp16.h15c.aimodelc  ← A18 Pro (iPhone 16 Pro)
@@ -573,15 +575,16 @@ The runtime automatically selects the correct specialization for the executing d
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/inspect_model.py` | Architecture flow, layer inventory, PyTorch vs MLX diff |
+| `scripts/inspect_weights.py` | Architecture flow, layer inventory, PyTorch vs MLX diff |
 | `scripts/audit_weight_dtypes.py` | Exhaustive dtype/shape audit of HF and MLX checkpoints |
 | `scripts/compare_weights.py` | Per-layer PSNR comparison of Apple vs our quantization |
 | `scripts/export_fastvlm.py` | Export all three components to `.aimodel` |
 | `scripts/inspect_aimodel.py` | Verify entrypoints, dtypes, shapes of exported model |
-| `scripts/verify_decoder.py` | Three-stage decoder correctness verification |
-| `scripts/verify_projector.py` | Three-stage projector correctness verification |
-| `scripts/verify_vision_encoder.py` | Three-stage vision encoder correctness verification |
-| `scripts/verify_runtime.py` | End-to-end runtime integration test via Core AI Python runtime |
+| `scripts/verify_decoder.py` | PyTorch-only decoder correctness verification |
+| `scripts/verify_runtime.py` | End-to-end PSNR verification. Use `--image` flag for meaningful vision PSNR. |
+| `scripts/run_hf_fastvlm.py` | Run FastVLM via HF weights — ground truth baseline for CoreAI comparison |
+| `scripts/probe_vlm_config.py` | Probe any HF VLM config for preprocessing and native resolution metadata |
+| `scripts/generate_test_images.py` | Generate synthetic test images for preprocessing verification |
 | `scripts/fastvlm_decoder.py` | Re-authored Qwen2 decoder for Core AI export |
 | `scripts/fastvlm_projector.py` | Re-authored mlp2x_gelu projector for Core AI export |
 | `scripts/fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder for Core AI export |
@@ -610,7 +613,7 @@ CLIPImageProcessor(
 The complete preprocessing pipeline for a camera frame is:
 
 1. Resize shortest edge to 1024 (bicubic)
-2. Pad to 1024×1024 square (`image_aspect_ratio: pad`)
+2. **Center crop** to 1024×1024 — cuts the longer dimension symmetrically
 3. Convert to float32 in range [0.0, 1.0]
 4. Rearrange from interleaved `[H, W, C]` → planar `[C, H, W]`
 5. Add batch dimension → `[1, 3, 1024, 1024]` float32
@@ -618,9 +621,43 @@ The complete preprocessing pipeline for a camera frame is:
 No mean subtraction, no std division. This is the tensor passed to
 `vision_encode` as `pixel_values`.
 
-For the Metal preprocessing pipeline, this means the compute shader only
-needs to handle resize, pad, channel reorder, and float conversion — not
-normalization. See `FASTVLM_SWIFT_INTEGRATION.md` for the Metal pipeline design.
+For the Metal preprocessing pipeline, the compute shader needs to handle:
+shortest-edge resize, center crop, channel reorder, and float conversion.
+No normalization needed.
+
+### `image_aspect_ratio: pad` is dead code
+
+`config.json` declares `image_aspect_ratio: pad`, which looks like it controls
+preprocessing behavior. It does not. This field is only read in the `spatial` patch
+merge branch of `prepare_inputs_labels_for_multimodal` in `llava_qwen.py`. FastVLM
+uses `mm_patch_merge_type: flat`, so the `spatial` branch is never reached and the
+field is never consulted. It is inherited LLaVA codebase configuration that has no
+effect on FastVLM's actual preprocessing.
+
+### CoreAISequentialVLMEngine image preprocessing (the bug we fixed)
+
+Prior to the fix in `tmorales2000/coreai-models`, `CoreAISequentialVLMEngine`
+**stretch-resized** all images to `imageSize × imageSize` regardless of the model's
+actual preprocessing contract. This is geometrically incorrect for non-square images.
+
+**Proof:** Fed a 200×800 image (1:4 aspect ratio) with a red circle to both models:
+
+| Model | Preprocessing | Response |
+|-------|-------------|---------|
+| FastVLM 1.5B fp16 | center_crop (fixed) | "The red object is a **circle**." ✓ |
+| Qwen3-VL 2B fp16 | stretch (unfixed) | "The red object is an **oval**." ✗ |
+
+**The fix** adds a `"preprocessing"` field to `metadata.json`:
+```json
+"vision": {
+    "image_size": 1024,
+    "preprocessing": "center_crop"
+}
+```
+
+`CoreAISequentialVLMEngine` reads this and calls `preprocessCHWCenterCrop()` instead
+of the legacy stretch `preprocessCHW()`. Proposed upstream as
+[apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
 
 ---
 
@@ -682,10 +719,10 @@ language_model.model.layers.0.self_attn.q_proj.biases  [384, 24]    float16
 
 Inspect any variant's full key structure:
 ```bash
-python scripts/inspect_model.py --variant 1.5b --source pytorch --mode layers
-python scripts/inspect_model.py --variant 1.5b --source mlx    --mode layers
-diff <(python scripts/inspect_model.py --variant 1.5b --source pytorch --mode layers) \
-     <(python scripts/inspect_model.py --variant 1.5b --source mlx    --mode layers)
+python scripts/inspect_weights.py --variant 1.5b --source pytorch --mode layers
+python scripts/inspect_weights.py --variant 1.5b --source mlx    --mode layers
+diff <(python scripts/inspect_weights.py --variant 1.5b --source pytorch --mode layers) \
+     <(python scripts/inspect_weights.py --variant 1.5b --source mlx    --mode layers)
 ```
 
 ---
@@ -728,8 +765,8 @@ resolves the import relative to the weights directory being loaded.
 
 ### Where it is actually used in this repo
 
-**`verify_vision_encoder.py` — indirectly, via HuggingFace auto machinery:**
-This is the only place `llava_qwen.py` is executed. The verify script calls
+**`run_hf_fastvlm.py` and `verify_runtime.py` — indirectly, via HuggingFace auto machinery:**
+These are the places `llava_qwen.py` is executed. The verify script calls
 `AutoModelForCausalLM.from_pretrained(weights_dir, trust_remote_code=True)`,
 which triggers the dynamic import. The resulting model provides the FastViTHD
 reference implementation that our re-authored `FastVLMVisionEncoder` is compared
