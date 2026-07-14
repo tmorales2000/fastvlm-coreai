@@ -23,8 +23,8 @@ NOTES:
   - Runs on MPS (Apple Silicon GPU) by default — ~5-10 sec for 0.5B
   - Use --device cpu as fallback if MPS causes issues
   - The HF model uses trust_remote_code=True (runs llava_qwen.py)
-  - Uses the LLaVA-style prompt format: USER: <image>\\nprompt\\nASSISTANT:
-    which matches FastVLM's training format
+  - Uses the model's own Qwen2 ChatML chat template from tokenizer_config.json
+    which matches FastVLM's training format exactly
   - Output is the ground truth for verifying CoreAI export quality
 """
 
@@ -71,7 +71,7 @@ def main():
 
     import torch
     from PIL import Image
-    from transformers import AutoConfig, AutoProcessor
+    from transformers import AutoConfig
 
     dtype = torch.float16
     device = args.device
@@ -87,6 +87,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(str(weights_dir), trust_remote_code=True)
     # image_processor loaded from model after model loads (uses model's own config)
     print(f"[INFO] Tokenizer loaded in {time.time()-t0:.1f}s")
+
+    # Get the correct stop token ID from the model's own vocabulary
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
     # Load model using auto class (resolves trust_remote_code model class)
     t0 = time.time()
@@ -128,11 +131,23 @@ def main():
     image = Image.open(args.image).convert("RGB")
     pixel_values = image_processor(images=image, return_tensors="pt")["pixel_values"]
 
-    # Tokenize prompt. FastVLM uses IMAGE_TOKEN_INDEX = -200 as sentinel in
-    # input_ids to mark image injection position — not a real vocabulary token.
+    # Build prompt using the model's chat template from tokenizer_config.json.
+    # This is the correct contract the model was trained on — Qwen2 ChatML format.
+    # We include <image> in the user content so we can split on it to insert
+    # the IMAGE_TOKEN_INDEX=-200 sentinel at the right position.
     IMAGE_TOKEN_INDEX = -200
-    before_tok = tokenizer("USER: ", return_tensors="pt", add_special_tokens=False)
-    after_tok  = tokenizer(f"\n{args.prompt}\nASSISTANT:", return_tensors="pt", add_special_tokens=False)
+    messages = [{"role": "user", "content": f"<image>\n{args.prompt}"}]
+    full_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # Split on <image> to insert -200 sentinel between the two halves
+    assert "<image>" in full_prompt, "Chat template did not preserve <image> placeholder"
+    before_str, after_str = full_prompt.split("<image>", 1)
+    before_tok = tokenizer(before_str, return_tensors="pt", add_special_tokens=False)
+    after_tok  = tokenizer(after_str,  return_tensors="pt", add_special_tokens=False)
 
     input_ids = torch.cat([
         before_tok["input_ids"],
@@ -163,12 +178,15 @@ def main():
             do_sample=do_sample,
             temperature=args.temperature if do_sample else None,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=[tokenizer.eos_token_id, im_end_id],
         )
     elapsed = time.time() - t0
 
-    # Decode — only the generated tokens
-    generated_ids  = output[0][prompt_len:]
-    response       = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    # Decode — llava_qwen.py calls super().generate() with inputs_embeds so
+    # output[0] contains ONLY the generated tokens, not the input prefix.
+    generated_ids = output[0]
+    response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    response = response.replace("<|im_end|>", "").strip()
     generated_tokens = len(generated_ids)
 
     print("=" * 64)
