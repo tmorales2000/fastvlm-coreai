@@ -92,6 +92,11 @@ python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
 
 ```bash
 # Verify numerical correctness against the HF reference
+python scripts/verify_vision_encoder.py --variant 0.5b
+# Stage 1 (fp32):  should be ~129 dB  (bit-identical to HF)
+# Stage 2 (fp16):  should be ~50 dB   (fp16 rounding from HF bf16)
+
+# Verify CoreAI compiled vision.aimodel against PyTorch reference
 python scripts/verify_runtime.py --variant 0.5b --image test_assets/images/earthrise.jpg
 # vision_encode PSNR: 71.9 dB  (PASS)
 # project PSNR:       67.6 dB  (PASS)
@@ -168,6 +173,12 @@ python scripts/inspect_aimodel.py exports/fastvlm-7b.vlmasset
 
 ```bash
 # Verify projector numerical quality including quantization
+python scripts/verify_projector.py --variant 1.5b
+# Stage 1 (fp32): ~113 dB
+# Stage 2 (fp16): ~59 dB
+# Stage 3 (int8): ~68 dB vs fp16 reference
+
+# Verify CoreAI compiled vision.aimodel (includes projector) against PyTorch reference
 python scripts/verify_runtime.py --variant 1.5b --image test_assets/images/earthrise.jpg
 # vision_encode PSNR: 71.9 dB  (PASS)
 # project PSNR:       67.6 dB  (PASS)
@@ -580,9 +591,11 @@ The runtime automatically selects the correct specialization for the executing d
 | `scripts/compare_weights.py` | Per-layer PSNR comparison of Apple vs our quantization |
 | `scripts/export_fastvlm.py` | Export all three components to `.aimodel` |
 | `scripts/inspect_aimodel.py` | Verify entrypoints, dtypes, shapes of exported model |
-| `scripts/verify_decoder.py` | PyTorch-only decoder correctness verification |
-| `scripts/verify_runtime.py` | End-to-end PSNR verification. Use `--image` flag for meaningful vision PSNR. |
-| `scripts/run_hf_fastvlm.py` | Run FastVLM via HF weights — ground truth baseline for CoreAI comparison |
+| `scripts/verify_vision_encoder.py` | Layer 1: HF FastVLMVisionEncoder vs re-authored PyTorch encoder PSNR |
+| `scripts/verify_projector.py` | Layer 1: HF projector vs re-authored PyTorch projector PSNR |
+| `scripts/verify_decoder.py` | Layer 1: HF Qwen2 decoder vs re-authored PyTorch decoder PSNR |
+| `scripts/verify_runtime.py` | Layer 2: CoreAI compiled model vs PyTorch reference PSNR. Use `--image` for meaningful vision stages. |
+| `scripts/run_hf_fastvlm.py` | End-to-end HF inference — ground truth baseline for CoreAI comparison |
 | `scripts/probe_vlm_config.py` | Probe any HF VLM config for preprocessing and native resolution metadata |
 | `scripts/generate_test_images.py` | Generate synthetic test images for preprocessing verification |
 | `scripts/fastvlm_decoder.py` | Re-authored Qwen2 decoder for Core AI export |
