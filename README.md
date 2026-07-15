@@ -283,8 +283,10 @@ xcrun coreai-build compile \
 | Script | Purpose |
 |--------|---------|
 | `inspect_aimodel.py` | Inspect any CoreAI VLM bundle or `.aimodel` file. Works on FastVLM (`.vlmasset`) and Qwen3-VL (`.llmasset`). Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
-| `verify_runtime.py` | End-to-end PSNR verification against PyTorch reference. Runs all 6 stages of the VLM pipeline. Run on macOS 26.5 (see Known Issues). |
-| `verify_decoder.py` | PyTorch-only decoder verification — no CoreAI runtime needed. Useful on any machine. |
+| `verify_vision_encoder.py` | **Layer 1:** HF FastVLMVisionEncoder vs re-authored PyTorch encoder PSNR. Verifies the re-authoring is correct. |
+| `verify_projector.py` | **Layer 1:** HF projector vs re-authored PyTorch projector PSNR. |
+| `verify_decoder.py` | **Layer 1:** HF Qwen2 decoder vs re-authored PyTorch decoder PSNR. No CoreAI runtime needed. |
+| `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all 6 pipeline stages. Use `--image` for meaningful vision PSNR. Run on macOS 26.5 (see Known Issues). |
 
 ### Test assets
 
