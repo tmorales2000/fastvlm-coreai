@@ -93,6 +93,12 @@ LanguageBundle (reads metadata.json)
 6. `decode(merged_embeds, position_ids)` → `logits` → sample next token
 7. Decode loop: single-token steps with persistent KV cache state
 
+**Key decoder contract:**
+The decoder (`fastvlm-{variant}.aimodel`) takes `inputs_embeds` (pre-computed
+embeddings) not `input_ids`. `embed.aimodel` is a separate model so the engine
+can scatter-merge image features before calling the decoder. This is why the
+bundle has three separate `.aimodel` files rather than one.
+
 **Image preprocessing (as of fork fix):**
 
 The engine reads `"preprocessing"` from `metadata.json` and selects:

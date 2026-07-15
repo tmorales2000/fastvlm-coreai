@@ -390,6 +390,9 @@ reads to select `ImagePreprocessor.preprocessCHWCenterCrop()`. Without this, non
 images are geometrically distorted before being fed to the vision encoder.
 See [apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
 
+**Performance (M4 Pro, GPU path):** ~97ms TTFT, 3,901 tok/sec prompt processing,
+113 tok/sec generation. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full benchmarks.
+
 ---
 
 ## Documentation
