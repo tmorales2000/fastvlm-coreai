@@ -9,35 +9,66 @@ Answers:
   4. What does the image processor config look like?
   5. What safetensors files exist and what are the vision tower weight shapes?
 
-Known Qwen3-VL variants on HuggingFace:
-  Qwen/Qwen3-VL-2B-Instruct   (default)
-  Qwen/Qwen3-VL-7B-Instruct
-  Qwen/Qwen3-VL-32B-Instruct
-  Qwen/Qwen3-VL-72B-Instruct
-
 Usage:
-    # Default: probe Qwen3-VL-2B-Instruct from HF (downloads configs only, not weights)
-    python scripts/probe_qwen3vl.py
+    # FastVLM (default) — probes local weights if available, else HF
+    python scripts/probe_vlm_config.py
+    python scripts/probe_vlm_config.py --variant 1.5b
+    python scripts/probe_vlm_config.py --variant 7b
 
-    # Probe a specific variant
-    python scripts/probe_qwen3vl.py --model-id Qwen/Qwen3-VL-7B-Instruct
+    # Qwen3-VL variants
+    python scripts/probe_vlm_config.py --model qwen3-vl
+    python scripts/probe_vlm_config.py --model qwen3-vl --variant 4b
+    python scripts/probe_vlm_config.py --model qwen3-vl --variant 8b
+    python scripts/probe_vlm_config.py --model qwen3-vl --variant 32b
+    python scripts/probe_vlm_config.py --model qwen3-vl --variant 72b
 
-    # Probe any VLM by model ID
-    python scripts/probe_qwen3vl.py --model-id Qwen/Qwen2-VL-7B-Instruct
-    python scripts/probe_qwen3vl.py --model-id apple/FastVLM-0.5B
-
-    # Probe from local weights directory
-    python scripts/probe_qwen3vl.py --local-dir ~/path/to/weights
-
-    # Probe from HF cache (faster if already downloaded)
-    python scripts/probe_qwen3vl.py \
-      --local-dir ~/.cache/huggingface/hub/models--Qwen--Qwen3-VL-2B-Instruct/snapshots/latest
+    # Add a model to MODEL_REGISTRY for anything not listed above.
+    # Use --local-dir to point at weights in a non-standard location.
+    python scripts/probe_vlm_config.py --model qwen3-vl --local-dir ~/custom/weights
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent
+
+# Registry mapping (model, variant) → (hf_model_id, weights_subdir)
+# weights_subdir is relative to REPO_ROOT/weights/
+MODEL_REGISTRY: dict[tuple[str, str], tuple[str, str]] = {
+    # FastVLM
+    ("fastvlm", "0.5b"): ("apple/FastVLM-0.5B",  "fastvlm-0.5b"),
+    ("fastvlm", "1.5b"): ("apple/FastVLM-1.5B",  "fastvlm-1.5b"),
+    ("fastvlm", "7b"):   ("apple/FastVLM-7B",     "fastvlm-7b"),
+    # Qwen3-VL
+    ("qwen3-vl", "2b"):  ("Qwen/Qwen3-VL-2B-Instruct",  "qwen3-vl-2b"),
+    ("qwen3-vl", "4b"):  ("Qwen/Qwen3-VL-4B-Instruct",  "qwen3-vl-4b"),
+    ("qwen3-vl", "8b"):  ("Qwen/Qwen3-VL-8B-Instruct",  "qwen3-vl-8b"),
+    ("qwen3-vl", "32b"): ("Qwen/Qwen3-VL-32B-Instruct", "qwen3-vl-32b"),
+    ("qwen3-vl", "72b"): ("Qwen/Qwen3-VL-72B-Instruct", "qwen3-vl-72b"),
+}
+
+DEFAULT_VARIANTS = {
+    "fastvlm":  "0.5b",
+    "qwen3-vl": "2b",
+}
+
+
+def resolve_model(model: str, variant: str) -> tuple[str, Path | None]:
+    """Resolve (model, variant) to (hf_model_id, local_weights_path | None)."""
+    key = (model.lower(), variant.lower())
+    if key not in MODEL_REGISTRY:
+        known = [f"--model {m} --variant {v}" for m, v in MODEL_REGISTRY]
+        print(f"ERROR: Unknown model/variant combination: {model!r} / {variant!r}", file=sys.stderr)
+        print(f"Known combinations:", file=sys.stderr)
+        for k in known:
+            print(f"  {k}", file=sys.stderr)
+        sys.exit(1)
+
+    hf_model_id, weights_subdir = MODEL_REGISTRY[key]
+    local_path = REPO_ROOT / "weights" / weights_subdir
+    return hf_model_id, local_path if local_path.exists() else None
 
 
 def probe_config(config: dict, indent: int = 0) -> None:
@@ -58,7 +89,8 @@ def probe_config(config: dict, indent: int = 0) -> None:
 
     prefix = "  " * indent
     for k, v in sorted(config.items()):
-        if k.lower() in {vk.lower() for vk in vision_keys} or "image" in k.lower() or "vision" in k.lower() or "patch" in k.lower() or "pixel" in k.lower():
+        if k.lower() in {vk.lower() for vk in vision_keys} or \
+           any(t in k.lower() for t in ["image", "vision", "patch", "pixel"]):
             if isinstance(v, dict):
                 print(f"{prefix}{k}:")
                 probe_config(v, indent + 1)
@@ -69,12 +101,10 @@ def probe_config(config: dict, indent: int = 0) -> None:
 def probe_from_hf(model_id: str) -> None:
     """Download and probe config from HuggingFace Hub."""
     from huggingface_hub import hf_hub_download
-    import json
 
     print(f"Probing {model_id} from HuggingFace Hub...")
     print()
 
-    # Download config files
     for filename in ["config.json", "preprocessor_config.json",
                      "generation_config.json", "chat_template.json"]:
         try:
@@ -91,8 +121,8 @@ def probe_from_hf(model_id: str) -> None:
 
 
 def probe_from_local(local_dir: Path) -> None:
-    """Probe config from local directory."""
-    print(f"Probing {local_dir}...")
+    """Probe config from local weights directory."""
+    print(f"Probing local weights: {local_dir}")
     print()
 
     for filename in ["config.json", "preprocessor_config.json",
@@ -111,24 +141,21 @@ def probe_from_local(local_dir: Path) -> None:
 
 
 def probe_safetensors(local_dir: Path) -> None:
-    """Probe safetensors weight shapes for vision tower."""
+    """Probe safetensors weight shapes for vision tower weights."""
     import safetensors.torch as st
 
     print(f"{'='*60}")
     print(f"  safetensors — vision tower weights")
     print(f"{'='*60}")
 
-    # Find all safetensors files
     st_files = sorted(local_dir.glob("*.safetensors"))
     if not st_files:
-        # Check index
         index_path = local_dir / "model.safetensors.index.json"
         if index_path.exists():
             index = json.loads(index_path.read_text())
-            # Find shards that contain vision weights
             vision_shards = set()
             for key, shard in index["weight_map"].items():
-                if "visual" in key or "vision" in key or "patch_embed" in key:
+                if any(k in key for k in ["visual", "vision", "patch_embed"]):
                     vision_shards.add(shard)
             st_files = [local_dir / s for s in sorted(vision_shards)]
             print(f"  Found {len(vision_shards)} vision shards in index")
@@ -147,31 +174,27 @@ def probe_safetensors(local_dir: Path) -> None:
             print(f"  Error loading {st_file.name}: {e}")
 
     if vision_weights:
-        # Group by component
-        components = {}
+        components: dict[str, list] = {}
         for name, shape in sorted(vision_weights.items()):
             parts = name.split(".")
             component = ".".join(parts[:3]) if len(parts) >= 3 else parts[0]
-            if component not in components:
-                components[component] = []
-            components[component].append((name, shape))
+            components.setdefault(component, []).append((name, shape))
 
         for component, weights in sorted(components.items()):
             print(f"\n  [{component}]")
-            for name, shape in weights[:5]:  # Show first 5 per component
+            for name, shape in weights[:5]:
                 print(f"    {name}: {shape}")
             if len(weights) > 5:
                 print(f"    ... and {len(weights)-5} more")
     else:
-        print("  No vision tower weights found in safetensors files")
-
+        print("  No vision tower weights found")
     print()
 
 
 def probe_image_processor_class(model_id: str) -> None:
-    """Try to load the actual image processor and inspect it."""
+    """Load the actual HF image processor and inspect its effective parameters."""
     print(f"{'='*60}")
-    print(f"  Image processor class inspection")
+    print(f"  Image processor class (effective parameters)")
     print(f"{'='*60}")
 
     try:
@@ -191,29 +214,48 @@ def probe_image_processor_class(model_id: str) -> None:
     print()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model-id", default="Qwen/Qwen3-VL-2B-Instruct",
-                        help="HuggingFace model ID (default: Qwen/Qwen3-VL-2B-Instruct). "
-                             "Works with any VLM: Qwen3-VL-7B, Qwen2-VL, FastVLM, etc.")
-    parser.add_argument("--local-dir", type=Path, default=None,
-                        help="Local directory with downloaded weights")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--model", default="fastvlm",
+        help="Model family (default: fastvlm). Options: fastvlm, qwen3-vl",
+    )
+    parser.add_argument(
+        "--variant", default=None,
+        help="Model variant, e.g. 0.5b, 1.5b, 7b for FastVLM; "
+             "2b, 4b, 8b, 32b, 72b for Qwen3-VL. "
+             "Defaults to 0.5b for fastvlm, 2b for qwen3-vl.",
+    )
+    parser.add_argument(
+        "--local-dir", type=Path, default=None,
+        help="Explicit local weights directory (overrides auto-resolution from --model/--variant).",
+    )
     args = parser.parse_args()
 
+    # Resolve model ID and local path from registry
+    variant = args.variant or DEFAULT_VARIANTS.get(args.model.lower(), "0.5b")
+    hf_model_id, resolved_local = resolve_model(args.model, variant)
+    local_dir = args.local_dir or resolved_local
+
     print(f"\n{'#'*60}")
-    print(f"  Qwen3-VL Native Resolution Probe")
-    print(f"  Model: {args.model_id}")
-    print(f"  (probe any VLM with --model-id)")
+    print(f"  VLM Config Probe")
+    print(f"  HF model ID: {hf_model_id}")
+    if local_dir:
+        print(f"  Local weights: {local_dir}")
     print(f"{'#'*60}\n")
 
-    if args.local_dir and args.local_dir.exists():
-        probe_from_local(args.local_dir)
-        probe_safetensors(args.local_dir)
+    if local_dir and local_dir.exists():
+        probe_from_local(local_dir)
+        probe_safetensors(local_dir)
     else:
-        probe_from_hf(args.model_id)
+        if local_dir:
+            print(f"[INFO] Local weights not found at {local_dir} — probing HF instead")
+        probe_from_hf(hf_model_id)
 
-    probe_image_processor_class(args.model_id)
+    probe_image_processor_class(hf_model_id)
 
 
 if __name__ == "__main__":
