@@ -41,24 +41,16 @@ git clone https://github.com/tmorales2000/fastvlm-coreai.git
 cd fastvlm-coreai
 ```
 
-### 2. Clone coreai-models (use this fork)
+### 2. Clone coreai-models
 
-`coreai-models` is required for the export pipeline. Clone from this fork
-rather than Apple's upstream — the fork includes a fix for image preprocessing
-that is required for correct FastVLM inference ([apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100)).
-Without this fix, `CoreAISequentialVLMEngine` stretch-resizes all images to a
-square, distorting non-square inputs and causing incorrect model output.
+`coreai-models` is required for the export pipeline. Clone Apple's upstream repo
+directly — image preprocessing support (`center_crop`, `pad`, `stretch`) was
+merged in [apple/coreai-models #108](https://github.com/apple/coreai-models/pull/108),
+which closed [#100](https://github.com/apple/coreai-models/issues/100).
 
 ```bash
-git clone https://github.com/tmorales2000/coreai-models.git ~/git/tmorales2000/coreai-models
-cd ~/git/tmorales2000/coreai-models
-git checkout fix/vlm-image-preprocessing-strategy
-cd -
+git clone https://github.com/apple/coreai-models.git ~/git/apple/coreai-models
 ```
-
-> **Note:** A proposal to merge this fix upstream has been filed as
-> [apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
-> Once merged, you can switch back to Apple's upstream repo.
 
 ### 3. Create the Python environment
 
@@ -79,7 +71,7 @@ coreai-opt==0.2.1
 ### 4. Install coreai-models from source
 
 ```bash
-uv pip install -e ~/git/tmorales2000/coreai-models/python/ --no-deps
+uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
 ```
 
 > **Note:** This step must be repeated after every `uv sync` because `uv sync`
@@ -112,7 +104,7 @@ Apple's `coreai-models` includes `llm-runner`, a Swift CLI that uses
 `CoreAISequentialVLMEngine` to run any exported VLM bundle end-to-end:
 
 ```bash
-cd ~/git/tmorales2000/coreai-models
+cd ~/git/apple/coreai-models
 swift build --product llm-runner
 # Binary: .build/out/Products/Debug/llm-runner
 cd -   # return to fastvlm-coreai
@@ -206,7 +198,7 @@ Use `--image test_assets/images/earthrise.jpg` for meaningful end-to-end verific
 exported bundle via `CoreAISequentialVLMEngine`:
 
 ```bash
-LLM_RUNNER=~/git/tmorales2000/coreai-models/.build/out/Products/Debug/llm-runner
+LLM_RUNNER=~/git/apple/coreai-models/.build/out/Products/Debug/llm-runner
 
 # Text only
 $LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
@@ -385,10 +377,10 @@ normalization.
 
 **Image preprocessing strategy:** FastVLM's `CLIPImageProcessor` uses shortest-edge
 resize + center crop to 1024×1024 — not stretch resize. The exported bundle declares
-`"preprocessing": "center_crop"` in `metadata.json`, which `CoreAISequentialVLMEngine`
-reads to select `ImagePreprocessor.preprocessCHWCenterCrop()`. Without this, non-square
-images are geometrically distorted before being fed to the vision encoder.
-See [apple/coreai-models #100](https://github.com/apple/coreai-models/issues/100).
+`"image_strategy": "center_crop"` in `metadata.json`, which `CoreAISequentialVLMEngine`
+reads to select the correct resize algorithm. Apple's `coreai-models` supports three
+strategies: `stretch` (default), `center_crop`, and `pad` — merged in
+[apple/coreai-models #108](https://github.com/apple/coreai-models/pull/108).
 
 **Performance (M4 Pro, GPU path):** ~97ms TTFT, 3,901 tok/sec prompt processing,
 113 tok/sec generation. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full benchmarks.
@@ -465,4 +457,4 @@ future contribution.
 | Issue | Status | Description |
 |-------|--------|-------------|
 | [#96](https://github.com/apple/coreai-models/issues/96) | 🔲 Open | PyPI wheel declares incorrect `Python>=3.14` constraint |
-| [#100](https://github.com/apple/coreai-models/issues/100) | 🔲 Proposed | `CoreAISequentialVLMEngine` stretch-resizes all VLM images — fix with working implementation on fork |
+| [#100](https://github.com/apple/coreai-models/issues/100) | ✅ Closed — merged as [#108](https://github.com/apple/coreai-models/pull/108) | `CoreAISequentialVLMEngine` image preprocessing strategy — `center_crop`, `pad`, `stretch` now supported in upstream |
