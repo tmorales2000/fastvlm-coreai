@@ -1,9 +1,10 @@
 # PSNR Verification Results
 
-## Decoder thresholds (two-stage verification)
+## Decoder thresholds (three-stage verification)
 - Stage 1 — fp32 port vs HF Qwen2ForCausalLM: **> 80 dB** pass (investigate < 50 dB)
 - Stage 2 — fp16 cached decode vs full pass: **> 40 dB** pass (investigate < 40 dB)
 - Stage 2 — fp16 overflow guard: max |logit| < 60000 (fp16 ceiling 65504)
+- Stage 3 — compressed vs fp16 baseline: **> 35 dB** int8, **> 25 dB** int4
 
 ## Projector thresholds (two-stage verification)
 - Stage 1 — fp32 port vs original HF mm_projector: **> 80 dB** pass (inf dB = bit-identical)
@@ -12,7 +13,8 @@
 
 ## Other component thresholds
 - Vision encoder re-authored fp16 vs fp32: **> 70 dB** (investigate < 60 dB)
-- After palettization vs fp16: **> 35 dB** (investigate < 30 dB)
+- After int4 quantization vs fp16 (macOS): **> 25 dB** (investigate < 20 dB)
+- After palettization vs fp16 (iOS): **> 35 dB** (investigate < 30 dB)
 - Compiled on-device vs fp32: **> 40 dB** (investigate < 35 dB)
 
 ---
@@ -55,9 +57,6 @@ See Known Issues in README.
 **Definitive end-to-end verification with a real image.**
 Uses `python scripts/verify_runtime.py --variant 0.5b --image test_assets/images/earthrise.jpg`
 
-This run provides meaningful PSNR for all 6 stages including the vision encoder
-and projector — the first complete numerical verification of the full pipeline.
-
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
 | Stage 1: vision_encode | **71.9 dB** | ✓ | Excellent — vision encoder export is high fidelity |
@@ -85,53 +84,92 @@ correlated (33.6 dB is not noise), just not identical.
 **Key finding — vision encoder is NOT the quality bottleneck:**
 Stage 1 at 71.9 dB confirms the CoreAI vision encoder produces nearly identical
 features to the HF reference. Output quality differences between CoreAI export
-and HF model (e.g. missing fine details) are attributable to temperature=0.7
-sampling variance in the decoder, not to vision encoder degradation.
+and HF model are attributable to temperature sampling variance, not vision degradation.
 
 ### 1.5B — TBD
 ### 7B — TBD
 
 ---
 
-## PyTorch Component Verification
+## PyTorch Component Verification (`verify_decoder.py`)
 
-### 1.5B
+All runs on fleetwoodmac (M4 Pro 64GB, macOS 27 beta), torch 2.9.0, July 29 2026.
+verify_decoder.py rewritten July 29 2026 against stable FastVLMDecoder API
+(explicit k_cache/v_cache args, embed_tokens loaded separately from safetensors).
+
+### 0.5B (fp16)
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
-| Decoder Stage 1 — fp32 port vs HF Qwen2 | 113.2 dB | ✓ | |
-| Decoder Stage 2 — fp16 cached decode | 72.1 dB | ✓ | max logit 12 |
-| Projector Stage 1 — fp32 port vs HF mm_projector | inf dB | ✓ | bit-identical |
-| Projector Stage 2 — fp16 health | 90.9 dB | ✓ | max output 9.43 |
-| Vision encoder re-authored fp16 vs fp32 | TBD | — | |
-| Python runtime (macOS) vs fp32 | TBD | — | |
-| After palettization vs fp16 (iOS) | TBD | — | |
-| Compiled iOS on-device vs fp32 | TBD | — | |
+| Stage 1 — fp32 port vs HF Qwen2 | **130.6 dB** | ✓ | Excellent |
+| Stage 2 — fp16 cached decode | **76.1 dB** | ✓ | first step: inf dB (bit-identical) |
+| Stage 2 — fp16 max \|logit\| | 18 | ✓ | well below 60000 ceiling |
+
+### 1.5B (fp16)
+
+| Stage | PSNR | Pass? | Notes |
+|-------|------|-------|-------|
+| Stage 1 — fp32 port vs HF Qwen2 | **113.2 dB** | ✓ | Lower than 0.5B: more layers accumulate divergence |
+| Stage 2 — fp16 cached decode | **58.9 dB** | ✓ | first step: 62.6 dB |
+| Stage 2 — fp16 max \|logit\| | 14 | ✓ | |
+
+### 1.5B (int8 per_channel)
+
+| Stage | PSNR | Pass? | Notes |
+|-------|------|-------|-------|
+| Stage 1 — fp32 port vs HF Qwen2 | **113.2 dB** | ✓ | Identical to fp16 (Stage 1 doesn't apply compression) |
+| Stage 2 — fp16 cached decode | **58.9 dB** | ✓ | |
+| Stage 3 — int8 vs fp16 baseline | **38.0 dB** | ✓ | Above 35 dB threshold |
+
+Compression: `--compression 8bit` (int8 symmetric per_channel, `torch.nn.modules.linear.Linear` only).
+
+### 7B (int4 per_channel)
+
+| Stage | PSNR | Pass? | Notes |
+|-------|------|-------|-------|
+| Stage 1 — fp32 port vs HF Qwen2 | **108.4 dB** | ✓ | 28 layers, Qwen2.5-7B base |
+| Stage 2 — fp16 cached decode | **62.8 dB** | ✓ | first step: 62.5 dB |
+| Stage 2 — fp16 max \|logit\| | 15 | ✓ | |
+| Stage 3 — int4 vs fp16 baseline | **29.5 dB** | ✓ | Above 25 dB threshold |
+
+Compression: `--compression 4bit_per_channel` (int4 symmetric per_channel).
+
+Note: 7B uses Qwen2.5-7B base (vocab 152064, image token 151665) vs Qwen2 for
+0.5B/1.5B (vocab 151936, image token 151646). Same FastViTHD vision tower.
 
 ---
 
-### 0.5B
+## Stage 1 PSNR Pattern Across Variants
 
-| Stage | PSNR | Pass? | Notes |
-|-------|------|-------|-------|
-| Decoder Stage 1 — fp32 port vs HF Qwen2 | 129.2 dB | ✓ | |
-| Decoder Stage 2 — fp16 cached decode | 65.1 dB | ✓ | max logit 16 |
-| Projector Stage 1 — fp32 port vs HF mm_projector | TBD | — | |
-| Projector Stage 2 — fp16 health | TBD | — | |
-| Vision encoder re-authored fp16 vs fp32 | TBD | — | |
-| Python runtime (macOS) vs fp32 | TBD | — | |
-| After palettization vs fp16 (iOS) | TBD | — | |
+Stage 1 compares our fp32 decoder port against HF Qwen2ForCausalLM in fp32.
+The PSNR difference across variants reflects accumulated numerical divergence
+from different op implementations (coreai_torch composite ops vs HF native ops)
+compounding over more layers. No fp16 leak — confirmed by parameter/buffer audit
+(all fp32, no tensor attributes on SDPA/RoPE/RMSNormImpl composite ops).
+
+| Variant | Stage 1 PSNR | Layers | Hidden dim |
+|---------|-------------|--------|------------|
+| 0.5B | 130.6 dB | 24 | 896 |
+| 1.5B | 113.2 dB | 28 | 1536 |
+| 7B | 108.4 dB | 28 | 3584 |
+
+More layers and wider dimensions → more accumulated divergence → lower PSNR.
+All well above the 80 dB pass threshold. Not a correctness issue.
 
 ---
 
-### 7B
+## Quantization Scheme Impact on Compiled Op Distribution
 
-| Stage | PSNR | Pass? | Notes |
-|-------|------|-------|-------|
-| Decoder Stage 1 — fp32 port vs HF Qwen2 | 110.2 dB | ✓ | |
-| Decoder Stage 2 — fp16 cached decode | 49.5 dB | ✓ | max logit 18 |
-| Projector Stage 1 — fp32 port vs HF mm_projector | TBD | — | |
-| Projector Stage 2 — fp16 health | TBD | — | |
-| Vision encoder re-authored fp16 vs fp32 | TBD | — | |
-| Python runtime (macOS) vs fp32 | TBD | — | |
-| After INT4 quantization vs fp16 (macOS) | TBD | — | |
+Key finding from `xcrun coreai-build inspect` on 7B int4 exports:
+
+| Scheme | blockwise_shift_scale | batch_matmul | Gen tok/sec | Notes |
+|--------|----------------------|--------------|-------------|-------|
+| per_block_64 asymmetric | 197 | 199 | 7.2 | Old default — unfused, catastrophic |
+| per_block_32 symmetric_with_clipping (apple_4bit) | 197 | 199 | ~7-10 (est.) | Unfused — same problem |
+| per_channel symmetric (4bit_per_channel) | 197 | 199 | **50.8** | Fused — 7× faster |
+
+Op count is identical across schemes. The difference is execution behavior:
+per_channel allows the GPU to fuse dequantization into batch_matmul as a
+row-wise scaling. Per_block requires a separate pass regardless of block size
+or symmetric/asymmetric. The op name (`blockwise_shift_scale`) is the same;
+only the runtime cost differs.
