@@ -1,239 +1,282 @@
 """
-quantization.py — Shared quantization utility for FastVLM verify and export scripts.
+quantization.py — Compression utilities for FastVLM CoreAI export.
 
-PURPOSE
--------
-Provides a single, consistent interface for applying coreai-opt quantization
-to the FastVLM decoder, used by:
+Provides named presets and YAML recipe loading matching Apple's
+coreai-models/export/presets.py and pipeline.py patterns.
 
-  - verify_decoder.py  (--quantize flag: simulate quantization, compare PSNR
-                         against the Stage 2 fp16 reference)
-  - export_fastvlm.py  (--quantize flag: apply quantization before staging
-                         into TorchConverter)
+NAMED PRESETS (--compression PRESET)
+--------------------------------------
+  4bit  int4 symmetric_with_clipping per_block block_size=32.
+        Apple's canonical macOS preset. Clips int4 to (-7,7) for equal
+        bins — cleaner dequantization than plain symmetric.
+        Excludes: SDPA, RoPE, RMSNorm (composite ops with internal precision).
 
-NAMING NOTE
------------
-This module is intentionally NOT about "compression" in the general sense.
-bf16 -> fp16 is a mandatory precision cast both the decoder and projector
-go through for ANE execution (loaded directly as fp16, one step, no fp32
-intermediate) — it is not optional and not what this module calls "quantization." Quantization here means INT8 or INT4 weight-only
-quantization, applied only to the decoder, only optionally, on top of the
-fp16 cast. See verify_decoder.py's three-stage structure (Correctness ->
-Precision -> Quantization) for where this fits in the overall pipeline.
+  8bit  int8 per_channel symmetric.
+        One scale per output channel. Most GPU-friendly — dequantization
+        fuses with batch_matmul. Apple has no named 8bit macOS preset;
+        this is our addition for lower-memory use cases.
 
-SUPPORTED QUANTIZATION LEVELS
--------------------------------
-  int8 : coreai-opt weight-only int8 quantization, grouped asymmetric,
-         block_size=64 along the reduction axis (axis=1 for both
-         nn.Linear and nn.Embedding). Matches Apple's MLX int8 scheme
-         for FastVLM 1.5B.
-  int4 : coreai-opt weight-only int4 quantization, same scheme.
-         Matches Apple's MLX int4 scheme for FastVLM 7B.
+  none  No quantization — fp16 only.
 
-QUANTIZATION SCOPE (verified by scripts/audit_weight_dtypes.py)
--------------------------------------------------------------------
-Both nn.Linear AND nn.Embedding weights are quantized -- this matches
-Apple's MLX output exactly, confirmed by an exhaustive tensor-by-tensor
-audit across all three variants. Quantized: embed_tokens, lm_head, all
-mlp.{gate,up,down}_proj, all self_attn.{q,k,v,o}_proj. NOT quantized
-(stay fp16): RMSNorm weights, all Linear/Embedding biases. This was
-NOT always the case in this module's history -- an earlier version only
-quantized nn.Linear, missing embed_tokens entirely. See audit script
-output for the full per-module-kind verification.
-
-Mutually exclusive — a model is exported as either int8 or int4, never both,
-and there is no "all" option. (verify_decoder.py runs each level as a
-separate invocation if you want to compare them.)
-
-PRODUCTION QUANTIZATION TARGETS (validated)
+YAML RECIPES (--compression-config path.yaml)
 ----------------------------------------------
-  0.5B decoder : no quantization (fp16 only; Apple ships 0.5B unquantized)
-  1.5B decoder : int8  (49.6 dB vs fp16, PASS; includes embed_tokens)
-  7B   decoder : int8  (int4 fails — 22.7 dB vs fp16; 7B fp16 baseline
-                        too sensitive at 44.8 dB for int4 to be viable)
-  projector    : int8  (68.2 dB vs fp16, PASS; Apple quantizes projector
-                        Linear weights — confirmed by audit_weight_dtypes.py)
-  vision enc.  : no quantization (fp16 only; CoreML export)
+Per-model mixed-precision recipes. Top-level key: quantization_config.
+Same format as QuantizerConfig.from_dict(). Produced by
+scan_quantization_sensitivity.py or written by hand.
 
-SIMULATION vs EXPORT DISTINCTION (critical)
---------------------------------------------
-coreai-opt operates in two distinct modes:
+Optional coreai_models block for pipeline options:
+  coreai_models:
+    calibrate_activations: true
 
-  SIMULATION (verify scripts): Call prepare(example_inputs) only.
-    The returned model is a standard nn.Module with fake-quantize modules
-    inserted around weights. It is directly runnable in PyTorch for forward
-    passes / PSNR comparison. Do NOT call finalize() before using it for
-    PSNR — finalize() converts the model into a backend-specific
-    representation that is no longer runnable as plain PyTorch.
+macOS vs iOS
+------------
+macOS: linear quantization (this module).
+iOS:   palettization (k-means codebook, different module, not yet implemented).
+       load_compression_config() raises NotImplementedError for iOS.
 
-  EXPORT (export_fastvlm.py): Call prepare(example_inputs), then
-    finalize(backend=ExportBackend.CoreAI). The finalized model is what
-    gets staged into TorchConverter via add_exported_program().
-
-CALIBRATION
------------
-These utilities do NOT perform calibration. Uncalibrated quantization gives
-a conservative (pessimistic) estimate of quality sufficient for
-characterising whether a quantization level is viable. For production
-export, calibration via calibration_mode() using representative
-vision-language inputs is a future improvement.
-
-HOW TO USE
-----------
-For verify scripts (PSNR comparison vs the fp16 Stage 2 output):
-    fp16_model = _build_port(..., torch.float16)  # bf16->fp16 direct
-    fp16_out = fp16_model(example_input)
-    quantized, _ = apply_quantization(fp16_model, "int8", (example_input,))
-    quantized_out = quantized(example_input)
-    score = psnr(fp16_out, quantized_out)
-
-For export scripts (before TorchConverter):
-    fp16_model = _build_port(..., torch.float16)
-    quantized, quantizer = apply_quantization(fp16_model, "int8", (example_input,))
-    export_ready = finalize_for_export(quantized, quantizer)
-    exported = torch.export.export(export_ready, ...)
-    converter.add_exported_program(exported, ...)
+SIMULATION vs EXPORT
+---------------------
+apply_quantization_from_config() handles both:
+  - For verify scripts: returns runnable nn.Module (prepare only, no finalize).
+  - For export: returns finalized model ready for TorchConverter.
+The caller controls which by passing finalize=True (export) or False (verify).
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
+import yaml
 
 from coreai_opt.common import ExportBackend
-from coreai_opt.quantization import ExecutionMode
-from coreai_opt.quantization import Quantizer, QuantizerConfig
-from coreai_opt.quantization.spec import PerBlockGranularity, QuantizationSpec, QuantizationScheme
+from coreai_opt.quantization import ExecutionMode, Quantizer, QuantizerConfig
 from coreai_opt.quantization.config import ModuleQuantizerConfig
+from coreai_opt.quantization.spec import (
+    PerChannelGranularity,
+    QuantizationScheme,
+    QuantizationSpec,
+)
 
-# Supported quantization levels. Matches the --quantize CLI flag values
-# in verify_decoder.py and export_fastvlm.py. No "fp16" entry here — fp16
-# is the mandatory Stage 2 precision cast, handled directly by the verify
-# scripts and export_fastvlm.py, not by this module.
-QUANTIZATION_LEVELS = [
-    "int8",
-    "int4",
-]
+# ── Composite op exclusions ───────────────────────────────────────────────────
+# Mirrors _TORCH_MODULE_EXCLUSIONS from coreai-models/export/presets.py.
+# These modules use specialized composite ops — quantizing their weights
+# produces incorrect results or conflicts with the op's internal precision.
+_COMPOSITE_OP_EXCLUSIONS: dict[str, None] = {
+    "coreai_torch.composite_ops.SDPA":        None,
+    "coreai_torch.composite_ops.RoPE":        None,
+    "coreai_torch.composite_ops.RMSNormImpl": None,
+}
 
-QuantizationLevel = Literal["int8", "int4"]
+# ── Named macOS presets ───────────────────────────────────────────────────────
+# Mirrors MACOS_PRESETS in coreai-models/export/presets.py.
+# Each entry is a quantization_config dict accepted by QuantizerConfig.from_dict().
 
-_DTYPE = {"int8": torch.int8, "int4": torch.int4}
+MACOS_NAMED_PRESETS: dict[str, dict[str, Any]] = {
+    "4bit": {
+        # Apple's canonical macOS int4 preset.
+        # symmetric_with_clipping clips int4 range to (-7, 7) rather than
+        # (-8, 7), ensuring equal bins on each side of zero — cleaner
+        # dequantization, no zero-point overhead of asymmetric.
+        #
+        # Uses module_type_configs targeting nn.Linear only (no global_config)
+        # to avoid axis resolution errors on custom modules like FastVLMRMSNorm.
+        # axis=1 is the reduction axis for nn.Linear weight [out, in].
+        "description": "int4 symmetric_with_clipping per_block_32 (Apple macOS standard)",
+        "quantization_config": {
+            "execution_mode": "eager",
+            "global_config": None,
+            "module_type_configs": {
+                "torch.nn.modules.linear.Linear": {
+                    "op_state_spec": {
+                        "weight": {
+                            "dtype": "int4",
+                            "qscheme": "symmetric_with_clipping",
+                            "granularity": {
+                                "type": "per_block",
+                                "block_size": 32,
+                                "axis": 1,  # explicit: input/reduction axis for Linear
+                            },
+                        }
+                    },
+                    "op_input_spec": None,
+                    "op_output_spec": None,
+                },
+                **_COMPOSITE_OP_EXCLUSIONS,
+            },
+        },
+    },
+    "8bit": {
+        # Our int8 preset — not in Apple's coreai-models (they don't ship
+        # macOS int8). Per-channel symmetric: one scale per output row.
+        # Dequantization fuses with batch_matmul on GPU/ANE.
+        # Use case: lower memory than fp16 without int4 quality loss.
+        #
+        # Uses module_type_configs to target nn.Linear only (no global_config)
+        # so axis=None can be auto-resolved per module type. global_config with
+        # axis=None fails on custom modules (FastVLMRMSNorm etc.) that coreai-opt
+        # doesn't know the axis default for.
+        "description": "int8 per_channel symmetric",
+        "quantization_config": {
+            "execution_mode": "eager",
+            "global_config": None,
+            "module_type_configs": {
+                "torch.nn.modules.linear.Linear": {
+                    "op_state_spec": {
+                        "weight": {
+                            "dtype": "int8",
+                            "qscheme": "symmetric",
+                            "granularity": {
+                                "type": "per_channel",
+                                "axis": 0,  # explicit: output channel axis for Linear
+                            },
+                        }
+                    },
+                    "op_input_spec": None,
+                    "op_output_spec": None,
+                },
+                **_COMPOSITE_OP_EXCLUSIONS,
+            },
+        },
+    },
+}
 
 
-def apply_quantization(
-    model: nn.Module,
-    level: QuantizationLevel,
-    example_inputs: tuple[torch.Tensor, ...],
-) -> tuple[nn.Module, Quantizer]:
-    """
-    Apply the specified quantization level to the FastVLM decoder.
-
-    The input model MUST already be fp16. Apple's MLX pipeline casts
-    ALL tensors bf16->fp16 during mlx_vlm.convert, before and independent
-    of quantization (confirmed: 0.5B MLX checkpoint, no quantization, yet
-    every tensor is fp16). Load with dtype=torch.float16 before calling.
-
-    Apple's two-part scheme, which this replicates exactly:
-      1. Non-linear tensors (RMSNorm weights, biases, etc.) stay fp16.
-      2. nn.Linear and nn.Embedding weight matrices -> grouped asymmetric
-         int8/int4, block_size=64 along the reduction axis (axis=1 for
-         both module types), per-group scale + zero-point in fp16.
-
-    Returns (quantized_model, quantizer) where:
-      - quantized_model is directly runnable for PSNR comparison
-        (verify scripts), with fake-quantize modules inserted.
-      - quantizer is the coreai-opt object needed for finalize_for_export()
-        (export scripts).
-
-    Do NOT call finalize() on quantized_model before using it for PSNR —
-    see module docstring.
+def load_compression_config(
+    source: str | Path,
+    platform: str = "macOS",
+) -> tuple[dict, str]:
+    """Load a compression config from a named preset or YAML file.
 
     Args:
-        model: The fp16 FastVLM decoder or projector (loaded bf16->fp16
-               directly). Must already be in eval() mode and on CPU.
-        level: One of QUANTIZATION_LEVELS ("int8" or "int4").
-        example_inputs: Tuple of example input tensors matching the model's
-                        forward() signature. Used by coreai-opt to trace the
-                        model for fake-quantize module insertion. Content
-                        doesn't affect quantization quality for weight-only
-                        quantization; random tensors of the right shape are
-                        sufficient.
+        source: Named preset string ("4bit", "8bit") or Path to a YAML file.
+        platform: "macOS" or "iOS". iOS raises NotImplementedError.
 
     Returns:
-        (quantized_model, quantizer)
+        (quantization_config_dict, label) where:
+          - quantization_config_dict is passed to apply_quantization_from_config()
+          - label is a human-readable string for logging/metadata
+
+    Raises:
+        NotImplementedError: If platform is "iOS".
+        KeyError: If source is a string not in MACOS_NAMED_PRESETS.
+        FileNotFoundError: If source is a Path that does not exist.
+        ValueError: If the YAML has an unexpected structure.
     """
-    if level not in QUANTIZATION_LEVELS:
-        raise ValueError(
-            f"Unknown quantization level: {level!r}. "
-            f"Must be one of: {QUANTIZATION_LEVELS}"
+    if platform == "iOS":
+        raise NotImplementedError(
+            "iOS export uses palettization, not linear quantization. "
+            "iOS export is not yet implemented."
         )
 
+    # Named preset
+    if isinstance(source, str):
+        if source == "none":
+            return None, "none"
+        if source not in MACOS_NAMED_PRESETS:
+            available = ", ".join(MACOS_NAMED_PRESETS.keys())
+            raise KeyError(
+                f"Unknown compression preset: {source!r}. "
+                f"Available: {available}, none."
+            )
+        entry = MACOS_NAMED_PRESETS[source]
+        return dict(entry["quantization_config"]), source
+
+    # YAML file
+    path = Path(source)
+    if not path.is_file():
+        raise FileNotFoundError(f"Compression config not found: {path}")
+
+    with path.open() as fh:
+        yaml_data = yaml.safe_load(fh)
+
+    if not isinstance(yaml_data, dict):
+        raise ValueError(f"{path}: expected a YAML mapping at top level.")
+
+    # Pop optional coreai_models pipeline options (e.g. calibrate_activations)
+    pipeline_opts = yaml_data.pop("coreai_models", {})
+
+    if len(yaml_data) != 1 or "quantization_config" not in yaml_data:
+        raise ValueError(
+            f"{path}: expected exactly one top-level key 'quantization_config', "
+            f"got: {sorted(yaml_data)}."
+        )
+
+    config_dict = dict(yaml_data["quantization_config"])
+
+    # Re-inline pipeline options (pipeline.py pops calibrate_activations
+    # from the dict before rebuilding the coreai-opt config)
+    if "calibrate_activations" in pipeline_opts:
+        config_dict["calibrate_activations"] = pipeline_opts["calibrate_activations"]
+
+    # Validate early — schema errors surface before we start loading the model
+    QuantizerConfig.from_dict({"quantization_config": config_dict})
+
+    return config_dict, path.stem
+
+
+def apply_quantization_from_config(
+    model: nn.Module,
+    quantization_config: dict,
+    example_inputs: tuple[torch.Tensor, ...],
+    finalize: bool = True,
+) -> nn.Module:
+    """Apply quantization to a model using a resolved config dict.
+
+    This is the single entry point for both named presets and YAML recipes.
+    The config dict is the same format as QuantizerConfig.from_dict() expects
+    under the 'quantization_config' key.
+
+    Args:
+        model: fp16 model in eval() mode on CPU.
+        quantization_config: Dict from load_compression_config().
+        example_inputs: Example inputs for quantizer tracing.
+        finalize: If True (default), finalize for CoreAI export.
+                  If False, return the prepared model for PSNR comparison.
+
+    Returns:
+        If finalize=True: finalized model for TorchConverter (not runnable as PyTorch).
+        If finalize=False: prepared model with fake-quantize modules (runnable).
+    """
     model.eval()
-    # Caller must pass an fp16 model (bf16->fp16 direct cast, matching
-    # Apple's MLX pipeline). mlx_vlm.convert casts ALL tensors bf16->fp16
-    # during basic conversion before quantization -- confirmed by the 0.5B
-    # MLX checkpoint (unquantized, yet every tensor is fp16, not bf16).
-    # Apple's quantization is therefore fp16->int8/int4 for linear/embedding
-    # weights; non-linears stay fp16. fp32 is NOT accepted.
     assert next(model.parameters()).dtype == torch.float16, (
-        "apply_quantization expects an fp16 model (matching Apple's MLX "        "pipeline: bf16->fp16 in mlx_vlm.convert before quantization). "        "Load weights with dtype=torch.float16 before calling."
+        "apply_quantization_from_config expects an fp16 model."
     )
 
-    # block_size=64, axis=1, ASYMMETRIC is shared by nn.Linear and
-    # nn.Embedding -- coreai-opt's per-block axis default for both is 1
-    # (the reduction/embedding_dim axis), matching Apple's MLX scheme
-    # exactly for both module types. Confirmed by exhaustive audit
-    # (audit_weight_dtypes.py) that Apple quantizes embed_tokens, lm_head,
-    # all mlp.*, all self_attn.{q,k,v,o}_proj, and both projector Linear
-    # layers -- i.e. every weight-bearing nn.Linear AND the nn.Embedding
-    # table. Only norms and biases are excluded (never quantized by Apple).
-    weight_spec = QuantizationSpec(
-        dtype=_DTYPE[level],
-        qscheme=QuantizationScheme.ASYMMETRIC,
-        granularity=PerBlockGranularity(axis=1, block_size=64),
-    )
-    module_config = ModuleQuantizerConfig(
-        op_input_spec={},
-        op_output_spec={},
-        op_state_spec={"weight": weight_spec},
-    )
-    config = (
-        QuantizerConfig(global_config=None)
-        .set_module_type(torch.nn.Linear, module_config)
-        .set_module_type(torch.nn.Embedding, module_config)
-        .set_execution_mode(ExecutionMode.EAGER)
-        # EAGER mode is required for export with dynamic seq_len.
-        # Graph mode (default) runs convert_pt2e during finalize(), which
-        # bakes the prepare() example shapes as constants in the fx.GraphModule,
-        # making torch.export.export unable to treat seq_len as dynamic.
-        # Eager mode inserts fake-quantize modules into the nn.Module directly
-        # without graph tracing, so shapes remain symbolic at export time.
-    )
+    # Pop calibrate_activations before building the coreai-opt config
+    # (it's a pipeline-level option, not a coreai-opt field)
+    config_dict = dict(quantization_config)
+    run_calibration = config_dict.pop("calibrate_activations", False)
+
+    config = QuantizerConfig.from_dict({"quantization_config": config_dict})
     quantizer = Quantizer(model, config)
     prepared = quantizer.prepare(example_inputs)
-    return prepared, quantizer
+
+    if run_calibration:
+        # Calibration with real data — currently not wired to a data source.
+        # Future: pass calibration_data_fn from export_fastvlm.py.
+        print("[WARN] calibrate_activations=True in config but calibration data "
+              "not yet wired. Running without calibration.")
+
+    if not finalize:
+        return prepared
+
+    return quantizer.finalize(
+        model=prepared,
+        backend=ExportBackend.CoreAI,
+    )
 
 
 def finalize_for_export(
     quantized_model: nn.Module,
     quantizer: Quantizer,
 ) -> nn.Module:
-    """
-    Finalize a quantized model for coreai-torch export.
+    """Finalize a prepared model for CoreAI export.
 
-    Call this AFTER apply_quantization() and BEFORE torch.export.export().
-    The returned model is in backend-specific form and is no longer suitable
-    for plain PyTorch forward passes / PSNR comparison.
-
-    Args:
-        quantized_model: The model returned by apply_quantization().
-        quantizer: The Quantizer object returned by apply_quantization().
-
-    Returns:
-        nn.Module ready to be passed to torch.export.export() and then
-        TorchConverter.add_exported_program().
+    Legacy entry point kept for verify_decoder.py compatibility.
+    New code should use apply_quantization_from_config(finalize=True).
     """
     return quantizer.finalize(
         model=quantized_model,
@@ -242,13 +285,7 @@ def finalize_for_export(
 
 
 def psnr(ref: torch.Tensor, test: torch.Tensor) -> float:
-    """
-    Compute PSNR (dB) between reference and test tensors in float64.
-
-    Both tensors are cast to float64 before comparison to avoid any
-    accumulated error from the test tensor's dtype affecting the metric itself.
-    Returns float('inf') if MSE is exactly zero (bit-identical).
-    """
+    """PSNR (dB) between reference and test tensors, computed in float64."""
     ref_f = ref.detach().float().to(torch.float64)
     test_f = test.detach().float().to(torch.float64)
     mse = torch.mean((ref_f - test_f) ** 2).item()
