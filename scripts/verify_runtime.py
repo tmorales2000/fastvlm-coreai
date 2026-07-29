@@ -20,7 +20,7 @@ USAGE:
   # Run on MacBook Pro (M1 Pro) — fleetwoodmac has MPSGraph bug with stateful KV
   python scripts/verify_runtime.py --variant 0.5b
   python scripts/verify_runtime.py --variant 0.5b --decode-steps 5 --seed 123
-  python scripts/verify_runtime.py --variant 0.5b --bundle-path exports/fastvlm-0.5b.vlmasset
+  python scripts/verify_runtime.py --variant 0.5b --bundle-path exports/fastvlm-0.5b
 
 NOTES:
   - vision.aimodel uses AIModel.load() (no stateful ops)
@@ -318,7 +318,7 @@ def main():
     parser.add_argument("--variant", choices=["0.5b", "1.5b", "7b"], required=True)
     parser.add_argument(
         "--bundle-path", type=Path, default=None,
-        help="Path to .vlmasset bundle (default: exports/fastvlm-{variant}.vlmasset)"
+        help="Path to bundle directory (default: exports/fastvlm-{variant})"
     )
     parser.add_argument("--decode-steps", type=int, default=3)
     parser.add_argument(
@@ -334,7 +334,7 @@ def main():
     args = parser.parse_args()
 
     bundle_path = args.bundle_path or (
-        Path(__file__).parent.parent / "exports" / f"fastvlm-{args.variant}.vlmasset"
+        Path(__file__).parent.parent / "exports" / f"fastvlm-{args.variant}"
     )
 
     passed = asyncio.run(verify_runtime(

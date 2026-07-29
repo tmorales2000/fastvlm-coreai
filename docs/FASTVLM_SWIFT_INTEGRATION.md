@@ -30,7 +30,7 @@ swift build --product llm-runner
 
 ```bash
 LLM_RUNNER=~/git/tmorales2000/coreai-models/.build/out/Products/Debug/llm-runner
-BUNDLE=~/git/tmorales2000/fastvlm-coreai/exports/fastvlm-0.5b.vlmasset
+BUNDLE=~/git/tmorales2000/fastvlm-coreai/exports/fastvlm-0.5b
 
 # Text only
 $LLM_RUNNER --model $BUNDLE \
@@ -54,7 +54,7 @@ $LLM_RUNNER --model $BUNDLE \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | required | Path to `.vlmasset` bundle |
+| `--model` | required | Path to bundle directory |
 | `--image` | none | Path to image file (triggers VLM mode) |
 | `--prompt` | required | Text prompt |
 | `--max-tokens` | 50 | Maximum **new** tokens to generate |
@@ -70,14 +70,14 @@ $LLM_RUNNER --model $BUNDLE \
 ## How CoreAISequentialVLMEngine Works
 
 `CoreAISequentialVLMEngine` orchestrates the full VLM pipeline given a
-`.vlmasset` bundle. It reads `metadata.json` to understand the bundle structure:
+bundle directory. It reads `metadata.json` to understand the bundle structure:
 
 ```
 llm-runner / your Swift app
   ↓
 CoreAISequentialVLMEngine (CoreAILanguageModels)
   ↓
-LanguageBundle (reads metadata.json)
+LanguageBundle (reads metadata.json from bundle directory)
   ├── vision.aimodel  → PreparedModelAsset → encode_image + project
   ├── embed.aimodel   → PreparedModelAsset → main (embed_tokens)
   └── {variant}.aimodel → PreparedModelAsset → main (stateful KV decoder)

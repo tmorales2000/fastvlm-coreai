@@ -1,7 +1,7 @@
 # FastVLM CoreAI Performance Benchmarks
 
 Benchmarks collected using `llm-runner` from Apple's `coreai-models` Swift package,
-running against exported `.vlmasset` bundles via `CoreAISequentialVLMEngine`.
+running against exported bundles via `CoreAISequentialVLMEngine`.
 
 All inference numbers are via the GPU path (MPSGraph). ANE path pending investigation.
 
@@ -243,7 +243,7 @@ temperature 0.7 — different from great_wave standardized set above).
 | Generation | ~131 tok/sec | TBD |
 | Vision encoder path | CoreAI GPU (MPSGraph) | CoreML (.mlpackage) |
 | Decoder path | CoreAI GPU (MPSGraph) | MLX (eager, GPU) |
-| Bundle format | `.vlmasset` (3 components) | `.mlpackage` + MLX weights |
+| Bundle format | plain directory (3 components) | `.mlpackage` + MLX weights |
 
 CoreAI is **~3.4× faster** TTFT than Apple's own MLX-FastVLM hybrid app on the
 same hardware. The primary driver is the unified CoreAI pipeline vs the hybrid

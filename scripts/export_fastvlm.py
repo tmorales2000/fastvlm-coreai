@@ -6,7 +6,7 @@ Follows Apple's authoritative recipe from:
   coreai-models/python/src/coreai_models/export/pipeline.py
   coreai-models/python/src/coreai_models/export/presets.py
 
-Produces a bundle directory (e.g. fastvlm-0.5b.vlmasset/) containing:
+Produces a bundle directory (e.g. exports/fastvlm-0.5b/) containing:
   {variant}.aimodel — text decoder (asset role: main)
   embed.aimodel      — token embedding lookup (asset role: embedding)
   vision.aimodel     — vision encoder + projector (asset role: vision)
@@ -148,7 +148,7 @@ def _weights_dir(variant: str) -> Path:
 
 
 def _bundle_path(variant: str, output_dir: Path) -> Path:
-    return output_dir / f"fastvlm-{variant}.vlmasset"
+    return output_dir / f"fastvlm-{variant}"
 
 
 def _load_config(weights_dir: Path):

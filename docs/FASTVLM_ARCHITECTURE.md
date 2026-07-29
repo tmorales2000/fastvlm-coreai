@@ -84,7 +84,7 @@ precision.
 
 ```bash
 # Inspect the compiled model's vision_encode entrypoint
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b
 # Look for:
 #   input   pixel_values   dtype=float32   shape=[1, 3, 1024, 1024]
 #   output  image_features dtype=float16   shape=[1, 256, 3072]
@@ -165,9 +165,9 @@ The `hidden_size` (896 / 1536 / 3584) matches the decoder's token embedding dime
 
 ```bash
 # Compare all three variants' projector output shapes
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
-python scripts/inspect_aimodel.py exports/fastvlm-1.5b.vlmasset
-python scripts/inspect_aimodel.py exports/fastvlm-7b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b
+python scripts/inspect_aimodel.py exports/fastvlm-1.5b
+python scripts/inspect_aimodel.py exports/fastvlm-7b
 # Look at the project entrypoint output shape in each
 ```
 
@@ -287,17 +287,17 @@ diff /tmp/pt.txt /tmp/mlx.txt
 
 ```bash
 # See KV cache shapes in the compiled model
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b
 # state  k_cache   dtype=float16   shape=[24, 1, 4096, 128]
 # state  v_cache   dtype=float16   shape=[24, 1, 4096, 128]
 # Shape: [n_layers, batch=1, MAX_SEQ_LEN, kv_dim]
 # kv_dim = head_dim * num_key_value_heads = 64 * 2 = 128 for 0.5B
 
-python scripts/inspect_aimodel.py exports/fastvlm-1.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-1.5b
 # state  k_cache   dtype=float16   shape=[28, 1, 4096, 256]
 # kv_dim = 128 * 2 = 256 for 1.5B
 
-python scripts/inspect_aimodel.py exports/fastvlm-7b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-7b
 # state  k_cache   dtype=float16   shape=[28, 1, 4096, 512]
 # kv_dim = 128 * 4 = 512 for 7B
 ```
@@ -317,7 +317,7 @@ both the prefill call (L = 256 image tokens + prompt tokens) and decode steps (L
 
 ```bash
 # Confirm dynamic L in compiled decode signature
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b
 #   input   input_ids    dtype=int32    shape=[1, -1]
 #   output  logits       dtype=float16  shape=[1, -1, 151936]
 ```
@@ -555,9 +555,9 @@ After running `python scripts/export_fastvlm.py --variant <V>`:
 
 | Bundle | Decoder | vision.aimodel entrypoints | decode logits shape | KV cache shape |
 |--------|---------|--------------------------|--------------------|--------------------|
-| `fastvlm-0.5b.vlmasset` | fp16 | encode_image, project | `[1,-1,151936]` | `[24,1,2,4096,64]` |
-| `fastvlm-1.5b.vlmasset` | int8 | encode_image, project | `[1,-1,151936]` | `[28,1,2,4096,128]` |
-| `fastvlm-7b.vlmasset` | int4 | encode_image, project | `[1,-1,152064]` | `[28,1,4,4096,128]` |
+| `fastvlm-0.5b` | fp16 | encode_image, project | `[1,-1,151936]` | `[24,1,2,4096,64]` |
+| `fastvlm-1.5b` | int8 per_channel | encode_image, project | `[1,-1,151936]` | `[28,1,2,4096,128]` |
+| `fastvlm-7b` | int4 per_channel | encode_image, project | `[1,-1,152064]` | `[28,1,4,4096,128]` |
 
 Note: decoder entrypoint is `main` in `fastvlm-{variant}.aimodel`.
 
@@ -601,7 +601,7 @@ The runtime automatically selects the correct specialization for the executing d
 | `scripts/fastvlm_decoder.py` | Re-authored Qwen2 decoder for Core AI export |
 | `scripts/fastvlm_projector.py` | Re-authored mlp2x_gelu projector for Core AI export |
 | `scripts/fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder for Core AI export |
-| `scripts/quantization.py` | coreai-opt quantization pipeline (eager mode, matches Apple's scheme) |
+| `scripts/quantization.py` | Compression preset system — `MACOS_NAMED_PRESETS` (`4bit`, `4bit_per_channel`, `8bit`), `load_compression_config()`, `apply_quantization_from_config()`. Supports YAML recipes. |
 
 ---
 

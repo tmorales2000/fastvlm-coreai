@@ -1,8 +1,8 @@
 """
 inspect_aimodel.py — Generic CoreAI VLM bundle and .aimodel inspector.
 
-Works on any VLM bundle produced by Apple's coreai-models export pipeline,
-including FastVLM (.vlmasset) and Qwen3-VL (.llmasset) bundles.
+Works on any VLM bundle produced by Apple's coreai-models export pipeline.
+Bundle directories have no extension per Apple's current convention (PR #125).
 
 Reads metadata.json to understand the bundle structure rather than making
 model-specific assumptions. Reports:
@@ -15,13 +15,13 @@ model-specific assumptions. Reports:
   - Tokenizer: image token ID validation
 
 USAGE:
-  # Any VLM bundle (auto-detects .vlmasset, .llmasset, or directory):
-  python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset
-  python scripts/inspect_aimodel.py ~/git/apple/coreai-models/exports/qwen3_vl_2b.llmasset
+  # Any VLM bundle directory:
+  python scripts/inspect_aimodel.py exports/fastvlm-0.5b
+  python scripts/inspect_aimodel.py ~/git/apple/coreai-models/exports/qwen3_vl_2b
 
   # Individual .aimodel file:
-  python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset/fastvlm-0.5b.aimodel
-  python scripts/inspect_aimodel.py exports/fastvlm-0.5b.vlmasset/vision.aimodel
+  python scripts/inspect_aimodel.py exports/fastvlm-0.5b/fastvlm-0.5b.aimodel
+  python scripts/inspect_aimodel.py exports/fastvlm-0.5b/vision.aimodel
 """
 
 import argparse
@@ -326,7 +326,7 @@ def main():
     parser.add_argument(
         "path",
         type=Path,
-        help="VLM bundle (.vlmasset/.llmasset) or individual .aimodel file",
+        help="VLM bundle directory or individual .aimodel file",
     )
     args = parser.parse_args()
 
