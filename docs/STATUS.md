@@ -52,7 +52,16 @@ is always used. Filed as a pending issue against `apple/coreai-models`.
 
 3. **Dynamic KV cache benchmarks** — compare TTFT and memory vs static for 0.5B.
 
-4. **Native resolution preprocessing for Qwen3-VL** — PR 2 to apple/coreai-models.
+4. **iOS export** — Scaffolding complete. Requires:
+   - `fastvlm_decoder_ios.py` — BC1S layout, readonly KV I/O, 4 entrypoints
+     (load_embeddings, gather_embeddings, extend, prompt_opt)
+   - `coreai_models.export.ios.export_ios_model` integration
+   - IOSurface hardware constraints (matching coreai-models/export/ios.py)
+   Architecture is fully defined from Apple's coreai-models source.
+   iOS presets (4bit_weight_palettized_group8/32) are in quantization.py.
+   `--platform iOS` CLI flag is wired but raises NotImplementedError pending decoder.
+
+5. **Native resolution preprocessing for Qwen3-VL** — PR 2 to apple/coreai-models.
 
 5. **FastVLM as first-class coreai-models recipe** — add to `vlm/export.py` registry
    and register FastViTHD architecture in `CoreAILanguageModels` Swift package.

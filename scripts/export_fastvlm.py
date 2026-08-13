@@ -32,10 +32,21 @@ Compression is specified via one of two mutually exclusive options:
       exclusive with --compression.
 
   --platform macOS|iOS
-      Target platform (default: macOS). Controls compression defaults:
-        macOS: linear quantization (torch pre-export, int4/int8)
-        iOS:   palettization (k-means codebook, ANE BC1S layout)
-      NOTE: iOS export is not yet implemented. macOS only.
+      Target platform (default: macOS). Controls model architecture and compression:
+
+        macOS: linear quantization (int4/int8 via coreai-opt)
+               3-component bundle: vision.aimodel + embed.aimodel + {variant}.aimodel
+               Stateful KV cache (mutable_slice_update, GPU pattern)
+               KV shape: [n_layers, 1, n_kv_heads, max_ctx, head_dim]
+
+        iOS:   palettization (k-means codebook, ANE-native)
+               Single .aimodel with 4 entrypoints:
+                 load_embeddings, gather_embeddings, extend, prompt_opt
+               Readonly KV I/O (BC1S layout, ANE pattern)
+               KV shape: [n_layers, 1, n_kv_heads*head_dim, 1, max_ctx]
+               Static shape configs for [8,16,64] query lengths
+               IOSurface hardware constraints for embedding table + KV cache
+               NOTE: iOS export requires fastvlm_decoder_ios.py (not yet implemented).
 
 YAML RECIPE FORMAT
 ==================
@@ -86,8 +97,13 @@ USAGE
   python scripts/export_fastvlm.py --variant 0.5b --kv-cache static   # default
   python scripts/export_fastvlm.py --variant 0.5b --kv-cache dynamic  # GrowingKVCache
 
-  # Selective components
+  # Selective components (macOS only)
   python scripts/export_fastvlm.py --variant 0.5b --components vision embed decode
+
+  # iOS (palettization, ANE BC1S layout, 4-entrypoint bundle)
+  python scripts/export_fastvlm.py --variant 0.5b --platform iOS
+  python scripts/export_fastvlm.py --variant 1.5b --platform iOS \
+      --compression 4bit_weight_palettized_group32
 """
 
 import argparse
@@ -138,6 +154,26 @@ IMAGE_STD         = [1.0, 1.0, 1.0]
 RESCALE_FACTOR    = 1.0
 
 ALL_COMPONENTS = ["vision", "embed", "decode"]
+
+# ---------------------------------------------------------------------------
+# iOS-specific constants (matching coreai-models/export/ios.py)
+# ---------------------------------------------------------------------------
+# iOS uses 4 entrypoints in a single .aimodel vs macOS's 3 separate .aimodel files
+IOS_LOAD_EMBEDDINGS_FN    = "load_embeddings"
+IOS_GATHER_EMBEDDINGS_FN  = "gather_embeddings"
+IOS_EXTEND_FN             = "extend"
+IOS_PROMPT_OPT_FN         = "prompt_opt"
+
+# iOS KV cache is BC1S: [n_layers, 1, n_kv_heads*head_dim, 1, max_ctx]
+# (ANE layout — heads and head_dim fused into channels, sequence on dim 4)
+IOS_KV_INTERLEAVE_FACTOR  = 8
+IOS_KV_KEY_INPUT          = "key_cache"
+IOS_KV_VALUE_INPUT        = "value_cache"
+IOS_KV_KEY_OUTPUT         = "new_k_cache"
+IOS_KV_VALUE_OUTPUT       = "new_v_cache"
+
+# iOS query lengths for static shape specialization
+IOS_QUERY_LENGTHS         = [8, 16, 64]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -576,7 +612,17 @@ def main():
     args = parser.parse_args()
 
     if args.platform == "iOS":
-        parser.error("iOS export is not yet implemented.")
+        # iOS export requires:
+        #   1. fastvlm_decoder_ios.py — BC1S layout, readonly KV I/O, 4 entrypoints
+        #   2. coreai_models.export.ios.export_ios_model integration
+        #   3. IOSurface hardware constraints for embedding table + KV cache
+        # Architecture is fully defined in coreai-models/python/src/coreai_models/export/ios.py
+        # Scaffold is in place; implementation pending fastvlm_decoder_ios.py authoring.
+        parser.error(
+            "iOS export not yet implemented. "
+            "Requires fastvlm_decoder_ios.py with BC1S layout and readonly KV I/O. "
+            "See docs/STATUS.md for details."
+        )
 
     # Resolve compression config and label
     compression_config: dict | None = None
