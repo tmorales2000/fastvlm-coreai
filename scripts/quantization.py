@@ -78,10 +78,6 @@ _COMPOSITE_OP_EXCLUSIONS: dict[str, None] = {
     "coreai_torch.composite_ops.SDPA":        None,
     "coreai_torch.composite_ops.RoPE":        None,
     "coreai_torch.composite_ops.RMSNormImpl": None,
-    # FastVLMRMSNorm has a 1D weight [hidden_size] that causes
-    # "axis 1 out of bounds for rank 1 tensor" with per_block axis=1.
-    # Must be explicitly excluded from all quantization presets.
-    "fastvlm_decoder.FastVLMRMSNorm":         None,
 }
 
 # Full dotted name for nn.Linear as coreai-opt expects it
@@ -145,9 +141,9 @@ MACOS_NAMED_PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     "8bit": {
-        # int8 symmetric_with_clipping per_block_32, targeting nn.Linear only.
-        # FastVLMRMSNorm excluded via _COMPOSITE_OP_EXCLUSIONS — its 1D weight
-        # [hidden_size] is incompatible with per_block axis=1.
+        # int8 symmetric_with_clipping per_block_32 — mirrors Apple's 4bit
+        # preset exactly, substituting int8 for int4. Apple ships no int8
+        # macOS preset; this is our addition for memory-constrained deployments.
         "description": "int8 symmetric_with_clipping per_block_32 (nn.Linear only)",
         "quantization_config": {
             "execution_mode": "eager",
