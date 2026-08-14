@@ -143,10 +143,13 @@ from quantization import (
 # Constants (matching vlm/export.py)
 # ---------------------------------------------------------------------------
 # Trace constants — match coreai-models/_constants.py (PR #166, Aug 12 2026)
-# QUANT_TRACE_QUERY_LEN = 16, QUANT_TRACE_OFFSET = 8, TRACE_KV_CACHE_SEQ_LEN = 2048
-QUERY_LEN        = 16    # trace-time query length (was 64, now matches Apple's default)
-OFFSET           = 8     # trace-time position offset (was 64)
-TRACE_KV_SEQ_LEN = 2048  # cap trace-time cache at 2048 regardless of max_ctx (avoids crash)
+# QUANT_TRACE_QUERY_LEN = 16, QUANT_TRACE_OFFSET = 8
+# NOTE: TRACE_KV_CACHE_SEQ_LEN = 2048 from _constants.py is NOT used here.
+# Apple's cap avoids a crash when max_context_length <= 2048. Our default is
+# 4096, so we trace with the full max_ctx. Using 2048 while declaring
+# query_len max=4094 causes a ConstraintViolationError in torch.export.
+QUERY_LEN = 16  # trace-time query length (matches QUANT_TRACE_QUERY_LEN)
+OFFSET    = 8   # trace-time position offset (matches QUANT_TRACE_OFFSET)
 
 IMAGE_TOKEN       = "<image>"
 IMAGE_SIZE        = 1024
@@ -407,8 +410,7 @@ def _export_decode(
 
     if compression_config is not None:
         print(f"[INFO] Applying compression: {compression_label}")
-        trace_kv_len = min(TRACE_KV_SEQ_LEN, max_ctx)
-        ex_k = torch.zeros(n_layers, 1, n_kv_heads, trace_kv_len, head_dim, dtype=torch.float16)
+        ex_k = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
         ex_v = torch.zeros_like(ex_k)
         example_inputs = (
             torch.randn(1, QUERY_LEN, hidden, dtype=torch.float16),
@@ -421,10 +423,7 @@ def _export_decode(
         )
         print(f"[INFO] Compression finalized for CoreAI export")
 
-    # Cap trace-time cache at TRACE_KV_SEQ_LEN to bound peak trace memory.
-    # Matches Apple's _build_reference_inputs logic: min(TRACE_KV_CACHE_SEQ_LEN, max_ctx)
-    trace_kv_len = min(TRACE_KV_SEQ_LEN, max_ctx)
-    k_cache = torch.zeros(n_layers, 1, n_kv_heads, trace_kv_len, head_dim, dtype=torch.float16)
+    k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
     v_cache = torch.zeros_like(k_cache)
 
     reference_inputs = {
