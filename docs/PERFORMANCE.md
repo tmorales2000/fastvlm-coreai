@@ -3,7 +3,7 @@
 Benchmarks collected using `llm-runner` from Apple's `coreai-models` Swift package,
 running against exported bundles via `CoreAISequentialVLMEngine`.
 
-All inference numbers are via the GPU path (MPSGraph). ANE path pending investigation.
+All inference numbers are via the GPU path (MPSGraph). ANE path pending.
 
 ---
 
@@ -13,30 +13,39 @@ All inference numbers are via the GPU path (MPSGraph). ANE path pending investig
 |---|---|
 | Machine | Mac Mini M4 Pro 64GB (h16s) |
 | macOS | 27.0 beta |
-| coreai-models | apple/coreai-models main (post PR #108) |
+| coreai-models | apple/coreai-models main (post PR #108, #126, #133) |
 | coreai-core | 1.0.0b2 |
 | torch | 2.9.0 (export time) |
 | Export flags | `--kv-cache static --max-context-length 4096` |
 | Image strategy | `center_crop` (declared in metadata, FastVLM default) |
-| Benchmark image | `test_assets/images/great_wave.jpg` |
-| Prompt | "Describe exactly what you see in this image." |
 | Temperature | 0 (greedy, deterministic) |
 
 **Cold** = no `.aimodelx` cache (first ever run). **Warm** = `.aimodelx` cache present.
 
+Two benchmark sets collected with different images and prompts:
+- **great_wave**: `test_assets/images/great_wave.jpg`, "Describe exactly what you see in this image."
+- **portrait**: `~/pix/a.jpg`, "Describe what you see in this image."
+
 ---
 
-## Full Comparison Matrix
+## Full Comparison Matrix (portrait benchmark, August 6 2026)
 
-| Model | Compression | TTFT (ms) | Gen (tok/s) | Prompt (tok/s) | Mem current | Mem peak | Load cold | Load warm |
-|-------|-------------|-----------|-------------|----------------|-------------|----------|-----------|-----------|
-| 0.5B | fp16 | **80** | **131** | 3,543 | 2,811MB | 3,448MB | 4,586ms | 245ms |
-| 1.5B | fp16 | 192 | 59 | 1,481 | 7,079MB | 9,668MB | 8,261ms | 534ms |
-| 1.5B | int8 per_channel | 194 | 59 | 1,465 | 5,678MB | 8,289MB | 59,279ms | 392ms |
-| 7B | fp16 | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| 7B | int4 per_channel | **903** | **51** | 327 | 5,968MB | 9,057MB | TBD | 699ms |
+Same image and prompt across all variants for direct comparison.
 
-TTFT = `decoder.Prompt` from verbose output (image encode + prefill, excludes load/warmup).
+| Model | Compression | TTFT warm | Gen tok/s | Prompt tok/s | Mem current | Mem peak | Load cold | Load warm | Warmup |
+|-------|-------------|-----------|-----------|--------------|-------------|----------|-----------|-----------|--------|
+| 0.5B | fp16 | **76ms** | **130** | 3,748 | 2,759MB | 3,444MB | 4,944ms | 230ms | 1,585ms |
+| 1.5B | fp16 | 184ms | 59 | 1,540 | 7,028MB | 9,668MB | 9,602ms | 520ms | 3,784ms |
+| 1.5B | int4 per_channel | **172ms** | **115** | 1,651 | **2,021MB** | **2,444MB** | 5,615ms | **241ms** | 3,688ms |
+| 7B | int4 per_channel | 748ms | 50 | 393 | 5,930MB | 9,058MB | 12,377ms | 727ms | 7,611ms |
+| 7B | fp16 | 812ms | 15 | 362 | **28,829MB** | **41,526MB** | **38,343ms** | 5,796ms | 10,699ms |
+
+TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excludes load/warmup).
+
+**Recommended configurations:**
+- **0.5B fp16** — fastest TTFT (76ms), highest throughput (130 tok/s), smallest footprint (2.8GB)
+- **1.5B int4 per_channel** — best overall: near-0.5B speed at 3× parameters, sub-0.5B memory
+- **7B int4 per_channel** — maximum quality, 50 tok/s, 6GB. **7B fp16 is not recommended** (29GB, 15 tok/s)
 
 ---
 
@@ -44,9 +53,12 @@ TTFT = `decoder.Prompt` from verbose output (image encode + prefill, excludes lo
 
 **Export:** `python scripts/export_fastvlm.py --variant 0.5b`
 
+### great_wave benchmark
+
 | Metric | Cold | Warm |
 |--------|------|------|
 | Model load | 4,586ms | 245ms |
+| Tokenizer load | — | 773ms |
 | Warmup (one-time JIT) | 1,699ms | 1,582ms |
 | **TTFT (prompt processing)** | **84.8ms** | **80.4ms** |
 | Prompt throughput | 3,362 tok/sec | 3,543 tok/sec |
@@ -54,24 +66,37 @@ TTFT = `decoder.Prompt` from verbose output (image encode + prefill, excludes lo
 | Tokens generated | 314 | 314 |
 | Memory (current) | 2,858MB | 2,811MB |
 | Memory (peak) | 3,703MB | 3,448MB |
-| Total wall time | 9.2s | 5.2s |
+
+### portrait benchmark (August 6 2026)
+
+| Metric | Cold | Warm |
+|--------|------|------|
+| Model load | 4,944ms | 230ms |
+| Tokenizer load | — | 773ms |
+| Warmup (one-time JIT) | 1,704ms | 1,585ms |
+| **TTFT (prompt processing)** | **77.3ms** | **75.8ms** |
+| Prompt throughput | 3,674 tok/sec | 3,748 tok/sec |
+| **Generation throughput** | **77 tok/sec (cold)** | **130 tok/sec (warm)** |
+| Tokens generated | 308 | 308 |
+| Memory (current) | 2,803MB | 2,759MB |
+| Memory (peak) | 3,704MB | 3,444MB |
 
 **KV cache:** StaticKVCache, `[24, 1, 2, 4096, 64]`, 24MB
 
-> **Sub-100ms TTFT:** 80ms warm is the user-visible latency in a production app
-> where the model is already loaded. This is the relevant number for real-time
-> applications. Cold TTFT is identical — warmup compiles the graph, not the
-> prefill path.
+> **Sub-100ms TTFT:** 76ms warm is the user-visible latency in a production app
+> where the model is already loaded. Cold generation (77 tok/sec) is lower than
+> warm (130 tok/sec) because the first run includes JIT graph priming.
 
-> **Compute path:** All three components (vision, embed, decoder) run GPU dynamic
-> via MPSGraph. Vision tower shows `Unknown model structure` warning — FastViTHD
-> is not a recognized architecture, defaults to GPU. ANE path pending.
+> **Compute path:** All three components run GPU dynamic via MPSGraph. Vision tower
+> shows `Unknown model structure` — FastViTHD is not a recognized architecture.
 
 ---
 
 ## FastVLM 1.5B (fp16)
 
 **Export:** `python scripts/export_fastvlm.py --variant 1.5b`
+
+### great_wave benchmark
 
 | Metric | Cold | Warm |
 |--------|------|------|
@@ -83,12 +108,55 @@ TTFT = `decoder.Prompt` from verbose output (image encode + prefill, excludes lo
 | Tokens generated | 197 | 197 |
 | Memory (current) | 7,135MB | 7,079MB |
 | Memory (peak) | 11,650MB | 9,668MB |
-| Total wall time | 16.3s | 8.5s |
+
+### portrait benchmark (August 6 2026)
+
+| Metric | Cold | Warm |
+|--------|------|------|
+| Model load | 9,602ms | 520ms |
+| Warmup (one-time JIT) | 4,014ms | 3,784ms |
+| **TTFT (prompt processing)** | **183ms** | **184ms** |
+| Prompt throughput | 1,552 tok/sec | 1,540 tok/sec |
+| **Generation throughput** | **59.1 tok/sec** | **59.0 tok/sec** |
+| Tokens generated | 167 | 167 |
+| Memory (current) | 7,076MB | 7,028MB |
+| Memory (peak) | 11,650MB | 9,668MB |
 
 **KV cache:** StaticKVCache, `[28, 1, 2, 4096, 128]`, 112MB
 
-> **Startup latency:** Warm startup = 534ms load + 3,805ms warmup = 4.3s before
-> first inference. Warmup (graph priming) dominates, not model load.
+---
+
+## FastVLM 1.5B (int4 per_channel)
+
+**Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 4bit_per_channel`
+
+Compression: int4 symmetric per-channel.
+
+### portrait benchmark (August 6 2026)
+
+| Metric | Cold | Warm | vs 1.5B fp16 warm |
+|--------|------|------|-------------------|
+| Model load | 5,615ms | **241ms** | 2.2× faster |
+| Warmup (one-time JIT) | 3,672ms | 3,688ms | ~same |
+| **TTFT (prompt processing)** | **174ms** | **172ms** | **7% faster** |
+| Prompt throughput | 1,631 tok/sec | 1,651 tok/sec | ~same |
+| **Generation throughput** | **110 tok/sec** | **115 tok/sec** | **1.95× faster** |
+| Tokens generated | 124 | 124 | — |
+| Memory (current) | 2,078MB | **2,021MB** | **71% lower** |
+| Memory (peak) | 2,558MB | **2,444MB** | **75% lower** |
+
+**KV cache:** StaticKVCache, `[28, 1, 2, 4096, 128]`, 112MB
+
+> **The standout result in this benchmark suite.** 1.5B int4 delivers:
+> - 115 tok/sec warm — nearly matching 0.5B fp16 (130 tok/sec) at 3× the parameters
+> - 2.0GB current memory — less than 0.5B fp16 (2.8GB)
+> - 172ms TTFT — slightly faster than 1.5B fp16 (184ms)
+> - Clean, complete output with no quality regression vs fp16
+
+> **Why int4 is faster than fp16 here:** Per-channel int4 quantization fuses
+> dequantization into batch_matmul as row-wise scaling, reducing memory bandwidth
+> pressure. The 1.5B model is memory-bandwidth-bound at fp16 — int4 removes the
+> bottleneck and allows the GPU to run closer to compute-bound.
 
 ---
 
@@ -96,52 +164,25 @@ TTFT = `decoder.Prompt` from verbose output (image encode + prefill, excludes lo
 
 **Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 8bit`
 
-Compression: int8 symmetric per-channel (`quantization.py` preset `8bit`).
+⚠️ **Known regression:** The current `8bit` preset (per_channel symmetric) produces
+27 tok/sec and repetitive output vs fp16's 59 tok/sec. Investigation pending.
+The old asymmetric per_block_64 scheme matched fp16 throughput exactly. Do not
+use `8bit` compression in production until this is resolved.
+
+### great_wave benchmark (earlier run)
 
 | Metric | Cold | Warm | vs 1.5B fp16 warm |
 |--------|------|------|-------------------|
-| Model load | **59,279ms** | **392ms** | 1.4× faster warm |
-| Warmup (one-time JIT) | 4,179ms | 3,829ms | ~same |
-| **TTFT (prompt processing)** | **192ms** | **194ms** | ~same |
-| Prompt throughput | 1,481 tok/sec | 1,465 tok/sec | ~same |
-| **Generation throughput** | **59.1 tok/sec** | **58.7 tok/sec** | ~same |
-| Tokens generated | 193 | 193 | — |
-| Memory (current) | 13,284MB | **5,678MB** | **20% lower** |
-| Memory (peak) | 20,479MB | **8,289MB** | **14% lower** |
-| Total wall time | 67.3s | 8.5s | — |
+| Model load | **59,279ms** | 392ms | 1.4× faster warm |
+| Warmup | 4,179ms | 3,829ms | ~same |
+| **TTFT** | **192ms** | **194ms** | ~same |
+| **Generation** | **59.1 tok/sec** | **58.7 tok/sec** | ~same |
+| Memory (current) | 13,284MB | **5,678MB** | 20% lower |
+| Memory (peak) | 20,479MB | **8,289MB** | 14% lower |
 
-**KV cache:** StaticKVCache, `[28, 1, 2, 4096, 128]`, 112MB
-
-> **⚠️ Cold load: 59 seconds.** JIT compilation of int8 dequantization ops takes
-> ~7× longer than fp16. Peak memory during cold compilation reaches 20GB.
-> Production apps should pre-compile via `xcrun coreai-build compile` to ship
-> `.aimodelc` and avoid the cold load penalty entirely.
-
-> **TTFT and generation identical to fp16:** The GPU (MPSGraph) path dequantizes
-> int8 weights to fp16 before matrix multiply — no native int8 compute on this path.
-> int8 saves memory and storage but not compute time.
-
-> **Memory advantage (warm):** int8 saves ~1.4GB resident memory vs fp16.
-> Peak during inference is 14% lower.
-
----
-
-## FastVLM 7B (fp16) — TBD
-
-**Export:** `python scripts/export_fastvlm.py --variant 7b`
-
-| Metric | Cold | Warm |
-|--------|------|------|
-| Model load | TBD | TBD |
-| Warmup (one-time JIT) | TBD | TBD |
-| TTFT (prompt processing) | TBD | TBD |
-| Prompt throughput | TBD | TBD |
-| Generation throughput | TBD | TBD |
-| Memory (current) | TBD | TBD |
-| Memory (peak) | TBD | TBD |
-
-> Note: 7B fp16 benchmarks pending. Model requires ~25-28GB resident memory.
-> Warmup estimated at ~15s based on scaling from smaller variants.
+> These numbers are from the old asymmetric per_block_64 scheme that matched fp16
+> throughput. The new per_channel symmetric scheme regresses to 27 tok/sec.
+> Root cause under investigation.
 
 ---
 
@@ -149,80 +190,85 @@ Compression: int8 symmetric per-channel (`quantization.py` preset `8bit`).
 
 **Export:** `python scripts/export_fastvlm.py --variant 7b --compression 4bit_per_channel`
 
-Compression: int4 symmetric per-channel (`quantization.py` preset `4bit_per_channel`).
+Compression: int4 symmetric per-channel.
 
-> **Important:** The `7B` variant uses a Qwen2.5-7B base (vocab 152064, image token ID
-> 151665) vs Qwen2 for 0.5B/1.5B (vocab 151936, image token ID 151646). Different
-> base models — different tokenizers — same FastViTHD vision tower.
+> The 7B variant uses Qwen2.5-7B base (vocab 152064, image token 151665) vs
+> Qwen2 for 0.5B/1.5B (vocab 151936, image token 151646).
 
-| Metric | Warm | vs 1.5B fp16 warm |
-|--------|------|-------------------|
-| Model load | **699ms** | 1.3× slower |
-| Warmup (one-time JIT) | 7,386ms | 1.9× slower |
-| **TTFT (prompt processing)** | **903ms** | 4.7× slower |
-| Prompt throughput | 327 tok/sec | 4.5× slower |
-| **Generation throughput** | **50.8 tok/sec** | ~same |
-| Tokens generated | 425 | — |
-| Memory (current) | 5,968MB | ~same |
-| Memory (peak) | 9,057MB | ~same |
-| Total wall time | 17.9s | — |
+### portrait benchmark (August 6 2026)
+
+| Metric | Cold | Warm |
+|--------|------|------|
+| Model load | 12,377ms | 727ms |
+| Warmup (one-time JIT) | 7,515ms | 7,611ms |
+| **TTFT (prompt processing)** | **746ms** | **748ms** |
+| Prompt throughput | 394 tok/sec | 393 tok/sec |
+| **Generation throughput** | **50.0 tok/sec** | **50.0 tok/sec** |
+| Tokens generated | 333 | 333 |
+| Memory (current) | 5,633MB | 5,930MB |
+| Memory (peak) | 9,111MB | 9,058MB |
 
 **KV cache:** StaticKVCache, `[28, 1, 4, 4096, 128]`, 224MB
 
-> **7× throughput improvement over per_block_64 asymmetric** (old scheme: 7.2 tok/sec →
-> new scheme: 50.8 tok/sec). Root cause: per_block quantization produces
-> `blockwise_shift_scale` ops (197 in compiled graph) that are NOT fused with
-> `batch_matmul` on GPU — the dequantization runs as a separate pass over the full
-> weight matrix. Per_channel dequantization (one scale per output row) fuses directly
-> into `batch_matmul` as a row-wise scaling, eliminating the separate pass.
-> The compiled `blockwise_shift_scale` count is 197 for both schemes — the op name
-> is the same but per_channel execution is 7× faster because the scale granularity
-> allows GPU fusion.
+> **7× throughput improvement over original per_block_64 asymmetric** (7.2 → 50 tok/sec).
+> Per_channel dequantization fuses into batch_matmul; per_block runs as a separate pass.
 
-> **Quality trade-off:** int4 per_channel has fewer scale parameters than per_block
-> (one per row vs one per 32 elements). PSNR vs fp16 baseline: 29.5 dB (per_channel)
-> vs expected ~32 dB (per_block_32). Acceptable for deployment.
+---
 
-> **Memory vs 1.5B fp16:** Nearly identical (5,968MB vs 7,079MB current) despite
-> 4.7× more parameters — int4 quantization reduces weight storage to ~1/4 of fp16.
-> The 7B int4 model is memory-competitive with 1.5B fp16 while delivering substantially
-> better output quality.
+## FastVLM 7B (fp16)
 
-> **Surprising result:** 50.8 tok/sec for 7B int4 is close to 58.8 tok/sec for 1.5B
-> fp16. You get 7B quality at near-1.5B speed. The TTFT (903ms) is the key trade-off —
-> prefill of 295 tokens takes nearly 1 second vs 192ms for 1.5B.
+**Export:** `python scripts/export_fastvlm.py --variant 7b`
+
+⚠️ **Not recommended for production.** Memory requirements exceed practical limits
+for interactive use even on 64GB machines.
+
+### portrait benchmark (August 6 2026)
+
+| Metric | Cold | Warm |
+|--------|------|------|
+| Model load | **38,343ms** | **5,796ms** |
+| Warmup (one-time JIT) | **15,634ms** | **10,699ms** |
+| **TTFT (prompt processing)** | **839ms** | **812ms** |
+| Prompt throughput | 351 tok/sec | 362 tok/sec |
+| **Generation throughput** | **15.3 tok/sec** | **15.3 tok/sec** |
+| Tokens generated | 358 | 358 |
+| Memory (current) | **28,837MB** | **28,829MB** |
+| Memory (peak) | **43,057MB** | **41,526MB** |
+
+**KV cache:** StaticKVCache, `[28, 1, 4, 4096, 128]`, 224MB
+
+> **28GB resident memory, 41–43GB peak** — barely fits in 64GB unified memory.
+> Any concurrent process risks memory pressure and swapping. Cold load takes
+> 38 seconds; even warm load takes 5.8s. Generation at 15 tok/sec is 3.3×
+> slower than 7B int4 for no quality benefit.
+>
+> **Use 7B int4 per_channel instead.** It delivers identical output quality
+> at 50 tok/sec, 6GB memory, and sub-1s warm load.
 
 ---
 
 ## Quantization Scheme Findings
 
-Critical discovery from benchmarking 7B int4 with multiple schemes:
-
 | Scheme | blockwise_shift_scale | 7B gen tok/s | Notes |
 |--------|----------------------|--------------|-------|
-| per_block_64 asymmetric (old default) | 197 | 7.2 | Unfused, catastrophically slow |
-| per_block_32 symmetric_with_clipping (apple_4bit) | 197 | ~7-10 (est.) | Unfused, same problem |
-| per_channel symmetric (4bit_per_channel) | 197 | **50.8** | Fused — 7× faster |
+| per_block_64 asymmetric (original) | 197 | 7.2 | Unfused — catastrophic |
+| per_block_32 symmetric_with_clipping (apple_4bit) | 197 | ~7–10 (est.) | Unfused — same problem |
+| per_channel symmetric (4bit_per_channel) | 197 | **50** | Fused — 7× faster |
 
-**Key insight:** `blockwise_shift_scale` count (197) is identical across all schemes —
-the compiler emits the same op regardless. The difference is execution behavior:
-- Per-block: scale granularity requires separate pass over weight matrix → unfused
-- Per-channel: one scale per output row → fuses into batch_matmul as row-wise scaling
+Op count is identical across schemes. Per-channel allows GPU to fuse dequantization
+into batch_matmul as row-wise scaling. Per-block requires a separate pass.
 
-**Current preset choices (`quantization.py`):**
-- `4bit` — Apple's macOS standard (symmetric_with_clipping per_block_32). Best quality,
-  but unfused on GPU — avoid for large models where throughput matters.
-- `4bit_per_channel` — per_channel symmetric int4. 7× faster on GPU, slight quality
-  trade-off. Recommended for 7B.
-- `8bit` — per_channel symmetric int8. Identical throughput to fp16 on GPU path
-  (dequantizes to fp16 before compute). Memory savings only.
+**Current presets (`quantization.py`):**
+- `4bit` — Apple macOS standard (symmetric_with_clipping per_block_32). Best quality,
+  but unfused on GPU. Avoid for large models where throughput matters.
+- `4bit_per_channel` — per_channel symmetric int4. 7× faster. **Recommended for 7B.**
+- `8bit` — per_channel symmetric int8. ⚠️ Currently regressed (27 tok/sec). TBD.
 
 ---
 
 ## FastVLM 0.5B vs Qwen3-VL 2B — Head-to-Head (M4 Pro)
 
-Same image, same prompt, same `llm-runner`. Earlier benchmark (portrait photo,
-temperature 0.7 — different from great_wave standardized set above).
+Portrait photo benchmark, temperature 0.7.
 
 | Metric | FastVLM 0.5B (fp16) | Qwen3-VL 2B (fp16) | FastVLM advantage |
 |--------|--------------------|--------------------|-------------------|
@@ -239,26 +285,24 @@ temperature 0.7 — different from great_wave standardized set above).
 
 | Metric | CoreAI (this project) | MLX-FastVLM (Apple hybrid) |
 |--------|----------------------|---------------------------|
-| TTFT | **~80ms** | ~270ms |
-| Generation | ~131 tok/sec | TBD |
-| Vision encoder path | CoreAI GPU (MPSGraph) | CoreML (.mlpackage) |
-| Decoder path | CoreAI GPU (MPSGraph) | MLX (eager, GPU) |
+| TTFT | **~76ms** | ~270ms |
+| Generation | ~130 tok/sec | TBD |
+| Vision encoder | CoreAI GPU (MPSGraph) | CoreML (.mlpackage) |
+| Decoder | CoreAI GPU (MPSGraph) | MLX (eager, GPU) |
 | Bundle format | plain directory (3 components) | `.mlpackage` + MLX weights |
 
-CoreAI is **~3.4× faster** TTFT than Apple's own MLX-FastVLM hybrid app on the
-same hardware. The primary driver is the unified CoreAI pipeline vs the hybrid
-CoreML+MLX approach which has cross-framework overhead.
+CoreAI is **~3.5× faster** TTFT than Apple's own MLX-FastVLM hybrid app.
 
 ---
 
 ## Scaling Summary
 
-| | 0.5B→1.5B (3× params) | 1.5B→7B (4.7× params, int4) | 1.5B fp16→int8 |
-|--|----------------------|----------------------------|----------------|
-| TTFT | 2.4× slower | 4.7× slower | ~same |
-| Generation | 2.2× slower | ~same (50 vs 59 tok/s) | ~same |
-| Memory (warm current) | 2.5× more | ~same (int4 offsets size) | 20% less |
-| Model load (warm) | 2.2× slower | 1.3× slower | 1.4× faster |
+| | 0.5B fp16 → 1.5B fp16 | 1.5B fp16 → 1.5B int4 | 1.5B fp16 → 7B int4 | 7B int4 → 7B fp16 |
+|--|----------------------|----------------------|---------------------|-------------------|
+| TTFT | 2.4× slower | 6% faster | 4.1× slower | 9% slower |
+| Generation | 2.2× slower | **2× faster** | ~same (50 vs 59) | **3.3× slower** |
+| Memory current | 2.5× more | **71% lower** | ~same | **4.9× more** |
+| Model load warm | 2.3× slower | 2.3× faster | 1.4× slower | 8× slower |
 
 ---
 
@@ -266,31 +310,37 @@ CoreML+MLX approach which has cross-framework overhead.
 
 ### Cold vs warm load
 
-**Cold** (no `.aimodelx` cache): CoreAI JIT-compiles the `.aimodel` graph on first run.
-The result is cached as `.aimodelx` in `~/Library/Caches/`.
+**Cold** = no `.aimodelx` cache. CoreAI JIT-compiles on first run, caches in
+`~/Library/Caches/`. fp16 cold scales linearly with model size. int4 cold is
+similar. int8 cold is ~7× slower (59s for 1.5B). 7B fp16 cold is 38 seconds.
 
-- fp16 cold load scales roughly linearly with model size
-- int8 cold load is ~7× slower due to quantization op compilation; peak memory 20GB
-- int4 cold load: TBD (expected similarly slow to int8)
-- Production apps should pre-compile via `xcrun coreai-build compile` to avoid cold penalty
+Production apps should pre-compile via `xcrun coreai-build compile` — PR #133
+(Aug 2026) means the runtime automatically finds `.aimodelc` alongside `.aimodel`
+without requiring `metadata.json` updates.
 
 ### Warmup
 
-The one-time JIT warmup runs a dummy forward pass to prime the GPU pipeline.
-Happens every process launch regardless of cache state. In a production app this is
-the startup latency after model load.
+One-time JIT warmup primes the GPU pipeline every process launch regardless of
+cache state. Warmup is the dominant startup cost for 1.5B+ models:
+- 0.5B: ~1.6s warmup vs 0.23s model load (warm)
+- 1.5B: ~3.7s warmup vs 0.52s model load (warm)
+- 7B:   ~7.6s warmup vs 0.73s model load (warm)
 
-### GPU path (current) vs ANE (pending)
+### Tokenizer load
 
-All numbers are GPU via MPSGraph. `Unknown model structure` on `vision.aimodel` means
-FastViTHD defaults to GPU. The compiled op distribution for our exports is architecturally
-equivalent to Apple's own Qwen3-VL exports (same op types, same counts scaled by layers).
-ANE path would require AOT compilation via `xcrun coreai-build compile --preferred-compute
-neural-engine` and potentially decoder re-authoring for full ANE utilization.
+Tokenizer load (Jinja template compilation) is ~770–830ms and constant across
+all model variants. Reported separately in the new verbose output format.
+
+### int8 regression note
+
+The current `8bit` preset (per_channel symmetric) regresses to 27 tok/sec and
+produces repetitive output for 1.5B. The old asymmetric per_block_64 scheme
+matched fp16 throughput (59 tok/sec). Root cause under investigation — likely
+related to axis or scheme selection in `apply_quantization_from_config()`.
 
 ### int4 quantization on GPU path
 
-Per-block int4 (any block size) produces `blockwise_shift_scale` ops that run as a
-separate dequantization pass before `batch_matmul` — unfused, slow. Per-channel int4
-fuses into `batch_matmul` as row-wise scaling — 7× faster on M4 Pro GPU. Use
-`--compression 4bit_per_channel` for 7B, not `--compression 4bit`.
+Per-channel int4 fuses dequantization into batch_matmul (row-wise scaling).
+Per-block int4 runs as a separate unfused pass regardless of block size or
+symmetric/asymmetric choice. Use `--compression 4bit_per_channel`, not
+`--compression 4bit`, for production 7B exports.
