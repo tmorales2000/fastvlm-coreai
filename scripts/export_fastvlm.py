@@ -142,14 +142,13 @@ from quantization import (
 # ---------------------------------------------------------------------------
 # Constants (matching vlm/export.py)
 # ---------------------------------------------------------------------------
-# Trace constants — match coreai-models/_constants.py (PR #166, Aug 12 2026)
-# QUANT_TRACE_QUERY_LEN = 16, QUANT_TRACE_OFFSET = 8
-# NOTE: TRACE_KV_CACHE_SEQ_LEN = 2048 from _constants.py is NOT used here.
-# Apple's cap avoids a crash when max_context_length <= 2048. Our default is
-# 4096, so we trace with the full max_ctx. Using 2048 while declaring
-# query_len max=4094 causes a ConstraintViolationError in torch.export.
-QUERY_LEN = 16  # trace-time query length (matches QUANT_TRACE_QUERY_LEN)
-OFFSET    = 8   # trace-time position offset (matches QUANT_TRACE_OFFSET)
+# Trace constants — match Apple's vlm/export.py export_text_bundle() exactly.
+# NOTE: _constants.py (PR #166) defines QUANT_TRACE_QUERY_LEN=16 and
+# TRACE_KV_CACHE_SEQ_LEN=2048 for the LLM export path. The VLM export path
+# uses different values — 64/64 — and full max_ctx for the KV cache.
+# Do not adopt LLM-path constants here.
+QUERY_LEN = 64  # matches Apple's vlm/export.py
+OFFSET    = 64  # matches Apple's vlm/export.py
 
 IMAGE_TOKEN       = "<image>"
 IMAGE_SIZE        = 1024
