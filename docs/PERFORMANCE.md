@@ -36,6 +36,7 @@ Same image and prompt across all variants for direct comparison.
 |-------|-------------|-----------|-----------|--------------|-------------|----------|-----------|-----------|--------|
 | 0.5B | fp16 | **76ms** | **130** | 3,748 | 2,759MB | 3,444MB | 4,944ms | 230ms | 1,585ms |
 | 1.5B | fp16 | 184ms | 59 | 1,540 | 7,028MB | 9,668MB | 9,602ms | 520ms | 3,784ms |
+| 1.5B | int8 per_block_32 | 212ms | **71** | 1,343 | **2,771MB** | **3,929MB** | 3,633ms | **328ms** | 3,652ms |
 | 1.5B | int4 per_channel | **172ms** | **115** | 1,651 | **2,021MB** | **2,444MB** | 5,615ms | **241ms** | 3,688ms |
 | 7B | int4 per_channel | 748ms | 50 | 393 | 5,930MB | 9,058MB | 12,377ms | 727ms | 7,611ms |
 | 7B | fp16 | 812ms | 15 | 362 | **28,829MB** | **41,526MB** | **38,343ms** | 5,796ms | 10,699ms |
@@ -160,29 +161,38 @@ Compression: int4 symmetric per-channel.
 
 ---
 
-## FastVLM 1.5B (int8 per_channel)
+## FastVLM 1.5B (int8 per_block_32)
 
 **Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 8bit`
 
-⚠️ **Known regression:** The current `8bit` preset (per_channel symmetric) produces
-27 tok/sec and repetitive output vs fp16's 59 tok/sec. Investigation pending.
-The old asymmetric per_block_64 scheme matched fp16 throughput exactly. Do not
-use `8bit` compression in production until this is resolved.
+Compression: int8 symmetric_with_clipping per_block_32. Targets `nn.Linear` only.
+`FastVLMRMSNorm` excluded (1D weight incompatible with per_block axis=1).
 
-### great_wave benchmark (earlier run)
+### portrait benchmark (August 14 2026)
 
 | Metric | Cold | Warm | vs 1.5B fp16 warm |
 |--------|------|------|-------------------|
-| Model load | **59,279ms** | 392ms | 1.4× faster warm |
-| Warmup | 4,179ms | 3,829ms | ~same |
-| **TTFT** | **192ms** | **194ms** | ~same |
-| **Generation** | **59.1 tok/sec** | **58.7 tok/sec** | ~same |
-| Memory (current) | 13,284MB | **5,678MB** | 20% lower |
-| Memory (peak) | 20,479MB | **8,289MB** | 14% lower |
+| Model load | 3,633ms | **328ms** | **1.6× faster** |
+| Warmup (one-time JIT) | 4,478ms | 3,652ms | ~same |
+| **TTFT (prompt processing)** | 1,326ms | **212ms** | ~same |
+| Prompt throughput | 214 tok/sec | 1,343 tok/sec | ~same |
+| **Generation throughput** | **72.3 tok/sec** | **71.3 tok/sec** | **1.2× faster** |
+| Tokens generated | 167 | 165 | — |
+| Memory (current) | 2,855MB | **2,771MB** | **61% lower** |
+| Memory (peak) | 4,029MB | **3,929MB** | **59% lower** |
 
-> These numbers are from the old asymmetric per_block_64 scheme that matched fp16
-> throughput. The new per_channel symmetric scheme regresses to 27 tok/sec.
-> Root cause under investigation.
+**KV cache:** StaticKVCache, `[28, 1, 2, 4096, 128]`, 112MB
+
+> **71 tok/sec — 1.2× faster than 1.5B fp16 (59 tok/sec).** Per_block_32
+> symmetric_with_clipping reduces memory bandwidth enough for the GPU to run
+> more efficiently than fp16 on the M4 Pro.
+
+> **61% lower memory:** 2.8GB current vs 7.0GB for fp16 — less than 0.5B fp16 (2.8GB).
+> Peak also dramatically lower: 3.9GB vs 9.7GB.
+
+> **Cold TTFT 1,326ms** — higher than warm (212ms) because the first inference
+> run includes JIT graph priming. Model load (3.6s cold) is much faster than
+> the old per_channel scheme which caused a 59-second cold load.
 
 ---
 
@@ -262,7 +272,8 @@ into batch_matmul as row-wise scaling. Per-block requires a separate pass.
 - `4bit` — Apple macOS standard (symmetric_with_clipping per_block_32). Best quality,
   but unfused on GPU. Avoid for large models where throughput matters.
 - `4bit_per_channel` — per_channel symmetric int4. 7× faster. **Recommended for 7B.**
-- `8bit` — per_channel symmetric int8. ⚠️ Currently regressed (27 tok/sec). TBD.
+- `8bit` — symmetric_with_clipping per_block_32 int8. **71 tok/sec** (faster than fp16).
+  Memory: 2.8GB (61% lower than fp16). Recommended for memory-constrained deployments.
 
 ---
 
@@ -297,12 +308,12 @@ CoreAI is **~3.5× faster** TTFT than Apple's own MLX-FastVLM hybrid app.
 
 ## Scaling Summary
 
-| | 0.5B fp16 → 1.5B fp16 | 1.5B fp16 → 1.5B int4 | 1.5B fp16 → 7B int4 | 7B int4 → 7B fp16 |
-|--|----------------------|----------------------|---------------------|-------------------|
-| TTFT | 2.4× slower | 6% faster | 4.1× slower | 9% slower |
-| Generation | 2.2× slower | **2× faster** | ~same (50 vs 59) | **3.3× slower** |
-| Memory current | 2.5× more | **71% lower** | ~same | **4.9× more** |
-| Model load warm | 2.3× slower | 2.3× faster | 1.4× slower | 8× slower |
+| | 0.5B fp16 → 1.5B fp16 | 1.5B fp16 → 1.5B int8 | 1.5B fp16 → 1.5B int4 | 1.5B fp16 → 7B int4 | 7B int4 → 7B fp16 |
+|--|----------------------|----------------------|----------------------|---------------------|-------------------|
+| TTFT | 2.4× slower | ~same | 6% faster | 4.1× slower | 9% slower |
+| Generation | 2.2× slower | **1.2× faster** | **2× faster** | ~same (50 vs 59) | **3.3× slower** |
+| Memory current | 2.5× more | **61% lower** | **71% lower** | ~same | **4.9× more** |
+| Model load warm | 2.3× slower | 1.6× faster | 2.3× faster | 1.4× slower | 8× slower |
 
 ---
 
@@ -331,12 +342,13 @@ cache state. Warmup is the dominant startup cost for 1.5B+ models:
 Tokenizer load (Jinja template compilation) is ~770–830ms and constant across
 all model variants. Reported separately in the new verbose output format.
 
-### int8 regression note
+### int8 quantization
 
-The current `8bit` preset (per_channel symmetric) regresses to 27 tok/sec and
-produces repetitive output for 1.5B. The old asymmetric per_block_64 scheme
-matched fp16 throughput (59 tok/sec). Root cause under investigation — likely
-related to axis or scheme selection in `apply_quantization_from_config()`.
+The `8bit` preset uses symmetric_with_clipping per_block_32, targeting `nn.Linear`
+only. `FastVLMRMSNorm` is explicitly excluded — its 1D weight `[hidden_size]` is
+incompatible with per_block axis=1 and was silently corrupting quantization in the
+previous per_channel scheme (causing 27 tok/sec and looping output).
+Result: 71 tok/sec (faster than fp16), 2.8GB memory (61% lower), clean output.
 
 ### int4 quantization on GPU path
 
