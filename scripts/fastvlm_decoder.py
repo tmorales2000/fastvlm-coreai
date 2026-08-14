@@ -52,11 +52,13 @@ import torch.nn as nn
 from coreai_torch.composite_ops import RMSNormImpl, RoPE, SDPA
 from safetensors import safe_open
 
-# State names — must match KEY_CACHE_NAME / VALUE_CACHE_NAME in
-# coreai-models/python/src/coreai_models/_constants.py (PR #166, Aug 12 2026).
-# Changed from "k_cache"/"v_cache" to camelCase "keyCache"/"valueCache".
-KEY_CACHE_NAME   = "keyCache"
-VALUE_CACHE_NAME = "valueCache"
+# State names — must match the VLM export path in coreai-models/vlm/export.py.
+# NOTE: _constants.py (PR #166, Aug 12 2026) uses "keyCache"/"valueCache" for
+# the LLM export path (BaseForCausalLM). The VLM export path (vlm/export.py)
+# still uses "k_cache"/"v_cache" and CoreAISequentialVLMEngine expects these.
+# Do NOT adopt the camelCase names until vlm/export.py is updated upstream.
+KEY_CACHE_NAME   = "k_cache"
+VALUE_CACHE_NAME = "v_cache"
 KV_STATE_NAMES   = (KEY_CACHE_NAME, VALUE_CACHE_NAME)
 
 
