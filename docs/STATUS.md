@@ -52,14 +52,15 @@ is always used. Filed as a pending issue against `apple/coreai-models`.
 
 3. **Dynamic KV cache benchmarks** — compare TTFT and memory vs static for 0.5B.
 
-4. **iOS export** — Scaffolding complete. Requires:
-   - `fastvlm_decoder_ios.py` — BC1S layout, readonly KV I/O, 4 entrypoints
-     (load_embeddings, gather_embeddings, extend, prompt_opt)
-   - `coreai_models.export.ios.export_ios_model` integration
-   - IOSurface hardware constraints (matching coreai-models/export/ios.py)
-   Architecture is fully defined from Apple's coreai-models source.
-   iOS presets (4bit_weight_palettized_group8/32) are in quantization.py.
-   `--platform iOS` CLI flag is wired but raises NotImplementedError pending decoder.
+4. **iOS export** — `fastvlm_ios.py` implemented following `Qwen3ForCausalLMForiOS`
+   pattern exactly. Uses `BaseForCausalLMForiOS`, iOS primitives (Conv2d projections,
+   `KVCacheHandler`, `RoPECache`, BC1S layout), and `export_ios_model()`.
+   `--platform iOS` CLI routes to `_export_ios()` in `export_fastvlm.py`.
+   Produces 4-entrypoint bundle (load_embeddings, gather_embeddings, extend, prompt_opt).
+   **Known gap:** iOS exports text decoder only. FastViTHD vision encoder is macOS-only.
+   A full iOS VLM pipeline requires both iOS decoder + macOS vision.aimodel, or
+   a future iOS-specific vision encoder. This gap exists in Apple's vlm/export.py too
+   — opportunity to file a PR once our iOS decoder is validated.
 
 5. **Native resolution preprocessing for Qwen3-VL** — PR 2 to apple/coreai-models.
 

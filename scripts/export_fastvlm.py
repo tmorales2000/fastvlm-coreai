@@ -553,6 +553,69 @@ async def export_fastvlm(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _export_ios(args) -> None:
+    """iOS text-decoder export via FastVLMForiOS + export_ios_model().
+
+    Produces a single .aimodel with four entrypoints:
+      load_embeddings, gather_embeddings, extend, prompt_opt.
+    Uses BC1S layout and KVCacheHandler (readonly KV I/O) for ANE.
+
+    Note: This exports the decoder ONLY. The vision encoder (vision.aimodel)
+    is macOS-only. A full iOS VLM deployment requires both.
+    """
+    sys.path.insert(0, str(Path(__file__).parent))
+    from fastvlm_ios import FastVLMForiOS
+    from coreai_models.export.ios import export_ios_model
+    from coreai_models.export.pipeline import ExportConfig
+
+    variant    = args.variant
+    max_ctx    = args.max_context_length
+    output_dir = args.output_dir
+    overwrite  = args.overwrite
+
+    weights_dir = _weights_dir(variant)
+    if not weights_dir.exists():
+        raise FileNotFoundError(
+            f"Weights not found: {weights_dir}\n"
+            f"Download with: hf download apple/FastVLM-{variant.upper()} "
+            f"--local-dir {weights_dir}"
+        )
+
+    compression_config, compression_label = (
+        load_compression_config(args.compression_config, platform="iOS")
+        if args.compression_config
+        else load_compression_config(
+            args.compression or "4bit_weight_palettized_group32", platform="iOS"
+        )
+    )
+
+    print(f"[iOS] Loading FastVLM {variant.upper()} decoder...")
+    model = FastVLMForiOS.from_weights_dir(
+        str(weights_dir),
+        max_context_length=max_ctx,
+        disable_embedding_quantization=False,
+    )
+
+    bundle_path = output_dir / f"fastvlm-{variant}-ios"
+    bundle_path.mkdir(parents=True, exist_ok=True)
+
+    export_config = ExportConfig(
+        hf_model_id=f"apple/FastVLM-{variant.upper()}",
+        variant="iOS",
+        max_context_length=max_ctx,
+        compression=compression_label,
+        output_dir=str(output_dir),
+        output_name=f"fastvlm-{variant}-ios",
+        overwrite=overwrite,
+        compression_config_object=compression_config,
+    )
+
+    print(f"[iOS] Exporting decoder → {bundle_path}  (compression: {compression_label})")
+    print("[iOS] Note: vision.aimodel (macOS) needed for full VLM pipeline.")
+    export_ios_model(model, model.config, export_config)
+    print(f"[iOS] Done: {bundle_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export FastVLM to CoreAI VLM bundle format.",
@@ -621,17 +684,14 @@ def main():
     args = parser.parse_args()
 
     if args.platform == "iOS":
-        # iOS export requires:
-        #   1. fastvlm_decoder_ios.py — BC1S layout, readonly KV I/O, 4 entrypoints
-        #   2. coreai_models.export.ios.export_ios_model integration
-        #   3. IOSurface hardware constraints for embedding table + KV cache
-        # Architecture is fully defined in coreai-models/python/src/coreai_models/export/ios.py
-        # Scaffold is in place; implementation pending fastvlm_decoder_ios.py authoring.
-        parser.error(
-            "iOS export not yet implemented. "
-            "Requires fastvlm_decoder_ios.py with BC1S layout and readonly KV I/O. "
-            "See docs/STATUS.md for details."
-        )
+        # iOS export via fastvlm_ios.py + BaseForCausalLMForiOS + export_ios_model().
+        # Note: iOS exports the TEXT DECODER only (not the full VLM bundle).
+        # The vision encoder (FastViTHD) runs on macOS via vision.aimodel.
+        # An iOS VLM pipeline would need vision.aimodel (macOS) + iOS decoder bundle,
+        # or a future iOS-specific vision encoder export.
+        # This is a known gap in Apple's VLM iOS story — opportunity for a PR.
+        _export_ios(args)
+        return
 
     # Resolve compression config and label
     compression_config: dict | None = None
