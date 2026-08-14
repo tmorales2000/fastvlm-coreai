@@ -18,10 +18,13 @@ NAMED PRESETS (--compression PRESET)
                     — 7× faster than per_block on M4 Pro for 7B.
                     Recommended for 7B and 1.5B.
 
-  8bit              int8 per-channel symmetric. Memory savings only on GPU
-                    (dequantizes to fp16 before compute). NOTE: int8 per_channel
-                    currently shows throughput regression vs fp16 on M4 Pro GPU.
-                    Investigate before using in production.
+  8bit              int8 symmetric_with_clipping per_block block_size=32.
+                    Mirrors Apple's 4bit preset structure with int8 dtype.
+                    Uses global_config (not module_type_configs) matching
+                    Apple's preset pattern. Memory savings vs fp16.
+                    NOTE: Apple ships no int8 macOS preset — this is our
+                    addition. Previous per_channel version regressed to
+                    27 tok/sec and looping output.
 
   none              No quantization — fp16 only.
 
@@ -75,6 +78,10 @@ _COMPOSITE_OP_EXCLUSIONS: dict[str, None] = {
     "coreai_torch.composite_ops.SDPA":        None,
     "coreai_torch.composite_ops.RoPE":        None,
     "coreai_torch.composite_ops.RMSNormImpl": None,
+    # FastVLMRMSNorm has a 1D weight [hidden_size] that causes
+    # "axis 1 out of bounds for rank 1 tensor" with per_block axis=1.
+    # Must be explicitly excluded from all quantization presets.
+    "fastvlm_decoder.FastVLMRMSNorm":         None,
 }
 
 # Full dotted name for nn.Linear as coreai-opt expects it
@@ -138,15 +145,18 @@ MACOS_NAMED_PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     "8bit": {
-        "description": "int8 per_channel symmetric — memory savings, identical throughput on GPU",
+        # int8 symmetric_with_clipping per_block_32, targeting nn.Linear only.
+        # FastVLMRMSNorm excluded via _COMPOSITE_OP_EXCLUSIONS — its 1D weight
+        # [hidden_size] is incompatible with per_block axis=1.
+        "description": "int8 symmetric_with_clipping per_block_32 (nn.Linear only)",
         "quantization_config": {
             "execution_mode": "eager",
             "global_config": None,
             "module_type_configs": {
                 _LINEAR_TYPE: _make_linear_config(
                     dtype="int8",
-                    qscheme="symmetric",
-                    granularity={"type": "per_channel", "axis": 0},
+                    qscheme="symmetric_with_clipping",
+                    granularity={"type": "per_block", "block_size": 32, "axis": 1},
                 ),
                 **_COMPOSITE_OP_EXCLUSIONS,
             },
