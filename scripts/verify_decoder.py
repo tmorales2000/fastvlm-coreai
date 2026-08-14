@@ -48,8 +48,9 @@ sys.path.insert(0, "scripts")
 from fastvlm_decoder import (  # noqa: E402
     FastVLMDecoder,
     FastVLMDecoderStateful,
-    KEY_CACHE_NAME,
-    VALUE_CACHE_NAME,
+    KEY_CACHE_NAME,    # "keyCache" (coreai-models _constants.py, PR #166)
+    VALUE_CACHE_NAME,  # "valueCache"
+    KV_STATE_NAMES,
     _load_decoder_weights,
 )
 from quantization import (  # noqa: E402
@@ -235,7 +236,7 @@ def stage_cache(text_cfg, weights_dir: str, n_prefill: int, n_decode: int) -> bo
     port     = _build_port(text_cfg, weights_dir, torch.float16)
     hidden   = text_cfg.hidden_size
     total    = n_prefill + n_decode
-    max_ctx  = total + 4  # small ceiling sufficient for verification
+    max_ctx  = min(total + 4, 256)  # small ceiling sufficient for verification
 
     # Use fixed random embeds so both paths see identical inputs
     torch.manual_seed(0)

@@ -34,7 +34,7 @@ Compression is specified via one of two mutually exclusive options:
   --platform macOS|iOS
       Target platform (default: macOS). Controls model architecture and compression:
 
-        macOS: linear quantization (int4/int8 via coreai-opt)
+        macOS: linear quantization (int4/int8 via coreai-opt)  [KEY_CACHE_NAME="keyCache"]
                3-component bundle: vision.aimodel + embed.aimodel + {variant}.aimodel
                Stateful KV cache (mutable_slice_update, GPU pattern)
                KV shape: [n_layers, 1, n_kv_heads, max_ctx, head_dim]
@@ -142,8 +142,11 @@ from quantization import (
 # ---------------------------------------------------------------------------
 # Constants (matching vlm/export.py)
 # ---------------------------------------------------------------------------
-QUERY_LEN = 64   # trace-time query length
-OFFSET    = 64   # trace-time position offset
+# Trace constants — match coreai-models/_constants.py (PR #166, Aug 12 2026)
+# QUANT_TRACE_QUERY_LEN = 16, QUANT_TRACE_OFFSET = 8, TRACE_KV_CACHE_SEQ_LEN = 2048
+QUERY_LEN        = 16    # trace-time query length (was 64, now matches Apple's default)
+OFFSET           = 8     # trace-time position offset (was 64)
+TRACE_KV_SEQ_LEN = 2048  # cap trace-time cache at 2048 regardless of max_ctx (avoids crash)
 
 IMAGE_TOKEN       = "<image>"
 IMAGE_SIZE        = 1024
@@ -156,7 +159,9 @@ RESCALE_FACTOR    = 1.0
 ALL_COMPONENTS = ["vision", "embed", "decode"]
 
 # ---------------------------------------------------------------------------
-# iOS-specific constants (matching coreai-models/export/ios.py)
+# iOS-specific constants (moved to coreai-models/_constants.py in PR #168 Aug 13 2026)
+# These match _constants.py exactly — import from there once we depend on
+# the coreai-models Python package directly.
 # ---------------------------------------------------------------------------
 # iOS uses 4 entrypoints in a single .aimodel vs macOS's 3 separate .aimodel files
 IOS_LOAD_EMBEDDINGS_FN    = "load_embeddings"
@@ -402,7 +407,8 @@ def _export_decode(
 
     if compression_config is not None:
         print(f"[INFO] Applying compression: {compression_label}")
-        ex_k = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+        trace_kv_len = min(TRACE_KV_SEQ_LEN, max_ctx)
+        ex_k = torch.zeros(n_layers, 1, n_kv_heads, trace_kv_len, head_dim, dtype=torch.float16)
         ex_v = torch.zeros_like(ex_k)
         example_inputs = (
             torch.randn(1, QUERY_LEN, hidden, dtype=torch.float16),
@@ -415,7 +421,10 @@ def _export_decode(
         )
         print(f"[INFO] Compression finalized for CoreAI export")
 
-    k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+    # Cap trace-time cache at TRACE_KV_SEQ_LEN to bound peak trace memory.
+    # Matches Apple's _build_reference_inputs logic: min(TRACE_KV_CACHE_SEQ_LEN, max_ctx)
+    trace_kv_len = min(TRACE_KV_SEQ_LEN, max_ctx)
+    k_cache = torch.zeros(n_layers, 1, n_kv_heads, trace_kv_len, head_dim, dtype=torch.float16)
     v_cache = torch.zeros_like(k_cache)
 
     reference_inputs = {

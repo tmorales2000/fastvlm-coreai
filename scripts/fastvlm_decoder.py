@@ -15,7 +15,7 @@ DESIGN
 2. K_CACHE / V_CACHE AS EXPLICIT FORWARD ARGS
    Matching Qwen3VLForCausalLMEmbeddings.forward() exactly:
      forward(inputs_embeds, position_ids, k_cache, v_cache) -> logits
-   State names: "k_cache" / "v_cache" matching KV_STATE_NAMES in vlm/export.py.
+   State names: "keyCache" / "valueCache" matching _constants.py in coreai-models (PR #166).
    At runtime the coreai-torch compiler renames these to keyCache/valueCache
    (camelCase) for Swift CoreAISequentialVLMEngine compatibility.
 
@@ -52,9 +52,11 @@ import torch.nn as nn
 from coreai_torch.composite_ops import RMSNormImpl, RoPE, SDPA
 from safetensors import safe_open
 
-# State names — must match KV_STATE_NAMES in coreai-models/vlm/export.py
-KEY_CACHE_NAME   = "k_cache"
-VALUE_CACHE_NAME = "v_cache"
+# State names — must match KEY_CACHE_NAME / VALUE_CACHE_NAME in
+# coreai-models/python/src/coreai_models/_constants.py (PR #166, Aug 12 2026).
+# Changed from "k_cache"/"v_cache" to camelCase "keyCache"/"valueCache".
+KEY_CACHE_NAME   = "keyCache"
+VALUE_CACHE_NAME = "valueCache"
 KV_STATE_NAMES   = (KEY_CACHE_NAME, VALUE_CACHE_NAME)
 
 
