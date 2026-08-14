@@ -245,13 +245,16 @@ def load_compression_config(
             "iOS export is not yet implemented."
         )
 
-    # Named preset
+    # Named preset (string) or YAML file (string or Path)
     if isinstance(source, str):
         if source == "none":
             return None, "none"
 
-        # Check macOS presets first, then iOS
-        if source in MACOS_NAMED_PRESETS:
+        # If it looks like a file path, convert to Path and fall through
+        source_path = Path(source)
+        if source_path.suffix in ('.yaml', '.yml') or '/' in source or '\\' in source:
+            source = source_path
+        elif source in MACOS_NAMED_PRESETS:
             if platform == "iOS":
                 raise ValueError(
                     f"Preset {source!r} is a macOS linear quantization preset. "
@@ -261,25 +264,21 @@ def load_compression_config(
             config = dict(entry["quantization_config"])
             _build_quantizer_config(config)
             return config, source
-
-        if source in IOS_NAMED_PRESETS:
+        elif source in IOS_NAMED_PRESETS:
             if platform == "macOS":
                 raise ValueError(
                     f"Preset {source!r} is an iOS palettization preset. "
                     f"For macOS use: {', '.join(MACOS_NAMED_PRESETS.keys())}."
                 )
-            entry = IOS_NAMED_PRESETS[source]
-            # iOS palettization config is returned as-is — caller must use
-            # apply_palettization_from_config(), not apply_quantization_from_config()
-            return dict(entry), source
-
-        available_macos = ", ".join(MACOS_NAMED_PRESETS.keys())
-        available_ios   = ", ".join(IOS_NAMED_PRESETS.keys())
-        raise KeyError(
-            f"Unknown compression preset: {source!r}. "
-            f"macOS presets: {available_macos}, none. "
-            f"iOS presets: {available_ios}, none."
-        )
+            return dict(IOS_NAMED_PRESETS[source]), source
+        else:
+            available_macos = ", ".join(MACOS_NAMED_PRESETS.keys())
+            available_ios   = ", ".join(IOS_NAMED_PRESETS.keys())
+            raise KeyError(
+                f"Unknown compression preset: {source!r}. "
+                f"macOS presets: {available_macos}, none. "
+                f"iOS presets: {available_ios}, none."
+            )
 
     # YAML file — use QuantizerConfig.from_yaml() directly
     path = Path(source)

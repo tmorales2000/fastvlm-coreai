@@ -27,20 +27,25 @@ Usage:
     python scripts/scan_quantization_sensitivity.py --variant 0.5b --local-only
 
 Output:
-    quantization_recipes/fastvlm-{variant}.json
+    quantization_recipes/fastvlm-{variant}-conservative.yaml
+    quantization_recipes/fastvlm-{variant}-aggressive.yaml
 
-    Contains two recipes:
-      "conservative" — mostly int8, sensitive layers kept fp16
-      "aggressive"   — mostly int4, int8 for moderately sensitive, fp16 for critical
+    Two YAML recipes in QuantizerConfig format, loadable by load_compression_config():
+      conservative — mostly int8, sensitive layers kept fp16
+      aggressive   — mostly int4, int8 for moderately sensitive, fp16 for critical
+
+    Recipes use module_name_configs for per-layer targeting.
+    Requires coreai-opt >= 0.2.2.dev0 (install from local source).
 
     Use with:
       python scripts/export_fastvlm.py --variant 0.5b \\
-          --quantize-recipe quantization_recipes/fastvlm-0.5b.json::conservative
+          --compression-config quantization_recipes/fastvlm-0.5b-conservative.yaml
+      python scripts/export_fastvlm.py --variant 0.5b \\
+          --compression-config quantization_recipes/fastvlm-0.5b-aggressive.yaml
 """
 
 import argparse
 import copy
-import json
 import sys
 import time
 from dataclasses import dataclass, field
@@ -66,16 +71,18 @@ DEFAULT_CALIBRATION_DIR = REPO_ROOT / "test_assets" / "images"
 DEFAULT_OUTPUT_DIR      = REPO_ROOT / "quantization_recipes"
 
 # ── Sensitivity thresholds ────────────────────────────────────────────────────
-# Local sensitivity: Frobenius norm ratio of (W_fp16 - W_quant) / W_fp16
-# KL sensitivity: KL divergence of output logits before/after quantization
+# Local thresholds are computed automatically from the observed score distribution
+# using percentiles of the actual data — avoiding overquantization when all scores
+# cluster in a narrow range (observed with FastVLM 0.5B: all layers 0.008-0.016,
+# an order of magnitude below hardcoded defaults of 0.04-0.08).
+# Override with --critical-percentile and --sensitive-percentile.
 
-# Layer is "critical" (keep fp16) if above these thresholds
-CRITICAL_LOCAL_THRESHOLD       = 0.08   # >8% weight error → fp16
-CRITICAL_KL_THRESHOLD          = 0.20   # >0.20 nats KL divergence → fp16
+DEFAULT_CRITICAL_PERCENTILE  = 90   # top 10% most sensitive → fp16
+DEFAULT_SENSITIVE_PERCENTILE = 70   # next 20% → int8 in aggressive recipe
 
-# Layer is "sensitive" (use int8 in aggressive recipe) if above these
-SENSITIVE_LOCAL_THRESHOLD      = 0.04   # >4% weight error → int8 in aggressive
-SENSITIVE_KL_THRESHOLD         = 0.05   # >0.05 nats KL divergence → int8 in aggressive
+# KL thresholds remain fixed (KL divergence is already a calibrated metric)
+CRITICAL_KL_THRESHOLD  = 0.20   # >0.20 nats → fp16
+SENSITIVE_KL_THRESHOLD = 0.05   # >0.05 nats → int8 in aggressive
 
 # Layers always kept at fp16 regardless of sensitivity
 ALWAYS_FP16_PATTERNS = [
@@ -111,30 +118,49 @@ class LayerSensitivity:
         return any(p in self.name for p in ALWAYS_FP16_PATTERNS)
 
 
-def quantize_int8_fake(weight: torch.Tensor) -> torch.Tensor:
-    """Simulate int8 weight quantization (per-channel, symmetric)."""
-    scale = weight.abs().max(dim=-1, keepdim=True).values / 127.0
+def _fake_quantize_per_block_32(
+    weight: torch.Tensor, bits: int
+) -> torch.Tensor:
+    """Simulate symmetric_with_clipping per_block_32 axis=1 quantization.
+
+    Matches the scheme used in our named presets (4bit and 8bit).
+    Clips the quantization range symmetrically:
+      int8: (-127, 127)  — not (-128, 127)
+      int4: (-7, 7)      — not (-8, 7)
+    This is what symmetric_with_clipping does in coreai-opt.
+    """
+    W = weight.float()
+    out_dim, in_dim = W.shape
+    block_size = 32
+    # Pad input dim to multiple of block_size if needed
+    pad = (block_size - in_dim % block_size) % block_size
+    if pad:
+        W = torch.nn.functional.pad(W, (0, pad))
+    # Reshape to [out_dim * n_blocks, block_size]
+    n_blocks = W.shape[1] // block_size
+    W_blocks = W.reshape(out_dim * n_blocks, block_size)
+    # Symmetric clipping: max_val = max(|w|), clip range = (-max_val, max_val)
+    max_val = W_blocks.abs().max(dim=-1, keepdim=True).values
+    clip_val = 127.0 if bits == 8 else 7.0
+    scale = max_val / clip_val
     scale = scale.clamp(min=1e-8)
-    quantized = (weight / scale).round().clamp(-128, 127)
-    return quantized * scale
+    q = (W_blocks / scale).round().clamp(-clip_val, clip_val)
+    W_dq = (q * scale).reshape(out_dim, -1)[:, :in_dim]
+    return W_dq.to(weight.dtype)
+
+
+def quantize_int8_fake(weight: torch.Tensor) -> torch.Tensor:
+    """Simulate int8 symmetric_with_clipping per_block_32 quantization."""
+    if weight.dim() != 2:
+        return weight  # skip non-2D (shouldn't happen for nn.Linear)
+    return _fake_quantize_per_block_32(weight, bits=8)
 
 
 def quantize_int4_fake(weight: torch.Tensor) -> torch.Tensor:
-    """Simulate int4 weight quantization (per-channel, symmetric, 16-element groups)."""
-    W = weight
-    group_size = 16
-    orig_shape = W.shape
-    if W.numel() >= group_size and W.shape[-1] >= group_size:
-        W = W.reshape(-1, group_size)
-        scale = W.abs().max(dim=-1, keepdim=True).values / 7.0
-        scale = scale.clamp(min=1e-8)
-        quantized = (W / scale).round().clamp(-8, 7)
-        return (quantized * scale).reshape(orig_shape)
-    else:
-        # Too small for group quantization — use per-tensor
-        scale = W.abs().max() / 7.0
-        scale = scale.clamp(min=1e-8)
-        return (W / scale).round().clamp(-8, 7) * scale
+    """Simulate int4 symmetric_with_clipping per_block_32 quantization."""
+    if weight.dim() != 2:
+        return weight  # skip non-2D
+    return _fake_quantize_per_block_32(weight, bits=4)
 
 
 def local_sensitivity(weight: torch.Tensor, bits: int = 8) -> float:
@@ -284,15 +310,70 @@ def scan_layer(
     return local_sens, avg_kl
 
 
+def compute_thresholds(
+    sensitivities: list[LayerSensitivity],
+    critical_percentile: int,
+    sensitive_percentile: int,
+) -> tuple[float, float, dict]:
+    """Compute sensitivity thresholds from the observed score distribution.
+
+    Uses percentiles of actual data rather than hardcoded values, avoiding
+    overquantization when all scores cluster in a narrow range. Also reports
+    elbow detection (largest gap in sorted scores) as a sanity check — if no
+    clear elbow exists, the distribution is uniform and percentile-based
+    thresholds are the best available heuristic.
+
+    Returns (critical_threshold, sensitive_threshold, stats_dict).
+    """
+    import statistics
+    scores = [s.local_sensitivity for s in sensitivities if not s.is_always_fp16]
+    if not scores:
+        return 0.08, 0.04, {}
+
+    scores_sorted = sorted(scores)
+    n = len(scores_sorted)
+
+    def percentile(p: int) -> float:
+        idx = max(0, min(n - 1, int(n * p / 100)))
+        return scores_sorted[idx]
+
+    critical_thresh  = percentile(critical_percentile)
+    sensitive_thresh = percentile(sensitive_percentile)
+
+    # Elbow: largest gap between consecutive sorted scores
+    gaps = [(scores_sorted[i+1] - scores_sorted[i], i)
+            for i in range(len(scores_sorted) - 1)]
+    if gaps:
+        largest_gap_val, largest_gap_idx = max(gaps)
+        elbow_value = scores_sorted[largest_gap_idx + 1]
+    else:
+        largest_gap_val, elbow_value = 0.0, critical_thresh
+
+    stats = {
+        "min":    scores_sorted[0],
+        "max":    scores_sorted[-1],
+        "mean":   statistics.mean(scores),
+        "stdev":  statistics.stdev(scores) if len(scores) > 1 else 0.0,
+        "median": statistics.median(scores),
+        f"p{critical_percentile}":  critical_thresh,
+        f"p{sensitive_percentile}": sensitive_thresh,
+        "largest_gap": largest_gap_val,
+        "elbow_value": elbow_value,
+        "n_scannable": n,
+    }
+    return critical_thresh, sensitive_thresh, stats
+
+
 def assign_dtype(
     sens: LayerSensitivity,
-    recipe_type: str,  # "conservative" or "aggressive"
+    recipe_type: str,
+    critical_thresh: float = 0.08,
+    sensitive_thresh: float = 0.04,
 ) -> str:
-    """Assign quantization dtype based on sensitivity scores."""
+    """Assign quantization dtype based on sensitivity and computed thresholds."""
     if sens.is_always_fp16:
         return "fp16"
 
-    # Use combined score (weight local sensitivity more if no KL)
     has_kl = sens.kl_sensitivity > 0
     score = (
         0.5 * sens.local_sensitivity + 0.5 * sens.kl_sensitivity
@@ -301,19 +382,16 @@ def assign_dtype(
     kl = sens.kl_sensitivity
 
     if recipe_type == "conservative":
-        # Aggressive thresholds — keep more fp16
-        if score > CRITICAL_LOCAL_THRESHOLD or kl > CRITICAL_KL_THRESHOLD:
+        if score >= critical_thresh or kl > CRITICAL_KL_THRESHOLD:
             return "fp16"
-        elif score > SENSITIVE_LOCAL_THRESHOLD or kl > SENSITIVE_KL_THRESHOLD:
+        elif score >= sensitive_thresh or kl > SENSITIVE_KL_THRESHOLD:
             return "fp16"
         else:
             return "int8"
-
     else:  # aggressive
-        # Permissive thresholds — quantize more
-        if score > CRITICAL_LOCAL_THRESHOLD or kl > CRITICAL_KL_THRESHOLD:
+        if score >= critical_thresh or kl > CRITICAL_KL_THRESHOLD:
             return "fp16"
-        elif score > SENSITIVE_LOCAL_THRESHOLD or kl > SENSITIVE_KL_THRESHOLD:
+        elif score >= sensitive_thresh or kl > SENSITIVE_KL_THRESHOLD:
             return "int8"
         else:
             return "int4"
@@ -337,32 +415,90 @@ def print_sensitivity_table(sensitivities: list[LayerSensitivity]) -> None:
         )
 
 
-def build_recipe(sensitivities: list[LayerSensitivity]) -> dict:
-    """Build the recipe JSON from sensitivity results."""
-    conservative = {}
-    aggressive   = {}
-    stats_c = {"fp16": 0, "int8": 0, "int4": 0}
-    stats_a = {"fp16": 0, "int8": 0, "int4": 0}
+def _dtype_to_layer_config(dtype: str) -> dict | None:
+    """Build a module_name_configs entry for a given dtype assignment.
+
+    Returns None for fp16 (exclude this layer from quantization entirely).
+    Returns symmetric_with_clipping per_block_32 config for int8/int4,
+    matching the named presets in quantization.py (4bit and 8bit).
+    """
+    if dtype == "fp16":
+        return None
+    return {
+        "op_state_spec": {
+            "weight": {
+                "dtype": dtype,
+                "qscheme": "symmetric_with_clipping",
+                "granularity": {
+                    "type": "per_block",
+                    "block_size": 32,
+                    "axis": 1,
+                },
+            }
+        },
+        "op_input_spec": None,
+        "op_output_spec": None,
+    }
+
+
+def build_yaml_recipe(
+    sensitivities: list[LayerSensitivity],
+    recipe_type: str,
+) -> tuple[dict, dict]:
+    """Build a QuantizerConfig-compatible dict for the given recipe type.
+
+    Uses module_type_configs for the base dtype (applied to all nn.Linear)
+    and module_name_configs for per-layer overrides where the layer's
+    assigned dtype differs from the base.
+
+    For conservative: base=int8, overrides fp16 for sensitive layers.
+    For aggressive:   base=int4, overrides int8 or fp16 for sensitive layers.
+
+    Returns (recipe_dict, summary_dict).
+    """
+    # Import here to avoid circular dependency
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from quantization import _LINEAR_TYPE, _COMPOSITE_OP_EXCLUSIONS
+
+    base_dtype = "int8" if recipe_type == "conservative" else "int4"
+    module_name_configs: dict = {}
+    stats: dict = {}
 
     for s in sensitivities:
-        conservative[s.name] = s.recommended_int8
-        aggressive[s.name]   = s.recommended_int4
-        stats_c[s.recommended_int8] = stats_c.get(s.recommended_int8, 0) + 1
-        stats_a[s.recommended_int4] = stats_a.get(s.recommended_int4, 0) + 1
+        assigned = s.recommended_int8 if recipe_type == "conservative" else s.recommended_int4
+        stats[assigned] = stats.get(assigned, 0) + 1
 
-    return {
-        "generated_by": "scan_quantization_sensitivity.py",
-        "conservative": {
-            "_summary": stats_c,
-            "_description": "Mostly int8. Sensitive layers kept fp16. Lower quality risk.",
-            "layers": conservative,
-        },
-        "aggressive": {
-            "_summary": stats_a,
-            "_description": "Mostly int4. int8 for moderately sensitive. Maximum compression.",
-            "layers": aggressive,
+        if assigned != base_dtype:
+            # This layer needs an override (different dtype or fp16 exclusion)
+            module_name_configs[s.name] = _dtype_to_layer_config(assigned)
+
+    recipe = {
+        "quantization_config": {
+            "execution_mode": "eager",
+            "global_config": None,
+            "module_type_configs": {
+                _LINEAR_TYPE: {
+                    "op_state_spec": {
+                        "weight": {
+                            "dtype": base_dtype,
+                            "qscheme": "symmetric_with_clipping",
+                            "granularity": {
+                                "type": "per_block",
+                                "block_size": 32,
+                                "axis": 1,
+                            },
+                        }
+                    },
+                    "op_input_spec": None,
+                    "op_output_spec": None,
+                },
+                **_COMPOSITE_OP_EXCLUSIONS,
+            },
+            "module_name_configs": module_name_configs,
         },
     }
+    return recipe, stats
 
 
 def main() -> None:
@@ -388,6 +524,15 @@ def main() -> None:
                         help=f"Output directory for recipe JSON (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--device", choices=["cpu", "mps"], default="mps",
                         help="Device (default: mps)")
+    parser.add_argument("--critical-percentile", type=int,
+                        default=DEFAULT_CRITICAL_PERCENTILE,
+                        help=f"Layers above this local sensitivity percentile stay fp16 "
+                             f"(default: {DEFAULT_CRITICAL_PERCENTILE} = top 10%% most sensitive). "
+                             f"Lower = more fp16 layers (safer). Higher = more quantized (smaller).")
+    parser.add_argument("--sensitive-percentile", type=int,
+                        default=DEFAULT_SENSITIVE_PERCENTILE,
+                        help=f"Layers above this percentile use int8 in aggressive recipe "
+                             f"(default: {DEFAULT_SENSITIVE_PERCENTILE} = top 30%% most sensitive).")
     args = parser.parse_args()
 
     key = (args.model.lower(), args.variant.lower())
@@ -499,8 +644,8 @@ def main() -> None:
                 kl_sensitivity=kl_8,
                 dtype=str(param.dtype).replace("torch.", ""),
             )
-            s.recommended_int8 = assign_dtype(s, "conservative")
-            s.recommended_int4 = assign_dtype(s, "aggressive")
+            s.recommended_int8 = assign_dtype(s, "conservative", 999.0, 999.0)
+            s.recommended_int4 = assign_dtype(s, "aggressive",   999.0, 999.0)
 
         sensitivities.append(s)
 
@@ -517,27 +662,63 @@ def main() -> None:
 
     print(f"\nScan complete in {time.time()-t_total:.1f}s")
 
+    # Compute thresholds from observed distribution — data-driven, not hardcoded
+    critical_thresh, sensitive_thresh, dist_stats = compute_thresholds(
+        sensitivities, args.critical_percentile, args.sensitive_percentile
+    )
+    print(f"\nSensitivity distribution ({dist_stats['n_scannable']} scannable layers):")
+    print(f"  min={dist_stats['min']:.4f}  median={dist_stats['median']:.4f}  "
+          f"max={dist_stats['max']:.4f}  stdev={dist_stats['stdev']:.4f}")
+    print(f"  p{args.critical_percentile}={dist_stats[f'p{args.critical_percentile}']:.4f}  "
+          f"p{args.sensitive_percentile}={dist_stats[f'p{args.sensitive_percentile}']:.4f}")
+    print(f"  largest gap={dist_stats['largest_gap']:.5f}  "
+          f"elbow={dist_stats['elbow_value']:.4f}")
+    if dist_stats['largest_gap'] < 0.001:
+        print(f"  ⚠ No clear elbow — scores are uniformly distributed.")
+        print(f"    Percentile-based thresholds are the best available heuristic.")
+        print(f"    Consider running with --critical-percentile / --sensitive-percentile")
+        print(f"    to tune, or run without --local-only for KL divergence confirmation.")
+    print(f"\nAuto-computed thresholds:")
+    print(f"  critical  (→ fp16):               {critical_thresh:.4f}  "
+          f"[top {100-args.critical_percentile}% of layers]")
+    print(f"  sensitive (→ int8 in aggressive):  {sensitive_thresh:.4f}  "
+          f"[top {100-args.sensitive_percentile}% of layers]")
+
+    # Re-assign dtypes using computed thresholds
+    for s in sensitivities:
+        if not s.is_always_fp16:
+            s.recommended_int8 = assign_dtype(s, "conservative",
+                                               critical_thresh, sensitive_thresh)
+            s.recommended_int4 = assign_dtype(s, "aggressive",
+                                               critical_thresh, sensitive_thresh)
+
     # Print summary table
     print_sensitivity_table(sensitivities)
 
-    # Build and save recipe
-    recipe = build_recipe(sensitivities)
+    # Build and save YAML recipes
+    import yaml
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output_dir / f"fastvlm-{args.variant}.json"
-    output_path.write_text(json.dumps(recipe, indent=2))
-    print(f"\nRecipe written to: {output_path}")
 
-    # Print summary
-    c = recipe["conservative"]["_summary"]
-    a = recipe["aggressive"]["_summary"]
-    print(f"\nConservative recipe: {c.get('fp16',0)} fp16, {c.get('int8',0)} int8, {c.get('int4',0)} int4")
-    print(f"Aggressive recipe:   {a.get('fp16',0)} fp16, {a.get('int8',0)} int8, {a.get('int4',0)} int4")
-    print(f"\nUse with:")
-    print(f"  python scripts/export_fastvlm.py --variant {args.variant} \\")
-    print(f"      --quantize-recipe {output_path}::conservative")
-    print(f"  python scripts/export_fastvlm.py --variant {args.variant} \\")
-    print(f"      --quantize-recipe {output_path}::aggressive")
+    for recipe_type in ("conservative", "aggressive"):
+        recipe, stats = build_yaml_recipe(sensitivities, recipe_type)
+        output_path = args.output_dir / f"fastvlm-{args.variant}-{recipe_type}.yaml"
+
+        with output_path.open("w") as fh:
+            fh.write(f"# Generated by: scan_quantization_sensitivity.py\n")
+            fh.write(f"# Recipe type:  {recipe_type}\n")
+            fh.write(f"# Variant:      fastvlm-{args.variant}\n")
+            fh.write(f"# Summary:      {stats}\n")
+            fh.write("#\n")
+            yaml.dump(recipe, fh, default_flow_style=False, sort_keys=False)
+
+        print(f"\n{recipe_type.capitalize()} recipe → {output_path}")
+        print(f"  {stats.get('fp16',0)} fp16  "
+              f"{stats.get('int8',0)} int8  "
+              f"{stats.get('int4',0)} int4")
+        print(f"  Use with:")
+        print(f"    python scripts/export_fastvlm.py --variant {args.variant} \\")
+        print(f"        --compression-config {output_path}")
 
 
 if __name__ == "__main__":
