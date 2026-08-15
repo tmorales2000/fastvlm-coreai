@@ -655,15 +655,16 @@ def main():
     compression_group = parser.add_mutually_exclusive_group()
     compression_group.add_argument(
         "--compression",
-        choices=list(MACOS_NAMED_PRESETS.keys()) + ["none"],
+        choices=["4bit", "8bit", "none"],
         default=None,
         metavar="PRESET",
         help=(
-            f"Named compression preset. Available: "
-            f"{', '.join(MACOS_NAMED_PRESETS.keys())}, none. "
-            f"Default: none (fp16). "
-            f"4bit = int4 symmetric_with_clipping per_block_32 (Apple macOS standard). "
-            f"8bit = int8 per_channel symmetric."
+            "Named compression preset (default: none = fp16). "
+            "Matches Apple's coreai.llm.export --compression options. "
+            "4bit: int4 symmetric_with_clipping per_block_32 (Apple macOS standard). "
+            "8bit: int8 symmetric_with_clipping per_block_32 (our addition). "
+            "For per_channel int4 (7× faster GPU throughput), use: "
+            "--compression-config quantization_recipes/4bit_per_channel.yaml"
         ),
     )
     compression_group.add_argument(
