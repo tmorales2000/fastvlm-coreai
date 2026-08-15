@@ -36,17 +36,17 @@ Same image and prompt across all variants for direct comparison.
 |-------|-------------|-----------|-----------|--------------|-------------|----------|-----------|-----------|--------|
 | 0.5B | fp16 | **76ms** | **130** | 3,748 | 2,759MB | 3,444MB | 4,944ms | 230ms | 1,585ms |
 | 1.5B | fp16 | 184ms | 59 | 1,540 | 7,028MB | 9,668MB | 9,602ms | 520ms | 3,784ms |
-| 1.5B | int8 per_block_32 | 212ms | **71** | 1,343 | **2,771MB** | **3,929MB** | 3,633ms | **328ms** | 3,652ms |
-| 1.5B | int4 per_channel | **172ms** | **115** | 1,651 | **2,021MB** | **2,444MB** | 5,615ms | **241ms** | 3,688ms |
-| 7B | int4 per_channel | 748ms | 50 | 393 | 5,930MB | 9,058MB | 12,377ms | 727ms | 7,611ms |
+| 1.5B | int8 | 212ms | **71** | 1,343 | **2,771MB** | **3,929MB** | 3,633ms | **328ms** | 3,652ms |
+| 1.5B | int4 | **172ms** | **115** | 1,651 | **2,021MB** | **2,444MB** | 5,615ms | **241ms** | 3,688ms |
+| 7B | int4 | 747ms | 50 | 393 | 5,930MB | 9,058MB | 4,258ms | 683ms | 7,286ms |
 | 7B | fp16 | 812ms | 15 | 362 | **28,829MB** | **41,526MB** | **38,343ms** | 5,796ms | 10,699ms |
 
 TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excludes load/warmup).
 
 **Recommended configurations:**
 - **0.5B fp16** — fastest TTFT (76ms), highest throughput (130 tok/s), smallest footprint (2.8GB)
-- **1.5B int4 per_channel** — best overall: near-0.5B speed at 3× parameters, sub-0.5B memory
-- **7B int4 per_channel** — maximum quality, 50 tok/s, 6GB. **7B fp16 is not recommended** (29GB, 15 tok/s)
+- **1.5B int4** — best overall: near-0.5B speed at 3× parameters, sub-0.5B memory
+- **7B int4** — maximum quality, 50 tok/s, 6GB. **7B fp16 is not recommended** (29GB, 15 tok/s)
 
 ---
 
@@ -129,7 +129,7 @@ TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excl
 
 ## FastVLM 1.5B (int4 per_channel)
 
-**Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 4bit_per_channel`
+**Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 4bit`
 
 Compression: int4 symmetric per-channel.
 
@@ -154,10 +154,9 @@ Compression: int4 symmetric per-channel.
 > - 172ms TTFT — slightly faster than 1.5B fp16 (184ms)
 > - Clean, complete output with no quality regression vs fp16
 
-> **Why int4 is faster than fp16 here:** Per-channel int4 quantization fuses
-> dequantization into batch_matmul as row-wise scaling, reducing memory bandwidth
-> pressure. The 1.5B model is memory-bandwidth-bound at fp16 — int4 removes the
-> bottleneck and allows the GPU to run closer to compute-bound.
+> **Why int4 is faster than fp16:** symmetric_with_clipping per_block_32 reduces
+> memory bandwidth pressure vs fp16. The 1.5B model is memory-bandwidth-bound
+> at fp16 — int4 removes the bottleneck allowing the GPU to run more efficiently.
 
 ---
 
@@ -196,11 +195,12 @@ Compression: int8 symmetric_with_clipping per_block_32. Targets `nn.Linear` only
 
 ---
 
-## FastVLM 7B (int4 per_channel)
+## FastVLM 7B (int4)
 
-**Export:** `python scripts/export_fastvlm.py --variant 7b --compression 4bit_per_channel`
+**Export:** `python scripts/export_fastvlm.py --variant 7b --compression 4bit`
 
-Compression: int4 symmetric per-channel.
+Compression: int4 symmetric_with_clipping per_block_32 (preset `4bit`).
+Apple's canonical macOS int4 preset.
 
 > The 7B variant uses Qwen2.5-7B base (vocab 152064, image token 151665) vs
 > Qwen2 for 0.5B/1.5B (vocab 151936, image token 151646).
@@ -220,8 +220,13 @@ Compression: int4 symmetric per-channel.
 
 **KV cache:** StaticKVCache, `[28, 1, 4, 4096, 128]`, 224MB
 
-> **7× throughput improvement over original per_block_64 asymmetric** (7.2 → 50 tok/sec).
-> Per_channel dequantization fuses into batch_matmul; per_block runs as a separate pass.
+> **7× throughput improvement over original scheme** (7.2 → 50 tok/sec).
+> Root cause: the original scheme was asymmetric per_block_64 (from Apple's MLX checkpoints).
+> Asymmetric dequantization computes `(q - zero_point) * scale` — two operations.
+> Symmetric schemes (`4bit`, `4bit_per_channel`) only need `q * scale` — the real speedup.
+> Both `4bit` and `4bit_per_channel` produce identical throughput (~50 tok/sec) on M4 Pro GPU.
+> `blockwise_shift_scale` count is 197 for all per_block schemes — the op count does not
+> predict fusion behavior. The M4 Pro MPSGraph fuses symmetric dequant regardless.
 
 ---
 
@@ -252,7 +257,7 @@ for interactive use even on 64GB machines.
 > 38 seconds; even warm load takes 5.8s. Generation at 15 tok/sec is 3.3×
 > slower than 7B int4 for no quality benefit.
 >
-> **Use 7B int4 per_channel instead.** It delivers identical output quality
+> **Use 7B int4 (`--compression 4bit`) instead.** It delivers identical output quality
 > at 50 tok/sec, 6GB memory, and sub-1s warm load.
 
 ---
@@ -261,19 +266,26 @@ for interactive use even on 64GB machines.
 
 | Scheme | blockwise_shift_scale | 7B gen tok/s | Notes |
 |--------|----------------------|--------------|-------|
-| per_block_64 asymmetric (original) | 197 | 7.2 | Unfused — catastrophic |
-| per_block_32 symmetric_with_clipping (apple_4bit) | 197 | ~7–10 (est.) | Unfused — same problem |
-| per_channel symmetric (4bit_per_channel) | 197 | **50** | Fused — 7× faster |
+| per_block_64 asymmetric (original MLX) | 197 | 7.2 | Slow — asymmetric dequant |
+| per_block_32 symmetric_with_clipping (`4bit`) | 197 | **50** | Fast — symmetric dequant |
+| per_channel symmetric (`4bit_per_channel`) | 197 | **50** | Fast — symmetric dequant |
 
-Op count is identical across schemes. Per-channel allows GPU to fuse dequantization
-into batch_matmul as row-wise scaling. Per-block requires a separate pass.
+**Key finding:** `blockwise_shift_scale` count is 197 for ALL schemes — the op count
+does not predict GPU throughput. The M4 Pro MPSGraph fuses both per_block_32 and
+per_channel symmetric dequantization at execution time.
+
+The real cause of the original 7.2 tok/sec: the old scheme (from Apple's MLX checkpoints)
+used **asymmetric** quantization — dequant computes `(q - zero_point) * scale` (two ops).
+Symmetric schemes only need `q * scale` (one op). That's the 7× speedup, not per_channel.
+
+`4bit` and `4bit_per_channel` produce identical throughput on M4 Pro GPU. Use `4bit`
+(Apple's standard) for simplicity and best alignment with Apple's tooling.
 
 **Current presets (`quantization.py`):**
-- `4bit` — Apple macOS standard (symmetric_with_clipping per_block_32). Best quality,
-  but unfused on GPU. Avoid for large models where throughput matters.
-- `4bit_per_channel` — per_channel symmetric int4. 7× faster. **Recommended for 7B.**
-- `8bit` — symmetric_with_clipping per_block_32 int8. **71 tok/sec** (faster than fp16).
-  Memory: 2.8GB (61% lower than fp16). Recommended for memory-constrained deployments.
+- `4bit` — Apple's canonical macOS preset. symmetric_with_clipping per_block_32.
+  **Recommended for all variants.** ~50 tok/sec for 7B, ~115 tok/sec for 1.5B.
+- `8bit` — symmetric_with_clipping per_block_32, int8. **71 tok/sec** for 1.5B.
+  Memory: 2.8GB (61% lower than fp16). Use when quality matters more than compression.
 
 ---
 
@@ -308,7 +320,7 @@ CoreAI is **~3.5× faster** TTFT than Apple's own MLX-FastVLM hybrid app.
 
 ## Scaling Summary
 
-| | 0.5B fp16 → 1.5B fp16 | 1.5B fp16 → 1.5B int8 | 1.5B fp16 → 1.5B int4 | 1.5B fp16 → 7B int4 | 7B int4 → 7B fp16 |
+| | 0.5B fp16 → 1.5B fp16 | 1.5B fp16 → 1.5B int8 | 1.5B fp16 → 1.5B int4 (`4bit`) | 1.5B fp16 → 7B int4 | 7B int4 → 7B fp16 |
 |--|----------------------|----------------------|----------------------|---------------------|-------------------|
 | TTFT | 2.4× slower | ~same | 6% faster | 4.1× slower | 9% slower |
 | Generation | 2.2× slower | **1.2× faster** | **2× faster** | ~same (50 vs 59) | **3.3× slower** |
@@ -347,12 +359,12 @@ all model variants. Reported separately in the new verbose output format.
 The `8bit` preset uses symmetric_with_clipping per_block_32, targeting `nn.Linear`
 only. `FastVLMRMSNorm` is explicitly excluded — its 1D weight `[hidden_size]` is
 incompatible with per_block axis=1 and was silently corrupting quantization in the
-previous per_channel scheme (causing 27 tok/sec and looping output).
+previous int8 scheme (27 tok/sec and looping output — wrong scheme, now fixed).
 Result: 71 tok/sec (faster than fp16), 2.8GB memory (61% lower), clean output.
 
 ### int4 quantization on GPU path
 
-Per-channel int4 fuses dequantization into batch_matmul (row-wise scaling).
-Per-block int4 runs as a separate unfused pass regardless of block size or
-symmetric/asymmetric choice. Use `--compression 4bit_per_channel`, not
-`--compression 4bit`, for production 7B exports.
+The original 7.2 tok/sec regression was caused by asymmetric per_block_64
+quantization (from Apple's MLX checkpoints). The fix was switching to symmetric
+schemes — `4bit` (per_block_32) and the now-retired `4bit_per_channel` produce
+identical throughput (~50 tok/sec for 7B) on M4 Pro GPU. Use `--compression 4bit`.

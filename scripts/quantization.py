@@ -9,41 +9,45 @@ Requires coreai-opt >= 0.2.2.dev0 (install from local source):
 
 NAMED PRESETS (--compression PRESET)
 --------------------------------------
-  4bit              Apple's canonical macOS int4 preset.
-                    symmetric_with_clipping per_block block_size=32.
-                    Best quality for int4. Unfused on GPU (blockwise_shift_scale).
-                    Use when quality matters more than throughput.
+Mirrors Apple's coreai.llm.export --compression options (macOS):
 
-  4bit_per_channel  int4 per-channel symmetric. Fuses with batch_matmul on GPU
-                    — 7× faster than per_block on M4 Pro for 7B.
-                    Recommended for 7B and 1.5B.
+  4bit   Apple's canonical macOS int4 preset.
+         symmetric_with_clipping per_block block_size=32 axis=1.
 
-  8bit              int8 symmetric_with_clipping per_block block_size=32.
-                    Mirrors Apple's 4bit preset structure with int8 dtype.
-                    Uses global_config (not module_type_configs) matching
-                    Apple's preset pattern. Memory savings vs fp16.
-                    NOTE: Apple ships no int8 macOS preset — this is our
-                    addition. Previous per_channel version regressed to
-                    27 tok/sec and looping output.
+  8bit   int8 symmetric_with_clipping per_block_32.
+         Mirrors Apple's 4bit structure with int8 dtype.
+         Apple ships no int8 macOS preset — this is our addition.
 
-  none              No quantization — fp16 only.
+  none   No quantization — fp16 only.
 
 YAML RECIPES (--compression-config path.yaml)
 ----------------------------------------------
-Per-model mixed-precision recipes. Two formats accepted:
+Per-model mixed-precision recipes and non-standard compression schemes.
+--compression and --compression-config are mutually exclusive.
 
-  1. QuantizerConfig native format (produced by scan_quantization_sensitivity.py):
-     Top-level key: quantization_config
-     Supports module_name_configs for per-layer targeting.
+Pre-built recipes in quantization_recipes/:
+  4bit_per_channel.yaml — int4 per_channel symmetric. Fuses with
+    batch_matmul on GPU (7× faster than 4bit for large models).
+    Recommended for 1.5B and 7B production deployments.
+  fastvlm-{variant}-aggressive.yaml — mixed int4/int8/fp16 from
+    scan_quantization_sensitivity.py.
+  fastvlm-{variant}-conservative.yaml — mixed int8/fp16.
 
-  2. coreai-models pipeline format (optional coreai_models block for
-     pipeline options like calibrate_activations).
+Custom YAML format (QuantizerConfig native):
+  Top-level key: quantization_config
+  Supports module_name_configs for per-layer targeting.
 
 macOS vs iOS
 ------------
 macOS: linear quantization (coreai-opt QuantizerConfig).
-       Presets: 4bit, 4bit_per_channel, 8bit.
+       Presets: 4bit, 8bit, none.
        Applied to decoder weights before torch.export.
+
+iOS:   palettization (k-means codebook, KMeansPalettizer via coreai-opt).
+       Presets: 4bit_weight_palettized_group8, 4bit_weight_palettized_group32.
+       Different compression API: torch_palettization_config vs torch_quantization_config.
+       Excludes nn.Embedding and LoadEmbeddings.
+       Note: iOS export requires fastvlm_ios.py (decoder only, no vision).
 
 iOS:   palettization (k-means codebook, KMeansPalettizer via coreai-opt).
        Presets: 4bit_weight_palettized_group8, 4bit_weight_palettized_group32 (default).
@@ -74,10 +78,15 @@ from coreai_opt.quantization import ExecutionMode, Quantizer, QuantizerConfig
 # ── Composite op exclusions ───────────────────────────────────────────────────
 # Mirrors _TORCH_MODULE_EXCLUSIONS from coreai-models/export/presets.py.
 # Setting a module type to None in module_type_configs excludes it entirely.
+# FastVLMRMSNorm added because global_config traverses all nn.Module subclasses
+# with parameters — our RMSNorm has a 1D weight that per_block axis=1 can't handle.
+# Apple's models use coreai_models.primitives.macos.RMSNorm (already excluded);
+# we need to exclude our own implementation explicitly.
 _COMPOSITE_OP_EXCLUSIONS: dict[str, None] = {
     "coreai_torch.composite_ops.SDPA":        None,
     "coreai_torch.composite_ops.RoPE":        None,
     "coreai_torch.composite_ops.RMSNormImpl": None,
+    "fastvlm_decoder.FastVLMRMSNorm":         None,
 }
 
 # Full dotted name for nn.Linear as coreai-opt expects it
@@ -94,66 +103,57 @@ _IOS_EMBEDDING_EXCLUSIONS: dict[str, None] = {
 }
 
 
-def _make_linear_config(dtype: str, qscheme: str, granularity: dict) -> dict:
-    """Build a module config dict for nn.Linear weight quantization."""
-    return {
-        "op_state_spec": {
-            "weight": {
-                "dtype": dtype,
-                "qscheme": qscheme,
-                "granularity": granularity,
-            }
-        },
-        "op_input_spec": None,
-        "op_output_spec": None,
-    }
-
-
 MACOS_NAMED_PRESETS: dict[str, dict[str, Any]] = {
     "4bit": {
+        # Mirrors Apple's MACOS_PRESETS["4bit"] from coreai-models/export/presets.py
+        # exactly, including global_config structure.
+        # FastVLMRMSNorm excluded via _COMPOSITE_OP_EXCLUSIONS so global_config
+        # doesn't hit its 1D weight with per_block axis=1.
         "description": "int4 symmetric_with_clipping per_block_32 (Apple macOS standard)",
         "quantization_config": {
             "execution_mode": "eager",
-            "global_config": None,
-            "module_type_configs": {
-                _LINEAR_TYPE: _make_linear_config(
-                    dtype="int4",
-                    qscheme="symmetric_with_clipping",
-                    granularity={"type": "per_block", "block_size": 32, "axis": 1},
-                ),
-                **_COMPOSITE_OP_EXCLUSIONS,
+            "global_config": {
+                "op_state_spec": {
+                    "weight": {
+                        "dtype": "int4",
+                        "qscheme": "symmetric_with_clipping",
+                        "granularity": {
+                            "type": "per_block",
+                            "block_size": 32,
+                            "axis": 1,
+                        },
+                    }
+                },
+                "op_input_spec": None,
+                "op_output_spec": None,
             },
-        },
-    },
-    "4bit_per_channel": {
-        "description": "int4 per_channel symmetric — fuses with batch_matmul on GPU (7× faster than per_block)",
-        "quantization_config": {
-            "execution_mode": "eager",
-            "global_config": None,
             "module_type_configs": {
-                _LINEAR_TYPE: _make_linear_config(
-                    dtype="int4",
-                    qscheme="symmetric",
-                    granularity={"type": "per_channel", "axis": 0},
-                ),
                 **_COMPOSITE_OP_EXCLUSIONS,
             },
         },
     },
     "8bit": {
-        # int8 symmetric_with_clipping per_block_32 — mirrors Apple's 4bit
-        # preset exactly, substituting int8 for int4. Apple ships no int8
-        # macOS preset; this is our addition for memory-constrained deployments.
-        "description": "int8 symmetric_with_clipping per_block_32 (nn.Linear only)",
+        # Mirrors Apple's 4bit preset structure exactly, substituting int8.
+        # FastVLMRMSNorm excluded via _COMPOSITE_OP_EXCLUSIONS.
+        "description": "int8 symmetric_with_clipping per_block_32 (Apple macOS standard, int8)",
         "quantization_config": {
             "execution_mode": "eager",
-            "global_config": None,
+            "global_config": {
+                "op_state_spec": {
+                    "weight": {
+                        "dtype": "int8",
+                        "qscheme": "symmetric_with_clipping",
+                        "granularity": {
+                            "type": "per_block",
+                            "block_size": 32,
+                            "axis": 1,
+                        },
+                    }
+                },
+                "op_input_spec": None,
+                "op_output_spec": None,
+            },
             "module_type_configs": {
-                _LINEAR_TYPE: _make_linear_config(
-                    dtype="int8",
-                    qscheme="symmetric_with_clipping",
-                    granularity={"type": "per_block", "block_size": 32, "axis": 1},
-                ),
                 **_COMPOSITE_OP_EXCLUSIONS,
             },
         },
