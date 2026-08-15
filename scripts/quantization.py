@@ -26,9 +26,6 @@ Per-model mixed-precision recipes and non-standard compression schemes.
 --compression and --compression-config are mutually exclusive.
 
 Pre-built recipes in quantization_recipes/:
-  4bit_per_channel.yaml — int4 per_channel symmetric. Fuses with
-    batch_matmul on GPU (7× faster than 4bit for large models).
-    Recommended for 1.5B and 7B production deployments.
   fastvlm-{variant}-aggressive.yaml — mixed int4/int8/fp16 from
     scan_quantization_sensitivity.py.
   fastvlm-{variant}-conservative.yaml — mixed int8/fp16.
@@ -42,12 +39,6 @@ macOS vs iOS
 macOS: linear quantization (coreai-opt QuantizerConfig).
        Presets: 4bit, 8bit, none.
        Applied to decoder weights before torch.export.
-
-iOS:   palettization (k-means codebook, KMeansPalettizer via coreai-opt).
-       Presets: 4bit_weight_palettized_group8, 4bit_weight_palettized_group32.
-       Different compression API: torch_palettization_config vs torch_quantization_config.
-       Excludes nn.Embedding and LoadEmbeddings.
-       Note: iOS export requires fastvlm_ios.py (decoder only, no vision).
 
 iOS:   palettization (k-means codebook, KMeansPalettizer via coreai-opt).
        Presets: 4bit_weight_palettized_group8, 4bit_weight_palettized_group32 (default).
