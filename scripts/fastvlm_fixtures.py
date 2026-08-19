@@ -280,7 +280,8 @@ def build_decoder_fixture(
         # Call the model's multimodal preparation — this runs vision encoder,
         # projector, and scatter-merge, returning the combined inputs_embeds
         (
-            _,           # position_ids (None from prepare)
+            _,           # input_ids (None when using embeds)
+            _,           # position_ids
             _,           # attention_mask
             _,           # past_key_values
             inputs_embeds,
@@ -411,7 +412,7 @@ def build_corpus_fixtures(
         input_ids    = input_ids_base.clone().to(target_device)
 
         with torch.no_grad():
-            (_, _, _, inputs_embeds, _) = model.prepare_inputs_labels_for_multimodal(
+            (_, _, _, _, inputs_embeds, _) = model.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 position_ids=None,
                 attention_mask=None,
