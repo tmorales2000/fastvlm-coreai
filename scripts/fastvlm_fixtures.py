@@ -154,7 +154,7 @@ def _load_hf_model(weights_dir: Path, dtype: torch.dtype, device: str):
     try:
         model = AutoModelForCausalLM.from_pretrained(
             str(weights_dir),
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         ).eval()
@@ -169,7 +169,7 @@ def _load_hf_model(weights_dir: Path, dtype: torch.dtype, device: str):
         ModelClass = getattr(mod, model_class_name)
         model = ModelClass.from_pretrained(
             str(weights_dir),
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         ).eval()
