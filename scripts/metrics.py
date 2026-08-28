@@ -183,14 +183,21 @@ def margin_preservation(
     ref: torch.Tensor,
     test: torch.Tensor,
 ) -> float:
-    """Ratio of test top-1 margin to ref top-1 margin.
+    """Margin preservation of the reference decision.
 
-    Margin = logit[top1] - logit[top2]. Measures whether quantization
-    materially changes the confidence gap between leading candidates.
+    Computes the logit gap between the reference top-1 and top-2 tokens
+    in BOTH distributions, then returns the ratio test/ref.
 
-    Returns values > 0; 1.0 = identical margins.
-    Values < 1 mean the candidate is less confident than the baseline.
-    Values > 1 mean the candidate is more confident.
+    ref_margin  = ref[ref_top1] - ref[ref_top2]
+    test_margin = test[ref_top1] - test[ref_top2]
+    result      = test_margin / ref_margin
+
+    Interpretation:
+      > 0 : test preserves the reference ordering (ref_top1 still leads ref_top2)
+      < 0 : test reverses the reference ordering (ref_top2 now beats ref_top1)
+      ~ 1 : test is as confident as ref about the reference decision
+      > 1 : test is MORE confident than ref (can happen with quantization sharpening)
+
     Averages over all positions.
     """
     ref_f  = ref.detach().float()
@@ -203,13 +210,25 @@ def margin_preservation(
         ref_f  = ref_f.unsqueeze(0)
         test_f = test_f.unsqueeze(0)
 
-    def _margin(logits: torch.Tensor) -> torch.Tensor:
-        top2 = logits.topk(2, dim=-1).values
-        return (top2[:, 0] - top2[:, 1]).clamp(min=1e-8)
+    # Reference top-1 and top-2 token indices
+    ref_top2_vals, ref_top2_idx = ref_f.topk(2, dim=-1)
+    ref_top1_idx = ref_top2_idx[:, 0]   # [N]
+    ref_top2_idx = ref_top2_idx[:, 1]   # [N]
 
-    ref_margins  = _margin(ref_f)
-    test_margins = _margin(test_f)
-    return (test_margins / ref_margins).mean().item()
+    # Reference margin: ref[ref_top1] - ref[ref_top2]
+    ref_margin = ref_top2_vals[:, 0] - ref_top2_vals[:, 1]  # [N]
+
+    # Test margin: test[ref_top1] - test[ref_top2] (same token positions)
+    n = ref_f.shape[0]
+    idx = torch.arange(n)
+    test_at_ref_top1 = test_f[idx, ref_top1_idx]   # [N]
+    test_at_ref_top2 = test_f[idx, ref_top2_idx]   # [N]
+    test_margin = test_at_ref_top1 - test_at_ref_top2  # [N]
+
+    # Avoid division by zero when ref margin is negligible
+    safe_ref_margin = ref_margin.clamp(min=1e-4)
+    ratio = test_margin / safe_ref_margin
+    return ratio.mean().item()
 
 
 # ── Composite report ──────────────────────────────────────────────────────────

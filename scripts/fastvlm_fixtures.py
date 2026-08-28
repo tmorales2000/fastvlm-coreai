@@ -53,6 +53,15 @@ from typing import Optional
 
 import torch
 
+# Fixture schema version — bump this when the pipeline changes in a way
+# that would produce different outputs from the same inputs:
+#   - vision encoder/projector architecture change
+#   - preprocessing change (image_strategy, image_size)
+#   - chat template or tokenizer change
+#   - scatter-merge implementation change
+# Bumping invalidates all cached fixtures, forcing a rebuild.
+FIXTURE_SCHEMA_VERSION = 2
+
 # Default corpus — the nine semantic images from test_assets
 CORPUS_IMAGES = [
     "test_assets/images/great_wave.jpg",
@@ -82,11 +91,21 @@ class DecoderFixture:
     inputs_embeds and position_ids are the exact tensors the decoder
     receives at inference time. They include the scatter-merged image
     features at the image token positions.
+
+    Sequence layout (chat template dependent):
+      [0 .. before_tokens-1]           — tokens before <image> in prompt
+      [before_tokens .. image_end-1]   — image embedding tokens (256 for FastVLM)
+      [image_end .. seq_len-1]         — tokens after <image> in prompt
+
+    Use image_start/image_end for accurate position slicing in evaluation.
+    image_tokens is a count (= image_end - image_start) retained for compatibility.
     """
     inputs_embeds: torch.Tensor   # [1, seq_len, hidden_size] float16
     position_ids:  torch.Tensor   # [1, seq_len] int32
     image_tokens:  int            # number of image token positions (256 for FastVLM)
-    text_tokens:   int            # number of text token positions
+    image_start:   int            # index of first image token in sequence
+    image_end:     int            # index after last image token (= image_start + image_tokens)
+    text_tokens:   int            # number of text token positions (before + after image)
     prompt:        str            # original prompt string
     image_path:    str            # source image path
     variant:       str            # model variant ("0.5b", "1.5b", "7b")
@@ -106,8 +125,12 @@ def _fixture_cache_key(
     image_path: str,
     prompt: str,
 ) -> str:
-    """Deterministic cache key for a fixture."""
-    content = f"{variant}|{Path(image_path).resolve()}|{prompt}"
+    """Deterministic cache key for a fixture.
+
+    Includes FIXTURE_SCHEMA_VERSION so pipeline changes automatically
+    invalidate stale caches without requiring manual deletion.
+    """
+    content = f"v{FIXTURE_SCHEMA_VERSION}|{variant}|{Path(image_path).resolve()}|{prompt}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -135,6 +158,8 @@ def _save_cached_fixture(fixture: DecoderFixture, cache_path: Path) -> None:
         "inputs_embeds": fixture.inputs_embeds.cpu(),
         "position_ids":  fixture.position_ids.cpu(),
         "image_tokens":  fixture.image_tokens,
+        "image_start":   fixture.image_start,
+        "image_end":     fixture.image_end,
         "text_tokens":   fixture.text_tokens,
         "prompt":        fixture.prompt,
         "image_path":    fixture.image_path,
@@ -298,8 +323,14 @@ def build_decoder_fixture(
     if verbose:
         print(f"[fixture] Vision pipeline in {time.time()-t0:.2f}s")
 
-    seq_len    = inputs_embeds.shape[1]
-    image_tokens = seq_len - text_tokens  # image positions after scatter-merge
+    seq_len      = inputs_embeds.shape[1]
+    # before_tokens: tokens before <image> sentinel in the original input_ids
+    before_tokens = before_tok["input_ids"].shape[1]
+    after_tokens  = after_tok["input_ids"].shape[1]
+    image_tokens  = seq_len - before_tokens - after_tokens
+    image_start   = before_tokens
+    image_end     = before_tokens + image_tokens
+    text_tokens   = before_tokens + after_tokens
 
     # Build position_ids — sequential, matching how the decoder expects them
     position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
@@ -308,6 +339,8 @@ def build_decoder_fixture(
         inputs_embeds = inputs_embeds.cpu().to(torch.float16),
         position_ids  = position_ids.cpu(),
         image_tokens  = image_tokens,
+        image_start   = image_start,
+        image_end     = image_end,
         text_tokens   = text_tokens,
         prompt        = prompt,
         image_path    = image_path,
@@ -421,15 +454,22 @@ def build_corpus_fixtures(
                 images=[pixel_values[0]],
             )
 
-        seq_len      = inputs_embeds.shape[1]
-        image_tokens = seq_len - text_tokens
-        position_ids = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+        seq_len       = inputs_embeds.shape[1]
+        before_tokens = before_tok["input_ids"].shape[1]
+        after_tokens  = after_tok["input_ids"].shape[1]
+        image_tokens  = seq_len - before_tokens - after_tokens
+        image_start   = before_tokens
+        image_end     = before_tokens + image_tokens
+        text_tokens_n = before_tokens + after_tokens
+        position_ids  = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
 
         fixture = DecoderFixture(
             inputs_embeds = inputs_embeds.cpu().to(torch.float16),
             position_ids  = position_ids.cpu(),
             image_tokens  = image_tokens,
-            text_tokens   = text_tokens,
+            image_start   = image_start,
+            image_end     = image_end,
+            text_tokens   = text_tokens_n,
             prompt        = prompt,
             image_path    = str(Path(img_path).resolve()),
             variant       = variant,

@@ -308,15 +308,26 @@ def phase_fidelity(
         out_fp16 = port_fp16(inputs_embeds_fp16, pos_ids, k16, v16)
 
     # Report full metric suite
-    report = full_report(out_fp32.float(), out_fp16.float())
-    print()
-    print_report(report, label="FP32 → FP16 on realistic inputs:", indent="  ")
+    # Numerical fidelity: all positions
+    # Behavioral: final position only (the generation decision)
+    report_all   = full_report(out_fp32.float(), out_fp16.float())
+    report_final = full_report(out_fp32[:, -1:].float(), out_fp16[:, -1:].float())
 
-    # This phase is informational — always passes
-    # The metrics establish the baseline for Phase 4 comparison
-    print(f"\n[INFO] This is the FP16 baseline. Phase 4 will compare compressed vs FP16.")
-    print(f"       Top-1 agreement {report['top1_agreement']:.1%} is the best achievable "
-          f"after compression.")
+    print()
+    print_report(report_all,
+                 label="FP32 → FP16 (all positions — numerical fidelity):",
+                 indent="  ")
+    print()
+    print_report(report_final,
+                 label="FP32 → FP16 (final position — generation decision):",
+                 indent="  ")
+
+    # Phase 2 is informational — always MEASURED, never PASS/FAIL
+    # The metrics establish the fp16 deployment baseline used as the Phase 4 reference.
+    print(f"\n[MEASURED] This establishes the FP16 deployment baseline used as "
+          f"the Phase 4 reference.")
+    print(f"           Note: fixture inputs_embeds are stored as FP16, so Phase 2 measures")
+    print(f"           decoder FP32 vs FP16 precision, not full pipeline FP32→FP16 loss.")
     return True
 
 
@@ -344,24 +355,29 @@ def phase_cache(
     port_fp16 = _build_port(text_cfg, weights_dir, torch.float16)
 
     full_embeds = _random_embeds(hidden, total, torch.float16)
-    full_pos    = torch.arange(total, dtype=torch.int32).unsqueeze(0)
 
-    # Cached pass: prefill n_prefill tokens, then decode n_decode tokens one-by-one
+    # Cached pass: prefill n_prefill tokens, then decode n_decode tokens one-by-one.
+    # Position IDs must be the full sequence seen so far — not just the current token.
+    # For decode step at position p: position_ids = [0, 1, ..., p] so that
+    # seq_len = p+1, L = 1, offset = p inside FastVLMAttention.
     k_cache, v_cache = _make_kv_cache(text_cfg, max_ctx, torch.float16)
     cached_logits = []
     with torch.no_grad():
-        # Prefill
-        prefill_out = port_fp16(
+        # Prefill: positions [0..n_prefill-1]
+        prefill_pos = torch.arange(n_prefill, dtype=torch.int32).unsqueeze(0)
+        _ = port_fp16(
             full_embeds[:, :n_prefill],
-            full_pos[:, :n_prefill],
+            prefill_pos,
             k_cache, v_cache,
         )
-        # Decode steps — cache now has prefill written
+        # Decode steps: each step passes ALL positions seen so far [0..pos]
         for step in range(n_decode):
             pos = n_prefill + step
+            # position_ids = [0..pos] → offset = pos inside the decoder
+            pos_dec = torch.arange(pos + 1, dtype=torch.int32).unsqueeze(0)
             out = port_fp16(
                 full_embeds[:, pos:pos+1],
-                full_pos[:, pos:pos+1],
+                pos_dec,
                 k_cache, v_cache,
             )
             cached_logits.append(out)
@@ -373,28 +389,16 @@ def phase_cache(
     overflow = max_abs > FP16_OVERFLOW
     print(f"fp16 max |logit|  : {max_abs:.0f} (ceiling 65504)")
 
-    # Reference: run the SAME tokens without cache reuse
-    # (each decode step gets a fresh cache with only prior context written)
-    ref_logits = []
+    # Reference: one full FP16 pass over all tokens (no cache).
+    # Then compare cached decode logits at positions [n_prefill..total-1]
+    # against the full-pass logits at the same positions.
+    # This directly answers: does the incremental cached decode agree with
+    # the full-context reference? Any KV cache bug breaks this agreement.
+    k_full, v_full = _make_kv_cache(text_cfg, max_ctx, torch.float16)
+    full_pos = torch.arange(total, dtype=torch.int32).unsqueeze(0)
     with torch.no_grad():
-        for step in range(n_decode):
-            # Fresh cache for each reference computation
-            k_ref, v_ref = _make_kv_cache(text_cfg, max_ctx, torch.float16)
-            pos = n_prefill + step
-            # Write prefill into fresh cache
-            _ = port_fp16(
-                full_embeds[:, :n_prefill],
-                full_pos[:, :n_prefill],
-                k_ref, v_ref,
-            )
-            # Now decode one token — same context as cached path
-            out = port_fp16(
-                full_embeds[:, pos:pos+1],
-                full_pos[:, pos:pos+1],
-                k_ref, v_ref,
-            )
-            ref_logits.append(out)
-    ref = torch.cat(ref_logits, dim=1)  # [1, n_decode, vocab]
+        ref_out = port_fp16(full_embeds, full_pos, k_full, v_full)
+    ref = ref_out[:, n_prefill:, :]  # [1, n_decode, vocab]
 
     first = _psnr(cached[:, 0:1], ref[:, 0:1])
     span  = _psnr(cached, ref)
@@ -596,25 +600,44 @@ def verify(
         )
 
     # all phases
-    if not phase_correctness(text_cfg, weights_dir):
+    p1 = phase_correctness(text_cfg, weights_dir)
+    if not p1:
         print("\n>>> Stopped at Phase 1.")
         sys.exit(1)
     phase_fidelity(text_cfg, weights_dir, variant, image_path)
-    if not phase_cache(text_cfg, weights_dir, n_prefill, n_decode):
+    p3 = phase_cache(text_cfg, weights_dir, n_prefill, n_decode)
+    if not p3:
         print("\n>>> Stopped at Phase 3.")
         sys.exit(1)
+
+    p4_result = "SKIPPED"
     if compression_config is not None:
-        if not phase_compression(
+        p4_passed = phase_compression(
             text_cfg, weights_dir, variant,
             compression_config, compression_label, image_path,
-        ):
-            print("\n>>> Stopped at Phase 4.")
-            sys.exit(1)
+        )
+        p4_result = "RECOMMEND" if p4_passed else "CAUTION"
 
     print("\n" + "=" * 60)
-    phases = "Phases 1–4" if compression_config is not None else "Phases 1–3"
-    print(f"ALL PHASES PASS ({phases}) — safe to export.")
+    print("DECODER VERIFICATION COMPLETE")
     print("=" * 60)
+    print(f"  Phase 1 — Architecture correctness : PASS")
+    print(f"  Phase 2 — FP16 fidelity            : MEASURED")
+    print(f"  Phase 3 — KV cache correctness     : PASS")
+    if compression_config is not None:
+        print(f"  Phase 4 — Recipe quality           : {p4_result}")
+        if p4_result == "RECOMMEND":
+            print(f"\n  Recommendation: Export {compression_label} recipe for Core AI runtime validation.")
+        else:
+            print(f"\n  Caution: Recipe quality below threshold. Consider 8bit or mixed-precision YAML.")
+        print(f"\n  Note: This does not validate the finalized Core AI artifact.")
+        print(f"        Run verify_runtime.py after export for end-to-end validation.")
+    else:
+        print(f"\n  Decoder implementation is ready for export testing.")
+    print("=" * 60)
+
+    if compression_config is not None and p4_result == "CAUTION":
+        sys.exit(1)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
