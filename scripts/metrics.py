@@ -37,8 +37,8 @@ def psnr(ref: torch.Tensor, test: torch.Tensor) -> float:
     Returns inf when ref == test (zero error).
     Returns -inf when ref is all-zero (undefined peak).
     """
-    ref_f  = ref.detach().double()
-    test_f = test.detach().double()
+    ref_f  = ref.detach().cpu().double()
+    test_f = test.detach().cpu().double()
     mse    = torch.mean((ref_f - test_f) ** 2).item()
     if mse == 0.0:
         return float("inf")
@@ -56,8 +56,8 @@ def nrmse(ref: torch.Tensor, test: torch.Tensor) -> float:
     dimensionless and comparable across different output scales.
     Returns 0.0 when ref == test, inf when ref is all-zero.
     """
-    ref_f  = ref.detach().double()
-    test_f = test.detach().double()
+    ref_f  = ref.detach().cpu().double()
+    test_f = test.detach().cpu().double()
     mse    = torch.mean((ref_f - test_f) ** 2).item()
     ref_rms = torch.sqrt(torch.mean(ref_f ** 2)).item()
     if ref_rms == 0.0:
@@ -71,8 +71,8 @@ def cosine_similarity(ref: torch.Tensor, test: torch.Tensor) -> float:
     Measures preservation of the overall logit direction.
     Returns values in [-1, 1]; 1.0 = identical direction.
     """
-    ref_f  = ref.detach().double().flatten()
-    test_f = test.detach().double().flatten()
+    ref_f  = ref.detach().cpu().double().flatten()
+    test_f = test.detach().cpu().double().flatten()
     dot    = torch.dot(ref_f, test_f).item()
     norm_r = torch.norm(ref_f).item()
     norm_t = torch.norm(test_f).item()
@@ -90,8 +90,8 @@ def kl_divergence(ref: torch.Tensor, test: torch.Tensor) -> float:
 
     Returns 0.0 when ref == test.
     """
-    ref_f  = ref.detach().float()
-    test_f = test.detach().float()
+    ref_f  = ref.detach().cpu().float()
+    test_f = test.detach().cpu().float()
     # Flatten to (N, vocab) where N = batch * seq positions
     if ref_f.dim() > 2:
         ref_f  = ref_f.reshape(-1, ref_f.shape[-1])
@@ -123,8 +123,8 @@ def top_k_agreement(
     Operates on last dimension (vocab). Averages over all positions.
     Returns values in [0, 1]; 1.0 = perfect agreement.
     """
-    ref_f  = ref.detach().float()
-    test_f = test.detach().float()
+    ref_f  = ref.detach().cpu().float()
+    test_f = test.detach().cpu().float()
 
     if ref_f.dim() > 2:
         ref_f  = ref_f.reshape(-1, ref_f.shape[-1])
@@ -156,8 +156,8 @@ def top_k_overlap(
     partial overlap: |ref_topk ∩ test_topk| / k.
     Returns values in [0, 1]; 1.0 = complete overlap.
     """
-    ref_f  = ref.detach().float()
-    test_f = test.detach().float()
+    ref_f  = ref.detach().cpu().float()
+    test_f = test.detach().cpu().float()
 
     if ref_f.dim() > 2:
         ref_f  = ref_f.reshape(-1, ref_f.shape[-1])
@@ -200,8 +200,8 @@ def margin_preservation(
 
     Averages over all positions.
     """
-    ref_f  = ref.detach().float()
-    test_f = test.detach().float()
+    ref_f  = ref.detach().cpu().float()
+    test_f = test.detach().cpu().float()
 
     if ref_f.dim() > 2:
         ref_f  = ref_f.reshape(-1, ref_f.shape[-1])

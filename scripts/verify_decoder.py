@@ -182,12 +182,13 @@ def _build_port(text_cfg, weights_dir: str, dtype: torch.dtype,
     return model.eval()
 
 
-def _build_hf_reference(text_cfg, weights_dir: str) -> Qwen2ForCausalLM:
+def _build_hf_reference(text_cfg, weights_dir: str,
+                        device: torch.device | None = None) -> Qwen2ForCausalLM:
     weights = _load_decoder_weights(weights_dir, dtype=torch.float32)
     try:
-        model = Qwen2ForCausalLM(text_cfg).to(torch.float32)
+        model = Qwen2ForCausalLM(text_cfg)
     except Exception:
-        model = Qwen2ForCausalLM(Qwen2Config(**text_cfg.to_dict())).to(torch.float32)
+        model = Qwen2ForCausalLM(Qwen2Config(**text_cfg.to_dict()))
     missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
     tolerated    = {"model.embed_tokens.weight", "lm_head.weight"}
     real_missing = set(missing) - tolerated
@@ -195,6 +196,10 @@ def _build_hf_reference(text_cfg, weights_dir: str) -> Qwen2ForCausalLM:
         raise RuntimeError(f"HF reference missing keys: {sorted(real_missing)[:8]}")
     if unexpected:
         raise RuntimeError(f"HF reference unexpected keys: {sorted(unexpected)[:8]}")
+    # to(device) after load_state_dict(assign=True) — same reason as _build_port
+    model = model.to(torch.float32)
+    if device is not None:
+        model = model.to(device)
     return model.eval()
 
 
@@ -230,8 +235,8 @@ def phase_correctness(text_cfg, weights_dir: str,
     print("Random token sequence using real embedding-table inputs.")
     print("Purpose: catch re-authoring bugs, not precision issues.")
 
-    hf   = _build_hf_reference(text_cfg, weights_dir)
-    port = _build_port(text_cfg, weights_dir, torch.float32)
+    hf   = _build_hf_reference(text_cfg, weights_dir, device)
+    port = _build_port(text_cfg, weights_dir, torch.float32, device)
     n_layers = text_cfg.num_hidden_layers
 
     hf_acts, port_acts = {}, {}
@@ -398,6 +403,7 @@ def phase_cache(
     max_ctx  = min(total + 4, 256)
 
     torch.manual_seed(1)
+    dev = device or torch.device("cpu")
     port_fp16 = _build_port(text_cfg, weights_dir, torch.float16, device)
 
     full_embeds = _random_embeds(hidden, total, torch.float16, device)
@@ -441,7 +447,6 @@ def phase_cache(
     # This directly answers: does the incremental cached decode agree with
     # the full-context reference? Any KV cache bug breaks this agreement.
     k_full, v_full = _make_kv_cache(text_cfg, max_ctx, torch.float16, device)
-    dev = device or torch.device("cpu")
     full_pos = torch.arange(total, dtype=torch.int32, device=dev).unsqueeze(0)
     with torch.no_grad():
         ref_out = port_fp16(full_embeds, full_pos, k_full, v_full)
@@ -549,25 +554,31 @@ def phase_compression(
         print(f"  Run: python scripts/build_fixtures.py --variant {variant}")
         return PhaseResult.INCONCLUSIVE
 
-    # Small calibration inputs for quantizer prepare — separate from fixtures
-    # to avoid KV cache mutation corrupting the comparison
-    dev = device or torch.device("cpu")
-    cal_k = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16, device=dev)
+    # Small calibration inputs for quantizer prepare — on CPU.
+    # coreai_opt quantizer.prepare() does not support MPS — RoPEImpl's freqs
+    # buffer is created on CPU at init time and causes device mismatch on MPS.
+    # We prepare on CPU then move to device for inference.
+    cpu = torch.device("cpu")
+    cal_k = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16)
     cal_v = torch.zeros_like(cal_k)
     example_inputs = (
-        _random_embeds(hidden, 8, torch.float16, dev),
+        _random_embeds(hidden, 8, torch.float16),
         torch.arange(8, dtype=torch.int32).unsqueeze(0),
         cal_k, cal_v,
     )
 
-    # Build fp16 and compressed models once — reuse across all fixtures
+    # Build fp16 baseline on device for fast inference
     port_fp16 = _build_port(text_cfg, weights_dir, torch.float16, device)
+
+    # Build and prepare compressed model on CPU, then move to device
     print(f"\nApplying {compression_label}...")
-    port_comp = _build_port(text_cfg, weights_dir, torch.float16, device)
+    port_comp = _build_port(text_cfg, weights_dir, torch.float16)  # CPU
     port_comp = apply_quantization_from_config(
         port_comp, compression_config, example_inputs, finalize=False
     )
     port_comp.eval()
+    if device is not None:
+        port_comp = port_comp.to(device)
 
     # Evaluate over corpus
     print(f"\nEvaluating {len(fixtures)} fixtures...")
@@ -661,7 +672,13 @@ def verify(
         print(f"Compression:       {compression_label}")
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Device:            {device}")
+    print(f"Device:            {device} (Phase 1 always CPU for IEEE 754 precision)")
+
+    # Phase 1 always runs on CPU regardless of MPS availability.
+    # Architecture correctness requires IEEE 754 strict fp32 — MPS uses Metal
+    # shaders with different rounding, producing lower PSNR scores that aren't
+    # meaningful for bug detection. Phases 2-4 run on MPS for deployment accuracy.
+    cpu = torch.device("cpu")
 
     config   = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
@@ -671,7 +688,7 @@ def verify(
                                   PhaseResult.SKIPPED, PhaseResult.RECOMMEND) else 1)
 
     if stage == "correctness":
-        _exit(phase_correctness(text_cfg, weights_dir, device))
+        _exit(phase_correctness(text_cfg, weights_dir, cpu))
         return
     if stage == "fidelity":
         _exit(phase_fidelity(text_cfg, weights_dir, variant, image_path, device))
@@ -690,7 +707,7 @@ def verify(
         return
 
     # all phases
-    r1 = phase_correctness(text_cfg, weights_dir, device)
+    r1 = phase_correctness(text_cfg, weights_dir, cpu)
     if r1.is_blocking():
         print(f"\n>>> Stopped at Phase 1 ({r1.value}).")
         sys.exit(1)
