@@ -22,13 +22,16 @@ Phases run in order and stop at the first hard failure.
       Checks KV cache correctness and fp16 health (NaN/Inf/saturation).
       Gate: > 40 dB decode PSNR, no NaN/Inf, logits < 60000.
 
-  Phase 4 — COMPRESSION QUALITY (realistic inputs, behavioral metrics)
-      Measures quality loss from compression vs fp16 baseline using
-      REALISTIC inputs from fastvlm_fixtures.py.
-      Reports full metric suite. Decision based on behavioral metrics
-      (top-1 agreement, top-5 overlap, KL divergence) not PSNR alone.
+  Phase 4 — COMPRESSION QUALITY (realistic inputs, corpus aggregation)
+      Measures quality loss from compression vs fp16 baseline using the full
+      9-image corpus from fastvlm_fixtures.py. Evaluates the final generation
+      position only (the first token decision). Reports mean and worst-case
+      metrics across the corpus.
+      Primary gate: top-5 overlap ≥ 80% mean AND ≥ 60% worst case.
+      Top-1 agreement and KL divergence are context only — top-1 flips between
+      semantically equivalent candidates (e.g. 'The' vs 'This') are expected.
+      INCONCLUSIVE if corpus fixtures are unavailable (no random fallback).
       Enable with --compression or --compression-config.
-      Gate: top-1 agreement > 90%, KL divergence < 0.1.
 
 Usage:
     python scripts/verify_decoder.py --variant 0.5b
@@ -88,13 +91,12 @@ FP16_OVERFLOW  = 60000.0  # fp16 ceiling is 65504
 # Primary gate: top-5 overlap — "do the same reasonable tokens appear?"
 # Top-1 agreement is reported as context but not gated — it flips when
 # top candidates have similar logit values, which is expected under compression.
-# KL divergence threshold is permissive — high KL is expected when top-5 tokens
-# are reordered but present (the set is the same, the distribution shifts).
-COMPRESSION_TOP5_PASS = 0.80   # top-5 overlap fraction
-COMPRESSION_KL_PASS   = 1.00   # informational only — not gated
-# Legacy PSNR thresholds (informational only in Phase 4)
-COMPRESSION_PASS_INT8 = 35.0
-COMPRESSION_PASS_INT4 = 20.0   # lowered from 25 dB — 21.7 dB verified clean
+COMPRESSION_TOP5_PASS = 0.80   # top-5 overlap fraction (mean and worst)
+# PSNR reference values — informational context only, NOT a gate.
+# PSNR is retained for continuity but behavioral metrics are the evidence.
+# Renaming from PASS to REFERENCE makes the non-gate role explicit.
+PSNR_REFERENCE_INT8 = 35.0
+PSNR_REFERENCE_INT4 = 20.0   # 21.7 dB verified clean in production (1.5B int4)
 
 # Default fixture image for Phase 2 and Phase 4
 DEFAULT_FIXTURE_IMAGE = "test_assets/images/great_wave.jpg"
@@ -187,7 +189,8 @@ def phase_correctness(text_cfg, weights_dir: str) -> bool:
     print("\n" + "=" * 60)
     print("PHASE 1 — ARCHITECTURE CORRECTNESS (fp32, port vs HF Qwen2)")
     print("=" * 60)
-    print("Random inputs. Purpose: catch re-authoring bugs, not precision issues.")
+    print("Random token sequence using real embedding-table inputs.")
+    print("Purpose: catch re-authoring bugs, not precision issues.")
 
     hf   = _build_hf_reference(text_cfg, weights_dir)
     port = _build_port(text_cfg, weights_dir, torch.float32)
@@ -423,6 +426,34 @@ def phase_cache(
 
 # ── Phase 4 — Compression quality ────────────────────────────────────────────
 
+def _run_one_fixture(
+    fixture,
+    port_fp16,
+    port_comp,
+    n_layers: int,
+    n_kv: int,
+    head_dim: int,
+) -> dict:
+    """Run fp16 and compressed models on one fixture, return final-position metrics."""
+    seq_len = fixture.seq_len
+    max_ctx = seq_len + 64
+    k_ex = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=torch.float16)
+    v_ex = torch.zeros_like(k_ex)
+
+    with torch.no_grad():
+        fp16_out = port_fp16(
+            fixture.inputs_embeds, fixture.position_ids,
+            k_ex.clone(), v_ex.clone(),
+        )
+        comp_out = port_comp(
+            fixture.inputs_embeds, fixture.position_ids,
+            k_ex.clone(), v_ex.clone(),
+        )
+
+    # Final position only — the actual generation decision
+    return full_report(fp16_out[:, -1:].float(), comp_out[:, -1:].float())
+
+
 def phase_compression(
     text_cfg,
     weights_dir: str,
@@ -434,132 +465,120 @@ def phase_compression(
     print("\n" + "=" * 60)
     print(f"PHASE 4 — COMPRESSION QUALITY ({compression_label})")
     print("=" * 60)
-    print("Comparing compressed vs fp16 on REALISTIC multimodal inputs.")
-    print(f"Image: {Path(image_path).name}")
+    print("Comparing compressed vs fp16 at the final generation position.")
+    print("Evaluated over the full fixture corpus for statistical coverage.")
 
     hidden   = text_cfg.hidden_size
     n_layers = text_cfg.num_hidden_layers
     n_kv     = text_cfg.num_key_value_heads
     head_dim = hidden // text_cfg.num_attention_heads
 
-    # Try to load realistic fixture
-    use_realistic = True
+    # Load corpus fixtures — INCONCLUSIVE if unavailable
+    from fastvlm_fixtures import build_corpus_fixtures, CORPUS_IMAGES
+    print(f"\nLoading corpus fixtures ({len(CORPUS_IMAGES)} images)...")
     try:
-        fixture = build_decoder_fixture(
+        fixtures = build_corpus_fixtures(
             variant=variant,
-            image_path=image_path,
             use_cache=True,
-            verbose=False,
+            verbose=True,
         )
-        inputs_embeds = fixture.inputs_embeds  # [1, seq, hidden] fp16
-        pos_ids       = fixture.position_ids
-        seq_len       = fixture.seq_len
-        max_ctx       = seq_len + 64
-        print(f"Fixture: seq_len={seq_len} "
-              f"({fixture.image_tokens} image + {fixture.text_tokens} text)")
-    except FileNotFoundError:
-        print("[WARN] Fixture unavailable — falling back to random inputs.")
-        print("       Results may not reflect real production quality.")
-        use_realistic = False
-        seq_len  = 8
-        max_ctx  = 64
-        torch.manual_seed(0)
-        inputs_embeds = _random_embeds(hidden, seq_len, torch.float16)
-        pos_ids       = torch.arange(seq_len, dtype=torch.int32).unsqueeze(0)
+    except Exception as e:
+        print(f"\n[INCONCLUSIVE] Could not load corpus fixtures: {e}")
+        print("  Phase 4 requires realistic multimodal fixtures.")
+        print("  Ensure test_assets/images/ contains the corpus images.")
+        return False
 
-    k_ex = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=torch.float16)
-    v_ex = torch.zeros_like(k_ex)
+    if not fixtures:
+        print("\n[INCONCLUSIVE] No fixtures available — corpus images missing.")
+        print("  Phase 4 cannot evaluate recipe quality without realistic inputs.")
+        return False
 
-    # Use small separate example inputs for quantizer calibration.
-    # Do NOT use the fixture inputs for calibration — the KV cache is mutated
-    # in-place during the prepare forward pass, which would corrupt the
-    # comparison between fp16 and compressed outputs.
-    cal_embeds = _random_embeds(hidden, 8, torch.float16)
-    cal_pos    = torch.arange(8, dtype=torch.int32).unsqueeze(0)
-    cal_k      = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16)
-    cal_v      = torch.zeros_like(cal_k)
-    example_inputs = (cal_embeds, cal_pos, cal_k, cal_v)
+    # Small calibration inputs for quantizer prepare — separate from fixtures
+    # to avoid KV cache mutation corrupting the comparison
+    cal_k = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16)
+    cal_v = torch.zeros_like(cal_k)
+    example_inputs = (
+        _random_embeds(hidden, 8, torch.float16),
+        torch.arange(8, dtype=torch.int32).unsqueeze(0),
+        cal_k, cal_v,
+    )
 
-    # FP16 baseline — fresh zero cache
+    # Build fp16 and compressed models once — reuse across all fixtures
     port_fp16 = _build_port(text_cfg, weights_dir, torch.float16)
-    with torch.no_grad():
-        fp16_out = port_fp16(inputs_embeds, pos_ids, k_ex.clone(), v_ex.clone())
-
-    # Compressed (prepare only — model stays runnable)
-    print(f"Applying {compression_label}...")
+    print(f"\nApplying {compression_label}...")
     port_comp = _build_port(text_cfg, weights_dir, torch.float16)
     port_comp = apply_quantization_from_config(
         port_comp, compression_config, example_inputs, finalize=False
     )
     port_comp.eval()
-    with torch.no_grad():
-        comp_out = port_comp(inputs_embeds, pos_ids, k_ex.clone(), v_ex.clone())
 
-    # Full metric suite — evaluate the FINAL position only.
-    # In VLM inference, only the last token's logit determines the first
-    # generated token. Intermediate positions (image tokens, prompt tokens)
-    # are teacher-forced and don't affect output quality.
-    # We also report text-only for context.
-    if use_realistic:
-        text_start = fixture.image_tokens
-        # Primary: final position only (the actual generation decision)
-        final_fp16 = fp16_out[:, -1:, :].float()
-        final_comp = comp_out[:, -1:, :].float()
-        # Secondary: all text positions for context
-        text_fp16  = fp16_out[:, text_start:, :].float()
-        text_comp  = comp_out[:, text_start:, :].float()
+    # Evaluate over corpus
+    print(f"\nEvaluating {len(fixtures)} fixtures...")
+    all_reports = []
+    worst_top5  = 1.0
+    worst_image = ""
 
-        report_final = full_report(final_fp16, final_comp)
-        report_text  = full_report(text_fp16,  text_comp)
+    for fix in fixtures:
+        r = _run_one_fixture(fix, port_fp16, port_comp, n_layers, n_kv, head_dim)
+        all_reports.append((Path(fix.image_path).name, r))
+        if r["top5_overlap"] < worst_top5:
+            worst_top5  = r["top5_overlap"]
+            worst_image = Path(fix.image_path).name
 
-        print()
-        print_report(report_final,
-                     label=f"Compressed ({compression_label}) vs fp16 — final position (generation decision):",
-                     indent="  ")
-        print()
-        print_report(report_text,
-                     label=f"Compressed ({compression_label}) vs fp16 — text positions [{text_start}:{fixture.seq_len}] (context):",
-                     indent="  ")
-        report = report_final  # gate on final position
-    else:
-        eval_fp16 = fp16_out.float()
-        eval_comp = comp_out.float()
-        report = full_report(eval_fp16, eval_comp)
-        print()
-        print_report(report, label=f"Compressed ({compression_label}) vs fp16 (random inputs):",
-                     indent="  ")
+    # Aggregate: mean and worst across corpus
+    def _mean(key):
+        return sum(r[key] for _, r in all_reports) / len(all_reports)
+    def _worst(key):
+        return min(r[key] for _, r in all_reports)
+    def _best(key):
+        return max(r[key] for _, r in all_reports)
 
-    # Legacy PSNR context
+    n         = len(all_reports)
     dtype_str = _extract_dtype(compression_config)
-    psnr_threshold = COMPRESSION_PASS_INT8 if dtype_str == "int8" else COMPRESSION_PASS_INT4
-    print(f"\n  PSNR threshold ({dtype_str}): {psnr_threshold:.0f} dB "
-          f"({'PASS' if report['psnr_db'] >= psnr_threshold else 'below threshold — but see behavioral metrics'})")
+    psnr_ref  = PSNR_REFERENCE_INT8 if dtype_str == "int8" else PSNR_REFERENCE_INT4
 
-    # Primary gate: top-5 overlap
-    # "Do the same reasonable next tokens appear in both distributions?"
-    # Top-1 agreement is context only — flipping between equivalent top candidates
-    # (e.g. 'The' vs 'This') is expected and acceptable under compression.
-    top5 = report["top5_overlap"]
-    top1 = report["top1_agreement"]
-    kl   = report["kl_divergence"]
+    print(f"\n  Corpus: {n} images")
+    print(f"  Prompt: \"{DEFAULT_PROMPT}\"")
+    print(f"  Evaluated at: final generation position (first token decision)")
+    print()
+    print(f"  {'Metric':<22} {'Mean':>10} {'Worst':>10}")
+    print(f"  {'-'*44}")
+    print(f"  {'PSNR (dB)':<22} {_mean('psnr_db'):>10.1f} {_worst('psnr_db'):>10.1f}   (ref: {psnr_ref:.0f} dB)")
+    print(f"  {'NRMSE':<22} {_mean('nrmse'):>10.4f} {_best('nrmse'):>10.4f}")
+    print(f"  {'Cosine similarity':<22} {_mean('cosine'):>10.4f} {_worst('cosine'):>10.4f}")
+    print(f"  {'KL divergence':<22} {_mean('kl_divergence'):>10.4f} {_best('kl_divergence'):>10.4f}")
+    print(f"  {'Top-5 overlap':<22} {_mean('top5_overlap'):>9.1%} {_worst('top5_overlap'):>9.1%}")
+    print(f"  {'Top-1 agreement':<22} {_mean('top1_agreement'):>9.1%} {_worst('top1_agreement'):>9.1%}   (context only)")
+    print(f"  {'Margin preservation':<22} {_mean('margin_ratio'):>10.4f} {_worst('margin_ratio'):>10.4f}")
+
+    top5_mean  = _mean("top5_overlap")
+    top5_worst = _worst("top5_overlap")
+    top5_pass_count = sum(1 for _, r in all_reports if r["top5_overlap"] >= COMPRESSION_TOP5_PASS)
+
+    print(f"\n  Top-5 ≥{COMPRESSION_TOP5_PASS:.0%}: {top5_pass_count}/{n} images pass")
+    if worst_image:
+        print(f"  Worst case: {worst_image} (top-5={worst_top5:.1%})")
+
+    # Primary gate: mean AND worst top-5 overlap
+    mean_pass  = top5_mean  >= COMPRESSION_TOP5_PASS
+    worst_pass = top5_worst >= COMPRESSION_TOP5_PASS * 0.75  # 60% floor on worst case
 
     print(f"\n  Primary gate:")
-    print(f"    top-5 overlap   : {top5:.1%}  (threshold: ≥{COMPRESSION_TOP5_PASS:.0%})")
-    print(f"    top-1 agreement : {top1:.1%}  (context only — flips expected when margins are small)")
-    print(f"    KL divergence   : {kl:.4f} (context only)")
+    print(f"    mean  top-5 overlap : {top5_mean:.1%}  (threshold: ≥{COMPRESSION_TOP5_PASS:.0%})")
+    print(f"    worst top-5 overlap : {top5_worst:.1%}  (floor: ≥{COMPRESSION_TOP5_PASS * 0.75:.0%})")
 
-    if not use_realistic:
-        print("\n[WARN] Used random inputs — behavioral metrics unreliable.")
-        print("       Install fixture image to get accurate Phase 4 results.")
-
-    if top5 >= COMPRESSION_TOP5_PASS:
-        print(f"\n[PASS] Compression viable for export "
-              f"(top-5={top5:.1%}, top-1={top1:.1%}).")
+    if mean_pass and worst_pass:
+        print(f"\n[RECOMMEND] Export {compression_label} recipe for Core AI runtime validation.")
         return True
 
-    print(f"\n[FAIL] Compression changes the candidate token set "
-          f"(top-5={top5:.1%}).")
-    print("       Consider 8bit instead of 4bit, or a mixed-precision YAML recipe.")
+    if mean_pass and not worst_pass:
+        print(f"\n[CAUTION] Mean quality acceptable but worst-case image ({worst_image}) "
+              f"shows significant degradation ({worst_top5:.1%} top-5).")
+        print(f"          Consider mixed-precision YAML to protect sensitive inputs.")
+        return False
+
+    print(f"\n[CAUTION] Recipe quality below threshold (mean top-5={top5_mean:.1%}).")
+    print(f"          Consider 8bit instead of 4bit, or a mixed-precision YAML recipe.")
     return False
 
 
