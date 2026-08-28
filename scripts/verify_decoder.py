@@ -493,7 +493,7 @@ def phase_compression(
     print(f"PHASE 4 — COMPRESSION QUALITY ({compression_label})")
     print("=" * 60)
     print("Comparing compressed vs fp16 at the final generation position.")
-    print("Evaluated over the full fixture corpus for statistical coverage.")
+    print("Evaluated over the full fixture corpus for representative coverage.")
 
     hidden   = text_cfg.hidden_size
     n_layers = text_cfg.num_hidden_layers
@@ -561,6 +561,12 @@ def phase_compression(
             worst_image = Path(fix.image_path).name
 
     # Aggregate: mean and worst across corpus
+    # Margin ratio: cap at ±100 before averaging to prevent pathological means
+    # when fp16 reference margins are near zero (ratio blows up)
+    def _mean_capped(key, cap=100.0):
+        vals = [max(-cap, min(cap, r[key])) for _, r in all_reports]
+        return sum(vals) / len(vals)
+
     def _mean(key):
         return sum(r[key] for _, r in all_reports) / len(all_reports)
     def _worst(key):
@@ -583,7 +589,7 @@ def phase_compression(
     print(f"  {'KL divergence':<22} {_mean('kl_divergence'):>10.4f} {_best('kl_divergence'):>10.4f}")
     print(f"  {'Top-5 overlap':<22} {_mean('top5_overlap'):>9.1%} {_worst('top5_overlap'):>9.1%}")
     print(f"  {'Top-1 agreement':<22} {_mean('top1_agreement'):>9.1%} {_worst('top1_agreement'):>9.1%}   (context only)")
-    print(f"  {'Margin preservation':<22} {_mean('margin_ratio'):>10.4f} {_worst('margin_ratio'):>10.4f}")
+    print(f"  {'Margin preservation':<22} {_mean_capped('margin_ratio'):>10.4f} {_worst('margin_ratio'):>10.4f}")
 
     top5_mean  = _mean("top5_overlap")
     top5_worst = _worst("top5_overlap")
