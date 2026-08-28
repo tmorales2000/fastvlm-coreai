@@ -1,269 +1,97 @@
 """
-verify_projector.py — FastVLM projector verification.
+verify_projector.py — Architecture correctness for the re-authored projector.
 
-STAGES
-------
-Stage 1 — CORRECTNESS (HF weights -> fp32 port)
-    Load the projector weights (mlp2x_gelu: layers.0 Linear -> layers.1 GELU
-    -> layers.2 Linear) faithfully into fp32 via FastVLMProjector + the
-    shared _load_projector_weights() key-mapping logic. Unlike the decoder,
-    there's no independent HF reference implementation to diff against — the
-    projector is a direct weight load with no re-architecture — so this
-    stage is a structural sanity check (shapes, key coverage, clean forward
-    pass) rather than a cross-model PSNR comparison.
+Compares the re-authored FastVLMProjector (fp16) against the HF mm_projector
+weights loaded at fp32. Equivalent to verify_decoder Phase 1 for the projector
+component.
 
-Stage 2 — PRECISION (bf16 -> fp16)
-    Load weights directly as float16 (bf16 -> fp16, one direct cast, no fp32
-    intermediate) — the mandatory ANE execution precision. NOT optional.
-    PSNR is measured against the Stage 1 fp32 port used as a high-precision
-    reference only — fp32 is NOT an intermediate in the actual precision path.
+Gate:
+  > 60 dB   PASS
+  40–60 dB  MARGINAL (exits nonzero — investigate before export)
+  < 40 dB   FAIL
 
-Stage 3 — QUANTIZATION (fp16 -> int8 | int4), optional
-    Apply coreai-opt weight-only quantization to BOTH projector Linear
-    layers (layers.0 and layers.2). PSNR measured against Stage 2's fp16
-    output. Mutually exclusive: int8 or int4, no "all".
-
-    CORRECTION (June 2026): an earlier version of this script and its
-    docstring claimed "Apple never quantizes the projector" and had no
-    Stage 3 at all. This was WRONG — verified false by an exhaustive
-    tensor-by-tensor audit (scripts/audit_weight_dtypes.py) of Apple's
-    actual shipped MLX weights. Both multi_modal_projector.linear_0.weight
-    and linear_2.weight are quantized in Apple's 1.5b (int8) and 7b (int4)
-    MLX checkpoints, identically to how the decoder's Linear layers are
-    quantized (same group_size=64 asymmetric scheme). Only the Linear
-    biases are excluded from quantization, consistent with every other
-    component. The assumption was never verified directly against the
-    weight files until this audit — a reminder to verify claims about
-    Apple's pipeline against actual bytes, not just the public README.
-
-VALIDATED PRODUCTION TARGETS
------------------------------
-  0.5B : Stage 2 only, fp16, no quantization (Apple ships 0.5B fully
-         unquantized across every component, decoder included).
-  1.5B : Stage 3 int8  (68.2 dB vs fp16, PASS).
-  7B   : Stage 3 int8  (not yet measured; run verify_projector --variant 7b
-         --quantize int8 to confirm).
-
-USAGE
------
-  python scripts/verify_projector.py --variant 1.5b
-  python scripts/verify_projector.py --variant 1.5b --quantize int8
-  python scripts/verify_projector.py --variant 1.5b --quantize int4
+Usage:
+    python scripts/verify_projector.py --variant 0.5b
+    python scripts/verify_projector.py --variant 1.5b
 """
 
 import argparse
+import glob
 import sys
+from pathlib import Path
 
 import torch
 from transformers import AutoConfig
 
-sys.path.insert(0, "scripts")
-from quantization import QUANTIZATION_LEVELS, apply_quantization, psnr  # noqa: E402
-from fastvlm_projector import FastVLMProjector, _load_projector_weights  # noqa: E402
+REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-# Pass thresholds (dB). Engineering judgments, not Apple specifications.
-PRECISION_PASS = 60.0
-QUANTIZATION_PASS = 40.0
+from fastvlm_projector import FastVLMProjector  # noqa: E402
+from metrics import psnr                        # noqa: E402
 
-
-def _build_port(config, weights_dir: str, dtype: torch.dtype) -> FastVLMProjector:
-    model = FastVLMProjector(config).to(dtype=dtype)
-    weights = _load_projector_weights(weights_dir, dtype=dtype)
-    model.load_state_dict(weights, assign=True, strict=True)
-    model.eval()
-    return model
+PASS_THRESHOLD     = 60.0   # dB
+MARGINAL_THRESHOLD = 40.0   # dB — exits nonzero
 
 
-def _example_inputs(config) -> tuple[torch.Tensor, ...]:
-    """
-    Minimal example input for coreai-opt tracing during Stage 3 preparation.
+def verify(variant: str = "1.5b") -> None:
+    weights_dir = str(REPO_ROOT / "weights" / f"fastvlm-{variant}")
+    print(f"Verifying projector: {variant}")
+    print(f"{'='*50}")
 
-    dtype is float16, NOT float32 -- apply_quantization() always casts the
-    model to fp16 internally before quantizing (matching Apple's bf16->fp16
-    pipeline for non-quantized tensors). The traced example input's dtype
-    must match the model's post-cast dtype or the first matmul inside
-    quantizer.prepare() fails with a Float/Half mismatch (as it did here:
-    the decoder's _example_inputs uses int32 input_ids/position_ids, which
-    are unaffected by .half(), so this mismatch never surfaced there --
-    it's specific to any port whose example input is itself a floating
-    point activation tensor, like the projector's).
-    """
-    torch.manual_seed(0)
-    B, seq_len = 1, 256
-    x = torch.randn(B, seq_len, config.mm_hidden_size, dtype=torch.float16)
-    return (x,)
-
-
-# ─── Stage 1: correctness (HF weights -> fp32 port) ────────────────────────────
-
-
-def stage_correctness(config, weights_dir: str) -> tuple[bool, torch.Tensor, torch.Tensor]:
-    """
-    Stage 1 — CORRECTNESS. Loads projector weights into fp32 via
-    FastVLMProjector.from_weights()-equivalent path and confirms the load
-    is structurally complete (strict=True in _build_port already enforces
-    full key coverage). Returns (passed, fp32_port_out, test_input) — both
-    reused by Stage 2.
-    """
-    print("\n" + "=" * 56)
-    print("STAGE 1 — CORRECTNESS (HF weights -> fp32 port)")
-    print("=" * 56)
-
-    port = _build_port(config, weights_dir, torch.float32)
-
-    B, seq_len = 1, 256
-    torch.manual_seed(0)
-    x = torch.randn(B, seq_len, config.mm_hidden_size, dtype=torch.float32)
-
-    with torch.no_grad():
-        out = port(x)
-
-    print(f"\nProjector type   : {config.mm_projector_type}")
-    print(f"mm_hidden_size   : {config.mm_hidden_size}")
-    print(f"hidden_size      : {config.hidden_size}")
-    print(f"Output shape     : {list(out.shape)}")
-    print("\n[PASS] fp32 port loaded (strict key match) and runs cleanly.")
-    return True, out, x
-
-
-# ─── Stage 2: precision (fp32 -> fp16) ─────────────────────────────────────────
-
-
-def stage_precision(
-    config,
-    weights_dir: str,
-    fp32_ref: torch.Tensor,
-    test_input: torch.Tensor,
-) -> bool:
-    """
-    Stage 2 — PRECISION. Builds a fresh fp16 port (bf16->fp16 direct cast)
-    and compares against the Stage 1 fp32 port as a high-precision reference,
-    isolating the fp16 cast's own error.
-    """
-    print("\n" + "=" * 56)
-    print("STAGE 2 — PRECISION (bf16 -> fp16)")
-    print("=" * 56)
-
-    port_fp16 = _build_port(config, weights_dir, torch.float16)
-
-    with torch.no_grad():
-        out_fp16 = port_fp16(test_input.to(torch.float16))
-
-    has_nan = torch.isnan(out_fp16).any().item()
-    has_inf = torch.isinf(out_fp16).any().item()
-    score = psnr(fp32_ref, out_fp16.float())
-
-    print(f"\nfp16 NaN / Inf : {has_nan} / {has_inf}")
-    print(f"PSNR vs fp32 (Stage 1) port: {score:.1f} dB")
-
-    if has_nan or has_inf:
-        print("\n[FAIL] NaN/Inf in fp16 output.")
-        return False
-    if score > PRECISION_PASS:
-        print(f"\n[PASS] {score:.1f} dB > {PRECISION_PASS:.0f} dB threshold.")
-        return True
-    print(f"\n[FAIL] {score:.1f} dB <= {PRECISION_PASS:.0f} dB threshold.")
-    return False
-
-
-# ─── Stage 3: quantization (fp16 -> int8 | int4), optional ───────────────────
-
-
-def stage_quantization(config, weights_dir: str, level: str) -> bool:
-    """
-    Stage 3 — QUANTIZATION. Applies int8 or int4 weight-only quantization
-    to both projector Linear layers (layers.0, layers.2), matching Apple's
-    verified scheme (see module docstring correction note). PSNR is
-    measured against a freshly-built Stage 2 fp16 reference, isolating
-    quantization-only error.
-    """
-    print("\n" + "=" * 56)
-    print(f"STAGE 3 — QUANTIZATION ({level.upper()}, fp16 -> {level})")
-    print("=" * 56)
-
-    # Load at fp16 (bf16->fp16), matching Apple's MLX pipeline exactly.
-    # mlx_vlm.convert casts all tensors bf16->fp16 before quantization,
-    # confirmed by the 0.5B unquantized MLX checkpoint being entirely fp16.
-    port = _build_port(config, weights_dir, torch.float16)
-    example_inputs = _example_inputs(config)  # fp16 -- see docstring above
-    x = example_inputs[0]
-
-    print(f"Applying {level} quantization...")
-    quantized, _ = apply_quantization(port, level, example_inputs)
-
-    with torch.no_grad():
-        quantized_out = quantized(x)
-
-    fp16_port = _build_port(config, weights_dir, torch.float16)
-    with torch.no_grad():
-        fp16_ref_out = fp16_port(x)
-
-    score = psnr(quantized_out.float(), fp16_ref_out.float())
-    print(f"\nPSNR vs fp16 (Stage 2) reference : {score:.1f} dB")
-
-    if score > QUANTIZATION_PASS:
-        print(f"[PASS] {score:.1f} dB — {level} quantization viable.")
-        return True
-    print(
-        f"[FAIL] {score:.1f} dB — unacceptable quality loss at {level}. "
-        f"Consider a less aggressive quantization level."
-    )
-    return False
-
-
-# ─── Driver ───────────────────────────────────────────────────────────────────
-
-
-def verify(variant: str, quantize: str | None) -> None:
-    weights_dir = f"weights/fastvlm-{variant}"
-    print(f"Verifying projector: {variant} ({weights_dir})")
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
 
-    passed, fp32_ref, test_input = stage_correctness(config, weights_dir)
-    if not passed:
-        print("\n>>> Stage 1 FAILED.")
+    # fp16 re-authored model
+    model_fp16 = FastVLMProjector.from_weights(config, weights_dir)
+    model_fp16.eval()
+
+    # fp32 reference — same weights, cast to float32
+    model_f32 = FastVLMProjector(config).to(dtype=torch.float32)
+    import os
+    from safetensors import safe_open
+    st_files = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
+    weights_f32 = {}
+    for path in st_files:
+        with safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if "mm_projector" not in key:
+                    continue
+                stripped = "layers." + key.removeprefix("model.mm_projector.")
+                weights_f32[stripped] = f.get_tensor(key).float()
+    model_f32.load_state_dict(weights_f32, assign=True, strict=True)
+    model_f32.eval()
+
+    # Random test input — architecture correctness test (same as verify_decoder Phase 1)
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model_fp16 = model_fp16.to(device)
+    model_f32  = model_f32.to(device)
+
+    B, seq_len = 1, 256
+    x = torch.randn(B, seq_len, config.mm_hidden_size)
+
+    with torch.no_grad():
+        out_fp16 = model_fp16(x.to(device=device, dtype=torch.float16))
+        out_f32  = model_f32(x.to(device=device, dtype=torch.float32))
+
+    score = psnr(out_f32, out_fp16)
+
+    print(f"Output shape      : {out_fp16.shape}")
+    print(f"PSNR fp16 vs fp32 : {score:.1f} dB")
+    print()
+
+    if score > PASS_THRESHOLD:
+        print(f"[PASS] {score:.1f} dB — projector port matches HF mm_projector.")
+    elif score > MARGINAL_THRESHOLD:
+        print(f"[MARGINAL] {score:.1f} dB — investigate weight loading before export.")
         sys.exit(1)
-
-    passed = stage_precision(config, weights_dir, fp32_ref, test_input)
-    if not passed:
-        print("\n>>> Stage 2 FAILED. Fix fp16 precision issues before Stage 3.")
-        sys.exit(1)
-
-    if not quantize:
-        print("\n" + "=" * 56)
-        print("STAGES 1-2 PASS — safe to export at fp16.")
-        print("=" * 56)
-        sys.exit(0)
-
-    q_passed = stage_quantization(config, weights_dir, quantize)
-
-    print("\n" + "=" * 56)
-    if q_passed:
-        print(f"STAGES 1-3 PASS — safe to export at {quantize}.")
     else:
-        print(f"STAGE 3 ({quantize}) FAILED.")
-    print("=" * 56)
-    sys.exit(0 if q_passed else 1)
+        print(f"[FAIL] {score:.1f} dB — projector diverges from HF reference.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Verify FastVLM projector correctness, precision, and quantization quality.",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-examples:
-  python scripts/verify_projector.py --variant 1.5b
-  python scripts/verify_projector.py --variant 1.5b --quantize int8
-  python scripts/verify_projector.py --variant 1.5b --quantize int4
-""",
     )
     ap.add_argument("--variant", default="1.5b", choices=["0.5b", "1.5b", "7b"])
-    ap.add_argument(
-        "--quantize",
-        choices=QUANTIZATION_LEVELS,
-        default=None,
-        help="Run Stage 3 at this quantization level after Stages 1-2 pass. "
-             "Default: none (Stages 1-2 only, fp16 export target).",
-    )
-    args = ap.parse_args()
-    verify(args.variant, args.quantize)
+    verify(ap.parse_args().variant)

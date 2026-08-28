@@ -145,29 +145,40 @@ def _load_embed_weights(weights_dir: str) -> torch.Tensor:
     raise FileNotFoundError(f"embed_tokens.weight not found in {weights_dir}")
 
 
-def _make_kv_cache(text_cfg, max_ctx: int, dtype: torch.dtype):
+def _make_kv_cache(text_cfg, max_ctx: int, dtype: torch.dtype,
+                   device: torch.device | None = None):
     n_layers   = text_cfg.num_hidden_layers
     n_kv_heads = text_cfg.num_key_value_heads
     head_dim   = text_cfg.hidden_size // text_cfg.num_attention_heads
     shape = (n_layers, 1, n_kv_heads, max_ctx, head_dim)
-    return torch.zeros(shape, dtype=dtype), torch.zeros(shape, dtype=dtype)
+    kw = dict(dtype=dtype) if device is None else dict(dtype=dtype, device=device)
+    return torch.zeros(shape, **kw), torch.zeros(shape, **kw)
 
 
-def _random_embeds(hidden: int, seq_len: int, dtype: torch.dtype) -> torch.Tensor:
-    return torch.randn(1, seq_len, hidden, dtype=dtype)
+def _random_embeds(hidden: int, seq_len: int, dtype: torch.dtype,
+                   device: torch.device | None = None) -> torch.Tensor:
+    kwargs = dict(dtype=dtype) if device is None else dict(dtype=dtype, device=device)
+    return torch.randn(1, seq_len, hidden, **kwargs)
 
 
 # ── Model builders ────────────────────────────────────────────────────────────
 
-def _build_port(text_cfg, weights_dir: str, dtype: torch.dtype) -> FastVLMDecoder:
+def _build_port(text_cfg, weights_dir: str, dtype: torch.dtype,
+                device: torch.device | None = None) -> FastVLMDecoder:
     weights = _load_decoder_weights(weights_dir, dtype=dtype)
     weights = {k.removeprefix("model."): v for k, v in weights.items()}
-    model   = FastVLMDecoder(text_cfg).to(dtype=dtype)
+    model   = FastVLMDecoder(text_cfg)
     missing, unexpected = model.load_state_dict(weights, assign=True, strict=False)
     if set(missing):
         raise RuntimeError(f"Port missing keys: {set(missing)}")
     if unexpected:
         raise RuntimeError(f"Port unexpected keys: {unexpected}")
+    # to(device) must come AFTER load_state_dict(assign=True) —
+    # assign=True replaces parameters with loaded tensors (CPU from safetensors),
+    # overwriting any prior device placement.
+    model = model.to(dtype=dtype)
+    if device is not None:
+        model = model.to(device)
     return model.eval()
 
 
@@ -211,7 +222,8 @@ def _extract_dtype(cfg: dict) -> str:
 
 # ── Phase 1 — Architecture correctness ───────────────────────────────────────
 
-def phase_correctness(text_cfg, weights_dir: str) -> PhaseResult:
+def phase_correctness(text_cfg, weights_dir: str,
+                      device: torch.device | None = None) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 1 — ARCHITECTURE CORRECTNESS (fp32, port vs HF Qwen2)")
     print("=" * 60)
@@ -241,11 +253,12 @@ def phase_correctness(text_cfg, weights_dir: str) -> PhaseResult:
 
     torch.manual_seed(0)
     L = 8
-    embed_w   = _load_embed_weights(weights_dir).to(torch.float32)
-    input_ids = torch.randint(1, text_cfg.vocab_size, (1, L), dtype=torch.long)
+    dev = device or torch.device("cpu")
+    embed_w   = _load_embed_weights(weights_dir).to(device=dev, dtype=torch.float32)
+    input_ids = torch.randint(1, text_cfg.vocab_size, (1, L), dtype=torch.long, device=dev)
     embeds    = embed_w[input_ids]
-    pos_ids   = torch.arange(L, dtype=torch.long).unsqueeze(0)
-    k_fp32, v_fp32 = _make_kv_cache(text_cfg, max_ctx=256, dtype=torch.float32)
+    pos_ids   = torch.arange(L, dtype=torch.long, device=dev).unsqueeze(0)
+    k_fp32, v_fp32 = _make_kv_cache(text_cfg, max_ctx=256, dtype=torch.float32, device=device)
 
     with torch.no_grad():
         hf_out   = hf(inputs_embeds=embeds, position_ids=pos_ids).logits
@@ -293,6 +306,7 @@ def phase_fidelity(
     weights_dir: str,
     variant: str,
     image_path: str = DEFAULT_FIXTURE_IMAGE,
+    device: torch.device | None = None,
 ) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 2 — FP32 vs FP16 FIDELITY (realistic inputs)")
@@ -323,16 +337,17 @@ def phase_fidelity(
     seq_len  = fixture.seq_len
     max_ctx  = seq_len + 64  # must be >= seq_len for prefill to fit in cache
 
-    # Use fixture inputs_embeds — on CPU, cast to appropriate dtype
-    inputs_embeds_fp32 = fixture.inputs_embeds.float()   # [1, seq, hidden]
-    inputs_embeds_fp16 = fixture.inputs_embeds           # [1, seq, hidden] fp16
-    pos_ids = fixture.position_ids                       # [1, seq] int32
+    # Use fixture inputs_embeds — on CPU, cast to appropriate dtype then move to device
+    dev = device or torch.device("cpu")
+    inputs_embeds_fp32 = fixture.inputs_embeds.float().to(dev)   # [1, seq, hidden]
+    inputs_embeds_fp16 = fixture.inputs_embeds.to(dev)           # [1, seq, hidden] fp16
+    pos_ids = fixture.position_ids.to(dev)                       # [1, seq] int32
 
-    k32, v32 = _make_kv_cache(text_cfg, max_ctx, torch.float32)
-    k16, v16 = _make_kv_cache(text_cfg, max_ctx, torch.float16)
+    k32, v32 = _make_kv_cache(text_cfg, max_ctx, torch.float32, device)
+    k16, v16 = _make_kv_cache(text_cfg, max_ctx, torch.float16, device)
 
-    port_fp32 = _build_port(text_cfg, weights_dir, torch.float32)
-    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16)
+    port_fp32 = _build_port(text_cfg, weights_dir, torch.float32, device)
+    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16, device)
 
     with torch.no_grad():
         out_fp32 = port_fp32(inputs_embeds_fp32, pos_ids.long(), k32, v32)
@@ -368,6 +383,7 @@ def phase_cache(
     weights_dir: str,
     n_prefill: int = 6,
     n_decode: int = 4,
+    device: torch.device | None = None,
 ) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 3 — KV CACHE + FP16 HEALTH")
@@ -382,19 +398,19 @@ def phase_cache(
     max_ctx  = min(total + 4, 256)
 
     torch.manual_seed(1)
-    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16)
+    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16, device)
 
-    full_embeds = _random_embeds(hidden, total, torch.float16)
+    full_embeds = _random_embeds(hidden, total, torch.float16, device)
 
     # Cached pass: prefill n_prefill tokens, then decode n_decode tokens one-by-one.
     # Position IDs must be the full sequence seen so far — not just the current token.
     # For decode step at position p: position_ids = [0, 1, ..., p] so that
     # seq_len = p+1, L = 1, offset = p inside FastVLMAttention.
-    k_cache, v_cache = _make_kv_cache(text_cfg, max_ctx, torch.float16)
+    k_cache, v_cache = _make_kv_cache(text_cfg, max_ctx, torch.float16, device)
     cached_logits = []
     with torch.no_grad():
         # Prefill: positions [0..n_prefill-1]
-        prefill_pos = torch.arange(n_prefill, dtype=torch.int32).unsqueeze(0)
+        prefill_pos = torch.arange(n_prefill, dtype=torch.int32, device=dev).unsqueeze(0)
         _ = port_fp16(
             full_embeds[:, :n_prefill],
             prefill_pos,
@@ -404,7 +420,7 @@ def phase_cache(
         for step in range(n_decode):
             pos = n_prefill + step
             # position_ids = [0..pos] → offset = pos inside the decoder
-            pos_dec = torch.arange(pos + 1, dtype=torch.int32).unsqueeze(0)
+            pos_dec = torch.arange(pos + 1, dtype=torch.int32, device=dev).unsqueeze(0)
             out = port_fp16(
                 full_embeds[:, pos:pos+1],
                 pos_dec,
@@ -424,8 +440,9 @@ def phase_cache(
     # against the full-pass logits at the same positions.
     # This directly answers: does the incremental cached decode agree with
     # the full-context reference? Any KV cache bug breaks this agreement.
-    k_full, v_full = _make_kv_cache(text_cfg, max_ctx, torch.float16)
-    full_pos = torch.arange(total, dtype=torch.int32).unsqueeze(0)
+    k_full, v_full = _make_kv_cache(text_cfg, max_ctx, torch.float16, device)
+    dev = device or torch.device("cpu")
+    full_pos = torch.arange(total, dtype=torch.int32, device=dev).unsqueeze(0)
     with torch.no_grad():
         ref_out = port_fp16(full_embeds, full_pos, k_full, v_full)
     ref = ref_out[:, n_prefill:, :]  # [1, n_decode, vocab]
@@ -460,20 +477,23 @@ def _run_one_fixture(
     n_layers: int,
     n_kv: int,
     head_dim: int,
+    device: torch.device | None = None,
 ) -> dict:
     """Run fp16 and compressed models on one fixture, return final-position metrics."""
     seq_len = fixture.seq_len
     max_ctx = seq_len + 64
-    k_ex = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, dtype=torch.float16)
+    kw = dict(dtype=torch.float16) if device is None else dict(dtype=torch.float16, device=device)
+    k_ex = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim, **kw)
     v_ex = torch.zeros_like(k_ex)
 
+    dev = device or torch.device("cpu")
     with torch.no_grad():
         fp16_out = port_fp16(
-            fixture.inputs_embeds, fixture.position_ids,
+            fixture.inputs_embeds.to(dev), fixture.position_ids.to(dev),
             k_ex.clone(), v_ex.clone(),
         )
         comp_out = port_comp(
-            fixture.inputs_embeds, fixture.position_ids,
+            fixture.inputs_embeds.to(dev), fixture.position_ids.to(dev),
             k_ex.clone(), v_ex.clone(),
         )
 
@@ -488,6 +508,7 @@ def phase_compression(
     compression_config: dict,
     compression_label: str,
     image_path: str = DEFAULT_FIXTURE_IMAGE,
+    device: torch.device | None = None,
 ) -> PhaseResult:
     print("\n" + "=" * 60)
     print(f"PHASE 4 — COMPRESSION QUALITY ({compression_label})")
@@ -530,18 +551,19 @@ def phase_compression(
 
     # Small calibration inputs for quantizer prepare — separate from fixtures
     # to avoid KV cache mutation corrupting the comparison
-    cal_k = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16)
+    dev = device or torch.device("cpu")
+    cal_k = torch.zeros(n_layers, 1, n_kv, 64, head_dim, dtype=torch.float16, device=dev)
     cal_v = torch.zeros_like(cal_k)
     example_inputs = (
-        _random_embeds(hidden, 8, torch.float16),
+        _random_embeds(hidden, 8, torch.float16, dev),
         torch.arange(8, dtype=torch.int32).unsqueeze(0),
         cal_k, cal_v,
     )
 
     # Build fp16 and compressed models once — reuse across all fixtures
-    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16)
+    port_fp16 = _build_port(text_cfg, weights_dir, torch.float16, device)
     print(f"\nApplying {compression_label}...")
-    port_comp = _build_port(text_cfg, weights_dir, torch.float16)
+    port_comp = _build_port(text_cfg, weights_dir, torch.float16, device)
     port_comp = apply_quantization_from_config(
         port_comp, compression_config, example_inputs, finalize=False
     )
@@ -554,7 +576,7 @@ def phase_compression(
     worst_image = ""
 
     for fix in fixtures:
-        r = _run_one_fixture(fix, port_fp16, port_comp, n_layers, n_kv, head_dim)
+        r = _run_one_fixture(fix, port_fp16, port_comp, n_layers, n_kv, head_dim, device)
         all_reports.append((Path(fix.image_path).name, r))
         if r["top5_overlap"] < worst_top5:
             worst_top5  = r["top5_overlap"]
@@ -638,6 +660,9 @@ def verify(
     if compression_config is not None:
         print(f"Compression:       {compression_label}")
 
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"Device:            {device}")
+
     config   = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
 
@@ -646,13 +671,13 @@ def verify(
                                   PhaseResult.SKIPPED, PhaseResult.RECOMMEND) else 1)
 
     if stage == "correctness":
-        _exit(phase_correctness(text_cfg, weights_dir))
+        _exit(phase_correctness(text_cfg, weights_dir, device))
         return
     if stage == "fidelity":
-        _exit(phase_fidelity(text_cfg, weights_dir, variant, image_path))
+        _exit(phase_fidelity(text_cfg, weights_dir, variant, image_path, device))
         return
     if stage == "cache":
-        _exit(phase_cache(text_cfg, weights_dir, n_prefill, n_decode))
+        _exit(phase_cache(text_cfg, weights_dir, n_prefill, n_decode, device))
         return
     if stage == "compression":
         if compression_config is None:
@@ -660,17 +685,17 @@ def verify(
             sys.exit(1)
         _exit(phase_compression(
             text_cfg, weights_dir, variant,
-            compression_config, compression_label, image_path,
+            compression_config, compression_label, image_path, device,
         ))
         return
 
     # all phases
-    r1 = phase_correctness(text_cfg, weights_dir)
+    r1 = phase_correctness(text_cfg, weights_dir, device)
     if r1.is_blocking():
         print(f"\n>>> Stopped at Phase 1 ({r1.value}).")
         sys.exit(1)
-    r2 = phase_fidelity(text_cfg, weights_dir, variant, image_path)
-    r3 = phase_cache(text_cfg, weights_dir, n_prefill, n_decode)
+    r2 = phase_fidelity(text_cfg, weights_dir, variant, image_path, device)
+    r3 = phase_cache(text_cfg, weights_dir, n_prefill, n_decode, device)
     if r3.is_blocking():
         print(f"\n>>> Stopped at Phase 3 ({r3.value}).")
         sys.exit(1)
@@ -679,7 +704,7 @@ def verify(
     if compression_config is not None:
         r4 = phase_compression(
             text_cfg, weights_dir, variant,
-            compression_config, compression_label, image_path,
+            compression_config, compression_label, image_path, device,
         )
 
     print("\n" + "=" * 60)
