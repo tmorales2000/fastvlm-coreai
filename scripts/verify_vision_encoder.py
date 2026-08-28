@@ -67,26 +67,17 @@ def verify(variant: str = "1.5b") -> None:
     model_f32.eval()
 
     # Random test input — architecture correctness test (same as verify_decoder Phase 1)
-    # Use MPS if available — 1024x1024 vision encoder with 186 conv2d ops is
-    # extremely slow on CPU (~320s). torch.autocast not needed on MPS since
-    # Metal handles mixed precision natively.
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # Always CPU — IEEE 754 strict fp32 for meaningful PSNR comparison.
+    # MPS rounding produces lower scores that don't indicate bugs.
+    # torch.autocast promotes fp16 attention ops to fp32 to prevent overflow at network.9.
+    model_fp16 = model_fp16.cpu()
+    model_f32  = model_f32.cpu()
     pixels = torch.randn(1, 3, image_size, image_size)
 
-    model_fp16 = model_fp16.to(device)
-    model_f32  = model_f32.to(device)
-
-    if device.type == "mps":
-        with torch.no_grad():
-            features_fp16 = model_fp16(pixels.to(device=device, dtype=torch.float16))
-        with torch.no_grad():
-            features_f32 = model_f32(pixels.to(device=device, dtype=torch.float32))
-    else:
-        # CPU fallback — use autocast to prevent fp16 overflow at network.9
-        with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.float16):
-            features_fp16 = model_fp16(pixels.to(torch.float16))
-        with torch.no_grad():
-            features_f32 = model_f32(pixels.to(torch.float32))
+    with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.float16):
+        features_fp16 = model_fp16(pixels.to(torch.float16))
+    with torch.no_grad():
+        features_f32 = model_f32(pixels.to(torch.float32))
 
     score = psnr(features_f32, features_fp16)
 

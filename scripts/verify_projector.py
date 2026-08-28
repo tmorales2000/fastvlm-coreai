@@ -61,16 +61,17 @@ def verify(variant: str = "1.5b") -> None:
     model_f32.eval()
 
     # Random test input — architecture correctness test (same as verify_decoder Phase 1)
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model_fp16 = model_fp16.to(device)
-    model_f32  = model_f32.to(device)
+    # Always CPU — IEEE 754 strict fp32 for meaningful PSNR comparison.
+    # MPS rounding produces lower scores that don't indicate bugs.
+    model_fp16 = model_fp16.cpu()
+    model_f32  = model_f32.cpu()
 
     B, seq_len = 1, 256
     x = torch.randn(B, seq_len, config.mm_hidden_size)
 
     with torch.no_grad():
-        out_fp16 = model_fp16(x.to(device=device, dtype=torch.float16))
-        out_f32  = model_f32(x.to(device=device, dtype=torch.float32))
+        out_fp16 = model_fp16(x.to(torch.float16))
+        out_f32  = model_f32(x.to(torch.float32))
 
     score = psnr(out_f32, out_fp16)
 
