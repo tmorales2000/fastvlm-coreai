@@ -62,17 +62,19 @@ import torch
 # Bumping invalidates all cached fixtures, forcing a rebuild.
 FIXTURE_SCHEMA_VERSION = 2
 
-# Default corpus — the nine semantic images from test_assets
+# Default corpus — semantic images from test_assets/images/
+# Excludes synthetic aspect-ratio fixtures (tall_narrow_circle, wide_short_square)
+# which are degenerate for recipe quality testing.
 CORPUS_IMAGES = [
     "test_assets/images/great_wave.jpg",
     "test_assets/images/earthrise.jpg",
-    "test_assets/images/afghan_girl.jpg",
-    "test_assets/images/pale_blue_dot.jpg",
-    "test_assets/images/street_scene.jpg",
-    "test_assets/images/food_spread.jpg",
-    "test_assets/images/architecture.jpg",
-    "test_assets/images/wildlife.jpg",
-    "test_assets/images/portrait.jpg",
+    "test_assets/images/blue_marble.jpg",
+    "test_assets/images/pale_blue_dot.png",
+    "test_assets/images/pillars_of_creation.jpg",
+    "test_assets/images/hubble_deep_field.jpg",
+    "test_assets/images/girl_pearl_earring.jpg",
+    "test_assets/images/migrant_mother.jpg",
+    "test_assets/images/lunch_skyscraper.jpg",
 ]
 
 # Fixed evaluation prompt — same across all images for cross-recipe comparison
@@ -437,7 +439,7 @@ def build_corpus_fixtures(
             image = Image.open(img_path).convert("RGB")
         except FileNotFoundError:
             if verbose:
-                print(f"[corpus] Skipping missing image: {img_path}")
+                print(f"[corpus] MISSING: {img_path} — skipping")
             continue
 
         pixel_values = image_processor(images=image, return_tensors="pt")["pixel_values"]
