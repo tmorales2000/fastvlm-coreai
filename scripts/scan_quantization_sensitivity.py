@@ -204,50 +204,53 @@ def load_calibration_images(
     return pixel_values_list
 
 
-def get_reference_logits(
-    model,
-    pixel_values_list: list[torch.Tensor],
-    tokenizer,
+def get_reference_logits_from_fixtures(
+    decoder,
+    fixtures: list,
     device: torch.device,
+    text_cfg,
 ) -> list[torch.Tensor]:
-    """Get reference logits from unquantized model for each calibration image."""
-    model.eval()
-    IMAGE_TOKEN_INDEX = -200
-    prompt = "\nDescribe this image."
+    """Get reference logits from the decoder using pre-built fixtures.
 
-    before_tok = tokenizer("USER: ", return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
-    after_tok = tokenizer(f"\nDescribe this image.\nASSISTANT:",
-                         return_tensors="pt",
-                         add_special_tokens=False)["input_ids"].to(device)
-    sentinel = torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=torch.long, device=device)
-    input_ids = torch.cat([before_tok, sentinel, after_tok], dim=1)
+    Uses fixtures from fastvlm_fixtures.py — real multimodal decoder inputs
+    (image → vision encoder → projector → scatter-merge) — rather than running
+    the full model on pixel values. Produces more accurate sensitivity measurements
+    because the inputs match the real deployment distribution.
+    """
+    import torch
+    n_layers = text_cfg.num_hidden_layers
+    n_kv     = text_cfg.num_key_value_heads
+    head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
 
+    decoder.eval()
     logits_list = []
     with torch.no_grad():
-        for pv in pixel_values_list:
-            out = model(
-                input_ids=input_ids,
-                images=[pv[0]],
-                output_hidden_states=False,
-            )
-            # Take logits at the last position
-            logits_list.append(out.logits[0, -1, :].float().cpu())
-
+        for fix in fixtures:
+            inputs_embeds = fix.inputs_embeds.to(device=device, dtype=torch.float16)
+            position_ids  = fix.position_ids.to(device=device)
+            max_ctx = fix.seq_len + 64
+            k = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim,
+                          dtype=torch.float16, device=device)
+            v = torch.zeros_like(k)
+            out = decoder(inputs_embeds, position_ids, k, v)
+            # Final position logit — the generation decision
+            logits_list.append(out[0, -1, :].float().cpu())
     return logits_list
 
+
+# KL divergence imported from canonical metrics module
+from metrics import kl_divergence as _metrics_kl_divergence
 
 def kl_divergence(
     logits_ref: torch.Tensor,
     logits_quant: torch.Tensor,
     temperature: float = 1.0,
 ) -> float:
-    """KL divergence between reference and quantized model output distributions."""
-    p = F.softmax(logits_ref / temperature, dim=-1)
-    q = F.softmax(logits_quant / temperature, dim=-1)
-    # KL(P || Q) = sum(P * log(P/Q))
-    kl = (p * (p / (q + 1e-10) + 1e-10).log()).sum().item()
-    return max(0.0, kl)  # numerical clamp
+    """KL divergence — delegates to metrics.kl_divergence for consistency."""
+    if temperature != 1.0:
+        logits_ref   = logits_ref   / temperature
+        logits_quant = logits_quant / temperature
+    return _metrics_kl_divergence(logits_ref.unsqueeze(0), logits_quant.unsqueeze(0))
 
 
 def scan_layer(
@@ -255,49 +258,49 @@ def scan_layer(
     layer_name: str,
     param: nn.Parameter,
     ref_logits_list: list[torch.Tensor],
-    pixel_values_list: list[torch.Tensor],
-    tokenizer,
+    fixtures: list,
     device: torch.device,
     local_only: bool,
+    text_cfg=None,
     bits: int = 8,
 ) -> tuple[float, float]:
-    """
-    Measure sensitivity of quantizing one layer.
+    """Measure sensitivity of quantizing one layer.
+
     Returns (local_sensitivity, kl_sensitivity).
+    KL sensitivity uses decoder-only inference on pre-built fixtures —
+    faster than full model and uses real multimodal input distribution.
     """
     local_sens_8  = local_sensitivity(param.data, bits=8)
     local_sens_4  = local_sensitivity(param.data, bits=4)
     local_sens    = local_sens_8 if bits == 8 else local_sens_4
 
-    if local_only or not ref_logits_list:
+    if local_only or not ref_logits_list or not fixtures:
         return local_sens, 0.0
+
+    # Build KV cache shape from text_cfg
+    n_layers = text_cfg.num_hidden_layers
+    n_kv     = text_cfg.num_key_value_heads
+    head_dim = text_cfg.hidden_size // text_cfg.num_attention_heads
 
     # Temporarily quantize this one layer
     original_data = param.data.clone()
     quant_fn = quantize_int8_fake if bits == 8 else quantize_int4_fake
     param.data = quant_fn(param.data.float()).to(param.data.dtype)
 
-    # Measure KL on all calibration images
+    # Measure KL using decoder-only inference on pre-built fixtures
     kl_values = []
     model.eval()
-    IMAGE_TOKEN_INDEX = -200
-    before_tok = tokenizer("USER: ", return_tensors="pt",
-                          add_special_tokens=False)["input_ids"].to(device)
-    after_tok = tokenizer("\nDescribe this image.\nASSISTANT:",
-                         return_tensors="pt",
-                         add_special_tokens=False)["input_ids"].to(device)
-    sentinel = torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=torch.long, device=device)
-    input_ids = torch.cat([before_tok, sentinel, after_tok], dim=1)
-
     with torch.no_grad():
-        for pv, ref_logits in zip(pixel_values_list, ref_logits_list):
+        for ref_logits, fix in zip(ref_logits_list, fixtures):
             try:
-                out = model(
-                    input_ids=input_ids,
-                    images=[pv[0]],
-                    output_hidden_states=False,
-                )
-                quant_logits = out.logits[0, -1, :].float().cpu()
+                inputs_embeds = fix.inputs_embeds.to(device=device, dtype=torch.float16)
+                position_ids  = fix.position_ids.to(device=device)
+                max_ctx = fix.seq_len + 64
+                k = torch.zeros(n_layers, 1, n_kv, max_ctx, head_dim,
+                              dtype=torch.float16, device=device)
+                v = torch.zeros_like(k)
+                out = model(inputs_embeds, position_ids, k, v)
+                quant_logits = out[0, -1, :].float().cpu()
                 kl = kl_divergence(ref_logits, quant_logits)
                 kl_values.append(kl)
             except Exception:
@@ -563,47 +566,76 @@ def main() -> None:
     print(f"  Vision:  {'included' if args.include_vision else 'excluded (use --include-vision)'}")
     print()
 
-    # Load model and tokenizer
-    print("Loading model...")
+    # Load model config and decoder
+    from transformers import AutoConfig
+    from fastvlm_decoder import FastVLMDecoder, _load_decoder_weights
+
+    config   = AutoConfig.from_pretrained(str(weights_dir), trust_remote_code=True)
+    text_cfg = getattr(config, "text_config", config)
+
+    print("Loading decoder...")
     t0 = time.time()
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(str(weights_dir), trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        str(weights_dir),
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).eval().to(device)
+    w = _load_decoder_weights(str(weights_dir), dtype=dtype)
+    w = {k.removeprefix("model."): v for k, v in w.items()}
+    decoder = FastVLMDecoder(text_cfg).eval()
+    decoder.load_state_dict(w, strict=False, assign=True)
+    decoder = decoder.to(dtype=dtype, device=device)
     print(f"  Loaded in {time.time()-t0:.1f}s")
 
-    # Load calibration images
-    print("\nLoading calibration images...")
-    image_processor = model.get_vision_tower().image_processor
-    pixel_values_list = load_calibration_images(
-        args.calibration_dir, image_processor,
-        args.max_calibration_images, device, dtype
-    )
-
-    # Get reference logits
+    # Load corpus fixtures for KL measurement
+    fixtures       = []
     ref_logits_list = []
-    if not args.local_only and pixel_values_list:
-        print("\nComputing reference logits...")
-        t0 = time.time()
-        ref_logits_list = get_reference_logits(model, pixel_values_list, tokenizer, device)
-        print(f"  Done in {time.time()-t0:.1f}s ({len(ref_logits_list)} images)")
+    if not args.local_only:
+        print("\nLoading corpus fixtures...")
+        from fastvlm_fixtures import build_corpus_fixtures
+        try:
+            fixtures = build_corpus_fixtures(
+                variant=args.variant,
+                use_cache=True,
+                verbose=True,
+            )
+            if fixtures:
+                print(f"\n  Computing reference logits on {len(fixtures)} fixtures...")
+                t0 = time.time()
+                ref_logits_list = get_reference_logits_from_fixtures(
+                    decoder, fixtures, device, text_cfg
+                )
+                print(f"  Done in {time.time()-t0:.1f}s")
+            else:
+                print("  No fixtures — run build_fixtures.py first. Falling back to local-only.")
+        except Exception as e:
+            print(f"  Fixture load failed: {e}. Falling back to local-only.")
 
-    # Collect quantizable layers
+    # Full model only needed for --include-vision
+    model = None
+    if args.include_vision:
+        print("\nLoading full model for vision tower scan...")
+        from transformers import AutoModelForCausalLM
+        t0 = time.time()
+        model = AutoModelForCausalLM.from_pretrained(
+            str(weights_dir), dtype=dtype,
+            trust_remote_code=True, low_cpu_mem_usage=True,
+        ).eval().to(device)
+        print(f"  Loaded in {time.time()-t0:.1f}s")
+
+    # Collect quantizable layers from decoder
+    # Vision tower layers collected from full model if --include-vision
     print("\nScanning layers...")
     quantizable = []
-    for name, param in model.named_parameters():
+    for name, param in decoder.named_parameters():
         if param.dim() < 2:
             continue  # skip 1D params (biases, norms)
         if param.numel() < 512:
             continue  # skip tiny layers
-        is_vision = any(p in name for p in VISION_TOWER_PATTERNS)
-        if is_vision and not args.include_vision:
-            continue
         quantizable.append((name, param))
+
+    if args.include_vision and model is not None:
+        for name, param in model.named_parameters():
+            if not any(p in name for p in VISION_TOWER_PATTERNS):
+                continue
+            if param.dim() < 2 or param.numel() < 512:
+                continue
+            quantizable.append((name, param))
 
     print(f"  Found {len(quantizable)} quantizable weight tensors")
     if args.include_vision:
@@ -632,10 +664,12 @@ def main() -> None:
                 recommended_int4="fp16",
             )
         else:
+            # Use decoder for scanning — KL measured on pre-built fixtures
+            scan_model = model if any(p in name for p in VISION_TOWER_PATTERNS) else decoder
             local_8, kl_8 = scan_layer(
-                model, name, param,
-                ref_logits_list, pixel_values_list,
-                tokenizer, device, args.local_only, bits=8
+                scan_model, name, param,
+                ref_logits_list, fixtures,
+                device, args.local_only, text_cfg, bits=8
             )
             s = LayerSensitivity(
                 name=name,
