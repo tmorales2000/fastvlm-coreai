@@ -7,7 +7,8 @@ Phases run in order and stop at the first hard failure.
       Does our re-authored decoder compute the same thing as the original?
       Both models receive identical random inputs_embeds in fp32.
       Purpose: catch re-authoring bugs, not precision issues.
-      Gate: > 80 dB logits PSNR. We typically achieve ~113 dB.
+      Gate: >80 dB PASS, 50–80 dB MARGINAL (exits nonzero), <50 dB FAIL.
+      Known-good implementations score ~100+ dB.
 
   Phase 2 — FP32 vs FP16 FIDELITY (realistic inputs)
       Runs the decoder in fp32 and fp16 on identical REALISTIC inputs
@@ -29,7 +30,7 @@ Phases run in order and stop at the first hard failure.
       metrics across the corpus.
       Primary gate: top-5 overlap ≥ 80% mean AND ≥ 60% worst case.
       Top-1 agreement and KL divergence are context only — top-1 flips between
-      semantically equivalent candidates (e.g. 'The' vs 'This') are expected.
+      candidates already favored by the FP16 baseline are expected under compression.
       INCONCLUSIVE if corpus fixtures are unavailable (no random fallback).
       Enable with --compression or --compression-config.
 
@@ -45,6 +46,7 @@ Usage:
 import argparse
 import glob
 import sys
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,30 @@ import safetensors.torch as st
 import torch
 from transformers import AutoConfig
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config, Qwen2ForCausalLM
+
+
+class PhaseResult(Enum):
+    """Result enum for verification phases.
+
+    Richer than bool — distinguishes INCONCLUSIVE (could not test)
+    from CAUTION (tested, below threshold) from PASS/FAIL (hard gates).
+    """
+    PASS         = "PASS"          # Phase 1, 3: hard gate passed
+    MARGINAL     = "MARGINAL"      # Phase 1: 50–80 dB, investigate
+    FAIL         = "FAIL"          # Phase 1, 3: hard gate failed
+    MEASURED     = "MEASURED"      # Phase 2: informational, fixture available
+    SKIPPED      = "SKIPPED"       # Phase 2: fixture unavailable
+    RECOMMEND    = "RECOMMEND"     # Phase 4: export for Core AI validation
+    CAUTION      = "CAUTION"       # Phase 4: below threshold
+    INCONCLUSIVE = "INCONCLUSIVE"  # Phase 4: corpus unavailable/incomplete
+
+    def is_blocking(self) -> bool:
+        """True if this result should stop the pipeline."""
+        return self in (PhaseResult.FAIL, PhaseResult.MARGINAL, PhaseResult.CAUTION,
+                        PhaseResult.INCONCLUSIVE)
+
+    def is_ok_to_continue(self) -> bool:
+        return not self.is_blocking()
 
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -80,23 +106,23 @@ from quantization import (  # noqa: E402
 )
 
 # ── Phase 1 thresholds ────────────────────────────────────────────────────────
-CORRECTNESS_PASS     = 80.0   # dB — logits PSNR vs HF reference
-CORRECTNESS_MARGINAL = 50.0   # dB — worth investigating
+# Hard gates — MARGINAL exits nonzero (pipeline stops).
+# Our known-good implementations score ~100+ dB; a sudden drop to 50–80 dB
+# means the decoder cannot be trusted for compression evaluation.
+CORRECTNESS_PASS     = 80.0   # dB — clean PASS, port matches HF Qwen2
+CORRECTNESS_MARGINAL = 50.0   # dB — MARGINAL, exits nonzero, investigate
 
 # ── Phase 3 thresholds ────────────────────────────────────────────────────────
 CACHE_PASS     = 40.0    # dB — decode PSNR with KV cache
 FP16_OVERFLOW  = 60000.0  # fp16 ceiling is 65504
 
 # ── Phase 4 thresholds ────────────────────────────────────────────────────────
-# Primary gate: top-5 overlap — "do the same reasonable tokens appear?"
-# Top-1 agreement is reported as context but not gated — it flips when
-# top candidates have similar logit values, which is expected under compression.
-COMPRESSION_TOP5_PASS = 0.80   # top-5 overlap fraction (mean and worst)
-# PSNR reference values — informational context only, NOT a gate.
-# PSNR is retained for continuity but behavioral metrics are the evidence.
-# Renaming from PASS to REFERENCE makes the non-gate role explicit.
-PSNR_REFERENCE_INT8 = 35.0
-PSNR_REFERENCE_INT4 = 20.0   # 21.7 dB verified clean in production (1.5B int4)
+# Primary gate: top-5 overlap — "does the compressed model preserve the
+# FP16 baseline's high-ranking candidate token set?"
+# These are project heuristics intended to rank/reject obviously degraded
+# recipes. They should be calibrated as Core AI A/B data is collected.
+COMPRESSION_TOP5_PASS = 0.80   # top-5 overlap fraction — mean threshold
+COMPRESSION_TOP5_FLOOR = 0.60  # top-5 overlap fraction — worst-case floor
 
 # Default fixture image for Phase 2 and Phase 4
 DEFAULT_FIXTURE_IMAGE = "test_assets/images/great_wave.jpg"
@@ -185,7 +211,7 @@ def _extract_dtype(cfg: dict) -> str:
 
 # ── Phase 1 — Architecture correctness ───────────────────────────────────────
 
-def phase_correctness(text_cfg, weights_dir: str) -> bool:
+def phase_correctness(text_cfg, weights_dir: str) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 1 — ARCHITECTURE CORRECTNESS (fp32, port vs HF Qwen2)")
     print("=" * 60)
@@ -248,14 +274,16 @@ def phase_correctness(text_cfg, weights_dir: str) -> bool:
 
     if logits_score > CORRECTNESS_PASS:
         print(f"\n[PASS] {logits_score:.1f} dB — port matches HF Qwen2.")
-        return True
+        return PhaseResult.PASS
     if logits_score > CORRECTNESS_MARGINAL:
         print(
-            f"\n[WARN] {logits_score:.1f} dB — marginal. Investigate layer {worst_layer}."
+            f"\n[MARGINAL] {logits_score:.1f} dB — investigate layer {worst_layer}."
+            f"\n  Known-good implementations score 100+ dB. This is worth investigating"
+            f"\n  before trusting Phase 4 compression results."
         )
-        return True
+        return PhaseResult.MARGINAL
     print(f"\n[FAIL] {logits_score:.1f} dB — port diverges from HF Qwen2.")
-    return False
+    return PhaseResult.FAIL
 
 
 # ── Phase 2 — FP32 vs FP16 fidelity ──────────────────────────────────────────
@@ -265,7 +293,7 @@ def phase_fidelity(
     weights_dir: str,
     variant: str,
     image_path: str = DEFAULT_FIXTURE_IMAGE,
-) -> bool:
+) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 2 — FP32 vs FP16 FIDELITY (realistic inputs)")
     print("=" * 60)
@@ -284,9 +312,9 @@ def phase_fidelity(
         print(f"seq_len={fixture.seq_len} "
               f"({fixture.image_tokens} image + {fixture.text_tokens} text)")
     except FileNotFoundError as e:
-        print(f"\n[SKIP] Fixture unavailable: {e}")
-        print("       Run with a real image in test_assets/images/")
-        return True  # Non-fatal — Phase 2 is informational
+        print(f"\n[SKIPPED] Fixture unavailable: {e}")
+        print("          Run build_fixtures.py to pre-build corpus fixtures.")
+        return PhaseResult.SKIPPED
 
     hidden   = text_cfg.hidden_size
     n_layers = text_cfg.num_hidden_layers
@@ -327,11 +355,10 @@ def phase_fidelity(
 
     # Phase 2 is informational — always MEASURED, never PASS/FAIL
     # The metrics establish the fp16 deployment baseline used as the Phase 4 reference.
-    print(f"\n[MEASURED] This establishes the FP16 deployment baseline used as "
-          f"the Phase 4 reference.")
+    print(f"\n[MEASURED] FP16 deployment baseline established.")
     print(f"           Note: fixture inputs_embeds are stored as FP16, so Phase 2 measures")
     print(f"           decoder FP32 vs FP16 precision, not full pipeline FP32→FP16 loss.")
-    return True
+    return PhaseResult.MEASURED
 
 
 # ── Phase 3 — KV cache + FP16 health ─────────────────────────────────────────
@@ -341,7 +368,7 @@ def phase_cache(
     weights_dir: str,
     n_prefill: int = 6,
     n_decode: int = 4,
-) -> bool:
+) -> PhaseResult:
     print("\n" + "=" * 60)
     print("PHASE 3 — KV CACHE + FP16 HEALTH")
     print("=" * 60)
@@ -410,18 +437,18 @@ def phase_cache(
 
     if has_nan or has_inf:
         print("\n[FAIL] NaN/Inf in fp16 output.")
-        return False
+        return PhaseResult.FAIL
     if overflow:
         print(f"\n[FAIL] fp16 logits near saturation ({max_abs:.0f}).")
-        return False
+        return PhaseResult.FAIL
     if span > CACHE_PASS and first > CACHE_PASS:
         print(f"\n[PASS] fp16 cached decode clean ({span:.1f} dB).")
-        return True
+        return PhaseResult.PASS
     print(
         "\n[FAIL] Cached decode diverges. Check offset, head reshape, "
         "and that mutable_slice_update resolves to coreai_models."
     )
-    return False
+    return PhaseResult.FAIL
 
 
 # ── Phase 4 — Compression quality ────────────────────────────────────────────
@@ -461,7 +488,7 @@ def phase_compression(
     compression_config: dict,
     compression_label: str,
     image_path: str = DEFAULT_FIXTURE_IMAGE,
-) -> bool:
+) -> PhaseResult:
     print("\n" + "=" * 60)
     print(f"PHASE 4 — COMPRESSION QUALITY ({compression_label})")
     print("=" * 60)
@@ -486,12 +513,20 @@ def phase_compression(
         print(f"\n[INCONCLUSIVE] Could not load corpus fixtures: {e}")
         print("  Phase 4 requires realistic multimodal fixtures.")
         print("  Ensure test_assets/images/ contains the corpus images.")
-        return False
+        return PhaseResult.INCONCLUSIVE
 
     if not fixtures:
         print("\n[INCONCLUSIVE] No fixtures available — corpus images missing.")
         print("  Phase 4 cannot evaluate recipe quality without realistic inputs.")
-        return False
+        return PhaseResult.INCONCLUSIVE
+
+    from fastvlm_fixtures import CORPUS_IMAGES
+    if len(fixtures) != len(CORPUS_IMAGES):
+        print(f"\n[INCONCLUSIVE] Corpus incomplete: "
+              f"{len(fixtures)}/{len(CORPUS_IMAGES)} fixtures available.")
+        print(f"  Recipe recommendation requires the complete corpus.")
+        print(f"  Run: python scripts/build_fixtures.py --variant {variant}")
+        return PhaseResult.INCONCLUSIVE
 
     # Small calibration inputs for quantizer prepare — separate from fixtures
     # to avoid KV cache mutation corrupting the comparison
@@ -534,8 +569,7 @@ def phase_compression(
         return max(r[key] for _, r in all_reports)
 
     n         = len(all_reports)
-    dtype_str = _extract_dtype(compression_config)
-    psnr_ref  = PSNR_REFERENCE_INT8 if dtype_str == "int8" else PSNR_REFERENCE_INT4
+
 
     print(f"\n  Corpus: {n} images")
     print(f"  Prompt: \"{DEFAULT_PROMPT}\"")
@@ -543,7 +577,7 @@ def phase_compression(
     print()
     print(f"  {'Metric':<22} {'Mean':>10} {'Worst':>10}")
     print(f"  {'-'*44}")
-    print(f"  {'PSNR (dB)':<22} {_mean('psnr_db'):>10.1f} {_worst('psnr_db'):>10.1f}   (ref: {psnr_ref:.0f} dB)")
+    print(f"  {'PSNR (dB)':<22} {_mean('psnr_db'):>10.1f} {_worst('psnr_db'):>10.1f}")
     print(f"  {'NRMSE':<22} {_mean('nrmse'):>10.4f} {_best('nrmse'):>10.4f}")
     print(f"  {'Cosine similarity':<22} {_mean('cosine'):>10.4f} {_worst('cosine'):>10.4f}")
     print(f"  {'KL divergence':<22} {_mean('kl_divergence'):>10.4f} {_best('kl_divergence'):>10.4f}")
@@ -561,25 +595,25 @@ def phase_compression(
 
     # Primary gate: mean AND worst top-5 overlap
     mean_pass  = top5_mean  >= COMPRESSION_TOP5_PASS
-    worst_pass = top5_worst >= COMPRESSION_TOP5_PASS * 0.75  # 60% floor on worst case
+    worst_pass = top5_worst >= COMPRESSION_TOP5_FLOOR
 
     print(f"\n  Primary gate:")
     print(f"    mean  top-5 overlap : {top5_mean:.1%}  (threshold: ≥{COMPRESSION_TOP5_PASS:.0%})")
-    print(f"    worst top-5 overlap : {top5_worst:.1%}  (floor: ≥{COMPRESSION_TOP5_PASS * 0.75:.0%})")
+    print(f"    worst top-5 overlap : {top5_worst:.1%}  (floor: ≥{COMPRESSION_TOP5_FLOOR:.0%})")
 
     if mean_pass and worst_pass:
         print(f"\n[RECOMMEND] Export {compression_label} recipe for Core AI runtime validation.")
-        return True
+        return PhaseResult.RECOMMEND
 
     if mean_pass and not worst_pass:
         print(f"\n[CAUTION] Mean quality acceptable but worst-case image ({worst_image}) "
               f"shows significant degradation ({worst_top5:.1%} top-5).")
         print(f"          Consider mixed-precision YAML to protect sensitive inputs.")
-        return False
+        return PhaseResult.CAUTION
 
     print(f"\n[CAUTION] Recipe quality below threshold (mean top-5={top5_mean:.1%}).")
     print(f"          Consider 8bit instead of 4bit, or a mixed-precision YAML recipe.")
-    return False
+    return PhaseResult.CAUTION
 
 
 # ── Driver ────────────────────────────────────────────────────────────────────
@@ -601,61 +635,68 @@ def verify(
     config   = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
     text_cfg = getattr(config, "text_config", config)
 
+    def _exit(result: PhaseResult) -> None:
+        sys.exit(0 if result in (PhaseResult.PASS, PhaseResult.MEASURED,
+                                  PhaseResult.SKIPPED, PhaseResult.RECOMMEND) else 1)
+
     if stage == "correctness":
-        sys.exit(0 if phase_correctness(text_cfg, weights_dir) else 1)
+        _exit(phase_correctness(text_cfg, weights_dir))
+        return
     if stage == "fidelity":
-        sys.exit(0 if phase_fidelity(text_cfg, weights_dir, variant, image_path) else 1)
+        _exit(phase_fidelity(text_cfg, weights_dir, variant, image_path))
+        return
     if stage == "cache":
-        sys.exit(0 if phase_cache(text_cfg, weights_dir, n_prefill, n_decode) else 1)
+        _exit(phase_cache(text_cfg, weights_dir, n_prefill, n_decode))
+        return
     if stage == "compression":
         if compression_config is None:
             print("ERROR: --stage compression requires --compression or --compression-config.")
             sys.exit(1)
-        sys.exit(
-            0 if phase_compression(
-                text_cfg, weights_dir, variant,
-                compression_config, compression_label, image_path,
-            ) else 1
-        )
+        _exit(phase_compression(
+            text_cfg, weights_dir, variant,
+            compression_config, compression_label, image_path,
+        ))
+        return
 
     # all phases
-    p1 = phase_correctness(text_cfg, weights_dir)
-    if not p1:
-        print("\n>>> Stopped at Phase 1.")
+    r1 = phase_correctness(text_cfg, weights_dir)
+    if r1.is_blocking():
+        print(f"\n>>> Stopped at Phase 1 ({r1.value}).")
         sys.exit(1)
-    phase_fidelity(text_cfg, weights_dir, variant, image_path)
-    p3 = phase_cache(text_cfg, weights_dir, n_prefill, n_decode)
-    if not p3:
-        print("\n>>> Stopped at Phase 3.")
+    r2 = phase_fidelity(text_cfg, weights_dir, variant, image_path)
+    r3 = phase_cache(text_cfg, weights_dir, n_prefill, n_decode)
+    if r3.is_blocking():
+        print(f"\n>>> Stopped at Phase 3 ({r3.value}).")
         sys.exit(1)
 
-    p4_result = "SKIPPED"
+    r4 = PhaseResult.SKIPPED
     if compression_config is not None:
-        p4_passed = phase_compression(
+        r4 = phase_compression(
             text_cfg, weights_dir, variant,
             compression_config, compression_label, image_path,
         )
-        p4_result = "RECOMMEND" if p4_passed else "CAUTION"
 
     print("\n" + "=" * 60)
     print("DECODER VERIFICATION COMPLETE")
     print("=" * 60)
-    print(f"  Phase 1 — Architecture correctness : PASS")
-    print(f"  Phase 2 — FP16 fidelity            : MEASURED")
-    print(f"  Phase 3 — KV cache correctness     : PASS")
+    print(f"  Phase 1 — Architecture correctness : {r1.value}")
+    print(f"  Phase 2 — FP16 fidelity            : {r2.value}")
+    print(f"  Phase 3 — KV cache correctness     : {r3.value}")
     if compression_config is not None:
-        print(f"  Phase 4 — Recipe quality           : {p4_result}")
-        if p4_result == "RECOMMEND":
-            print(f"\n  Recommendation: Export {compression_label} recipe for Core AI runtime validation.")
-        else:
-            print(f"\n  Caution: Recipe quality below threshold. Consider 8bit or mixed-precision YAML.")
-        print(f"\n  Note: This does not validate the finalized Core AI artifact.")
+        print(f"  Phase 4 — Recipe quality           : {r4.value}")
+    print()
+    if r4 == PhaseResult.RECOMMEND:
+        print(f"  Recommendation: Export {compression_label} recipe for Core AI runtime validation.")
+        print(f"  Note: This does not validate the finalized Core AI artifact.")
         print(f"        Run verify_runtime.py after export for end-to-end validation.")
-    else:
-        print(f"\n  Decoder implementation is ready for export testing.")
+    elif r4 in (PhaseResult.CAUTION, PhaseResult.INCONCLUSIVE):
+        print(f"  {r4.value}: Recipe not recommended for export. See Phase 4 output above.")
+    elif r4 == PhaseResult.SKIPPED:
+        print(f"  Decoder implementation ready for export testing.")
+        print(f"  Add --compression to evaluate a recipe.")
     print("=" * 60)
 
-    if compression_config is not None and p4_result == "CAUTION":
+    if r4.is_blocking():
         sys.exit(1)
 
 
