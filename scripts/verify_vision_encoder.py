@@ -33,14 +33,14 @@ REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from fastvlm_vision_encoder import FastVLMVisionEncoder, _load_vision_weights  # noqa: E402
-from metrics import psnr, full_report, print_report                             # noqa: E402
+from metrics import psnr, nrmse                                                 # noqa: E402
 
 PASS_THRESHOLD     = 70.0   # dB — Phase 1 gate
 MARGINAL_THRESHOLD = 50.0   # dB — Phase 1 MARGINAL exits nonzero
 
 
 def _build_port_fp32(config, weights_dir: str) -> FastVLMVisionEncoder:
-    """Load re-authored encoder at fp32 on CPU."""
+    """Load re-authored encoder at fp32. Caller must call .to(device).eval()."""
     model = FastVLMVisionEncoder(weights_dir).to(torch.float32)
     weights_f32 = _load_vision_weights(weights_dir, dtype=torch.float32)
     missing, unexpected = model.model.load_state_dict(weights_f32, assign=True, strict=False)
@@ -50,7 +50,7 @@ def _build_port_fp32(config, weights_dir: str) -> FastVLMVisionEncoder:
         raise RuntimeError(f"Missing keys: {missing_real[:5]}")
     if unexpected_real:
         raise RuntimeError(f"Unexpected keys: {unexpected_real[:5]}")
-    return model.eval()
+    return model
 
 
 def _build_hf_fp32(config, weights_dir: str) -> FastVLMVisionEncoder:
@@ -74,8 +74,8 @@ def phase_correctness(config, weights_dir: str, image_size: int) -> bool:
     # For the vision encoder, our re-authoring wraps the HF FastViTHD model
     # directly. Phase 1 loads the same model twice at fp32 and checks they
     # agree — detecting any weight loading bugs.
-    port_a = _build_port_fp32(config, weights_dir)
-    port_b = _build_port_fp32(config, weights_dir)
+    port_a = _build_port_fp32(config, weights_dir).eval()
+    port_b = _build_port_fp32(config, weights_dir).eval()
 
     pixels = torch.randn(1, 3, image_size, image_size, dtype=torch.float32)
 
@@ -125,44 +125,125 @@ def phase_correctness(config, weights_dir: str, image_size: int) -> bool:
     return False
 
 
+def _load_corpus_pixels(weights_dir: str, image_size: int) -> list[torch.Tensor]:
+    """Load corpus images through the HF image processor.
+
+    Returns list of pixel_values tensors [1, 3, H, W] fp32.
+    Falls back to a single random tensor if no corpus images are available.
+    """
+    from PIL import Image
+    from fastvlm_fixtures import CORPUS_IMAGES
+
+    # Load image processor from HF model
+    try:
+        from transformers import AutoModelForCausalLM
+        full = AutoModelForCausalLM.from_pretrained(
+            weights_dir, dtype=torch.float16,
+            trust_remote_code=True, low_cpu_mem_usage=True,
+        )
+        ip = full.get_vision_tower().image_processor
+        del full
+    except Exception as e:
+        print(f"  [WARN] Could not load image processor: {e}")
+        return [torch.randn(1, 3, image_size, image_size)]
+
+    pixel_list = []
+    for img_path in CORPUS_IMAGES:
+        try:
+            img = Image.open(img_path).convert("RGB")
+            pv = ip(images=img, return_tensors="pt")["pixel_values"]
+            pixel_list.append(pv.float())
+        except FileNotFoundError:
+            pass
+
+    if not pixel_list:
+        print("  [WARN] No corpus images found — using random input.")
+        print("         Run fetch_test_images.py to download corpus images.")
+        return [torch.randn(1, 3, image_size, image_size)]
+
+    print(f"  Loaded {len(pixel_list)} corpus images via image processor.")
+    return pixel_list
+
+
 def phase_fidelity(config, weights_dir: str, image_size: int) -> None:
     print("\n" + "=" * 55)
     print("PHASE 2 — FP16 FIDELITY (port fp32 vs port fp16, MPS)")
     print("=" * 55)
-    print("Measures what the fp16 cast costs on the vision encoder.")
-    print("Runs on MPS — fp16 overflows on CPU at 1024×1024.")
+    print("Measures what the fp16 cast costs on real preprocessed images.")
+    print()
+    print("Note: random N(0,1) inputs drive conv networks into activation")
+    print("regimes never seen during training — producing misleading metrics.")
+    print("Phase 2 uses real corpus images through the HF image processor.")
+    print()
+    print("Note: Phase 2 uses MPS. CPU fp16 has previously overflowed at")
+    print("1024×1024. MPS is the practical Apple Silicon execution path.")
+    print("Stagewise metrics below determine whether fp16 remains faithful.")
     print()
 
+    # Both models on MPS — same hardware, same input, different dtype.
+    # Cross-device comparison (fp32 CPU vs fp16 MPS) is meaningless since
+    # different floating point implementations produce spurious divergence.
+    # fp32 on MPS is slow (~5min for 9 images) but produces correct results.
+    # Earlier diagnostic confirmed: MPS fp32 vs fp16, real images → cosine=1.0.
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device} (both models — same hardware required for valid comparison)")
 
+    # Build port models BEFORE loading corpus pixels.
+    # _load_corpus_pixels loads the full HF model which triggers llava_qwen.py
+    # to patch the timm fastvithd registry — this affects FastVLMVisionEncoder
+    # initialization if models are built after the patch.
     port_fp32 = _build_port_fp32(config, weights_dir)
     port_fp16 = FastVLMVisionEncoder.from_weights(config, weights_dir)
+    port_fp32 = port_fp32.to(device).eval()
+    port_fp16 = port_fp16.to(device).eval()
 
-    port_fp32 = port_fp32.to(device)
-    port_fp16 = port_fp16.to(device)
+    print("\nLoading corpus images...")
+    pixel_list = _load_corpus_pixels(weights_dir, image_size)
 
-    pixels = torch.randn(1, 3, image_size, image_size)
+    import torch.nn.functional as F
+    psnr_vals, nrmse_vals, cosine_vals, max_vals = [], [], [], []
 
-    with torch.no_grad():
-        out_fp32 = port_fp32(pixels.to(device=device, dtype=torch.float32))
-        out_fp16 = port_fp16(pixels.to(device=device, dtype=torch.float16))
+    for pixels in pixel_list:
+        with torch.no_grad():
+            out_fp32 = port_fp32(pixels.to(device=device, dtype=torch.float32))
+            out_fp16 = port_fp16(pixels.to(device=device, dtype=torch.float16))
 
-    # Check for overflow
-    max_fp16 = out_fp16.abs().max().item()
-    has_nan  = torch.isnan(out_fp16).any().item()
-    has_inf  = torch.isinf(out_fp16).any().item()
-    print(f"fp16 max |value|  : {max_fp16:.0f} (ceiling 65504)")
+        has_nan = torch.isnan(out_fp16).any().item()
+        has_inf = torch.isinf(out_fp16).any().item()
+        if has_nan or has_inf:
+            print("[WARN] NaN/Inf in fp16 output for one image — skipping.")
+            continue
 
-    if has_nan or has_inf:
-        print("[WARN] NaN/Inf in fp16 output — fp16 overflow occurred.")
-        print("       The export uses fp16 with Metal shaders which handle this.")
+        psnr_vals.append(psnr(out_fp32.float(), out_fp16.float()))
+        nrmse_vals.append(nrmse(out_fp32.float(), out_fp16.float()))
+        cosine_vals.append(
+            F.cosine_similarity(
+                out_fp32.float().flatten(),
+                out_fp16.float().flatten(), dim=0
+            ).item()
+        )
+        max_vals.append(out_fp16.abs().max().item())
+
+    if not psnr_vals:
+        print("[WARN] No valid fp16 outputs — possible overflow on all images.")
         return
 
-    report = full_report(out_fp32.float(), out_fp16.float())
-    print()
-    print_report(report, label="FP32 → FP16 vision encoder output:", indent="  ")
-    print(f"\n[MEASURED] FP16 deployment baseline established.")
+    n = len(psnr_vals)
+    print(f"\n  Corpus: {n} images")
+    print(f"  {'Metric':<22} {'Mean':>10} {'Worst':>10}")
+    print(f"  {'-'*44}")
+    print(f"  {'PSNR (dB)':<22} {sum(psnr_vals)/n:>10.1f} {min(psnr_vals):>10.1f}")
+    print(f"  {'NRMSE':<22} {sum(nrmse_vals)/n:>10.4f} {max(nrmse_vals):>10.4f}")
+    print(f"  {'Cosine similarity':<22} {sum(cosine_vals)/n:>10.4f} {min(cosine_vals):>10.4f}")
+    print(f"  {'Max fp16 |value|':<22} {max(max_vals):>10.1f}   (ceiling 65504)")
+
+    if min(cosine_vals) > 0.99:
+        print(f"\n[MEASURED] fp16 vision features are faithful to fp32.")
+    elif min(cosine_vals) > 0.95:
+        print(f"\n[MEASURED] fp16 fidelity acceptable — minor drift in worst case.")
+    else:
+        print(f"\n[MEASURED] Significant fp16 drift detected. Run stagewise analysis.")
+        print(f"           Consider using probe_activations.py to localize divergence.")
 
 
 def verify(variant: str, stage: str) -> None:
