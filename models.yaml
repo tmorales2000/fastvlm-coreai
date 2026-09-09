@@ -1,0 +1,58 @@
+# models.yaml — FastVLM CoreAI model registry
+#
+# This file defines the models this project supports for CoreAI export,
+# verification, and benchmarking. It is the single source of truth for
+# "what models does this project know about?"
+#
+# Usage:
+#   python scripts/sync_weights.py --list          # show status of all models
+#   python scripts/sync_weights.py --variant 0.5b  # download/verify one model
+#   python scripts/sync_weights.py --all            # download/verify all models
+#
+# Notes:
+#   - MLX quantized weights (apple/FastVLM-1.5B-INT8, apple/FastVLM-7B-INT4)
+#     are NOT listed here. They are managed exclusively by compare_weights.py
+#     and stored in the HF cache (~/.cache/huggingface/), not in weights/.
+#   - The revision field is optional. If omitted, sync_weights.py downloads
+#     the latest from HF and records the actual revision in .provenance.json.
+#     Set revision to pin a specific HF commit for reproducibility.
+
+models:
+
+  # ── FastVLM ───────────────────────────────────────────────────────────────
+  # Apple's FastVLM: FastViT-HD vision encoder + Qwen2 decoder.
+  # Source: https://huggingface.co/apple/FastVLM-{size}
+
+  fastvlm-0.5b:
+    repo: apple/FastVLM-0.5B
+    directory: weights/fastvlm-0.5b
+    type: fastvlm
+    variant: "0.5b"
+    description: "FastVLM 0.5B — Qwen2-0.5B decoder, FastViT-HD vision encoder"
+    # revision: fc2d1a370002183f44d8a1c1ac62cbf14e0c5c85  # uncomment to pin
+
+  fastvlm-1.5b:
+    repo: apple/FastVLM-1.5B
+    directory: weights/fastvlm-1.5b
+    type: fastvlm
+    variant: "1.5b"
+    description: "FastVLM 1.5B — Qwen2-1.5B decoder, FastViT-HD vision encoder"
+
+  fastvlm-7b:
+    repo: apple/FastVLM-7B
+    directory: weights/fastvlm-7b
+    type: fastvlm
+    variant: "7b"
+    description: "FastVLM 7B — Qwen2-7B decoder, FastViT-HD vision encoder"
+
+  # ── Qwen3-VL ──────────────────────────────────────────────────────────────
+  # Alibaba's Qwen3-VL: Apple's reference VLM for CoreAI export.
+  # Listed here for future export/verification support.
+  # sync_weights.py will download weights; export/verify scripts TBD.
+
+  qwen3-vl-2b:
+    repo: Qwen/Qwen3-VL-2B-Instruct
+    directory: weights/qwen3-vl-2b
+    type: qwen3-vl
+    variant: "2b"
+    description: "Qwen3-VL 2B — Apple's reference VLM for CoreAI (export support TBD)"

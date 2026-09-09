@@ -55,11 +55,55 @@ HF_PATHS = {
     "7b":   "weights/fastvlm-7b",
 }
 
-# HF MLX checkpoint paths (quantized weights for comparison)
-MLX_PATHS = {
+# HF repo IDs for MLX quantized weights (managed separately from CoreAI weights)
+# These are downloaded on demand into ~/.cache/huggingface/ — NOT into weights/
+# See: apple/FastVLM-1.5B-int8, apple/FastVLM-7B-int4 on HuggingFace
+MLX_REPOS = {
+    "1.5b": "apple/FastVLM-1.5B-int8",
+    "7b":   "apple/FastVLM-7B-int4",
+}
+
+# Legacy local paths — used as fallback if already downloaded manually
+_MLX_LOCAL_PATHS = {
     "1.5b": "weights/fastvlm-1.5b-int8",
     "7b":   "weights/fastvlm-7b-int4",
 }
+
+
+def get_mlx_path(variant: str) -> str:
+    """Return local path to MLX weights, downloading from HF if needed.
+
+    Checks legacy local directory first (weights/fastvlm-{variant}-{dtype}),
+    then falls back to downloading into the standard HF cache
+    (~/.cache/huggingface/hub/). MLX weights are never stored in weights/
+    for new downloads — they live in the HF cache and are not tracked by
+    sync_weights.py or models.yaml.
+    """
+    import os
+    from pathlib import Path
+
+    # Check legacy local path first
+    local = Path(_MLX_LOCAL_PATHS[variant])
+    if local.exists() and any(local.glob("*.safetensors")):
+        return str(local)
+
+    # Download into HF cache
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        raise RuntimeError(
+            "huggingface_hub not installed. Run: pip install huggingface-hub"
+        )
+
+    repo = MLX_REPOS[variant]
+    print(f"Downloading MLX weights from {repo} into HF cache...")
+    path = snapshot_download(repo_id=repo, local_files_only=False)
+    print(f"  → {path}")
+    return path
+
+
+# For backward compatibility
+MLX_PATHS = _MLX_LOCAL_PATHS
 
 MLX_BITS = {"1.5b": 8, "7b": 4}
 GROUP_SIZE = 64
@@ -229,7 +273,7 @@ def _compare_tensor(
 def compare_decoder(variant: str, show_ours: bool) -> None:
     bits = MLX_BITS[variant]
     hf_path  = HF_PATHS[variant]
-    mlx_path = MLX_PATHS[variant]
+    mlx_path = get_mlx_path(variant)
 
     print(f"\nDecoder — {variant} | int{bits} | group_size={GROUP_SIZE}")
     print(f"HF  : {hf_path}")
@@ -300,7 +344,7 @@ def compare_decoder(variant: str, show_ours: bool) -> None:
 def compare_projector(variant: str, show_ours: bool) -> None:
     bits = MLX_BITS[variant]
     hf_path  = HF_PATHS[variant]
-    mlx_path = MLX_PATHS[variant]
+    mlx_path = get_mlx_path(variant)
 
     print(f"\nProjector — {variant} | int{bits} | group_size={GROUP_SIZE}")
     print(f"HF  : {hf_path}")
