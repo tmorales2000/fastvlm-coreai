@@ -90,7 +90,12 @@ from fastvlm_decoder import (
 )
 from fastvlm_projector import FastVLMProjector
 from fastvlm_vision_encoder import FastVLMVisionEncoder
-from quantization import apply_quantization, finalize_for_export
+from quantization import (
+    load_compression_config,
+    apply_quantization_from_config,
+    finalize_for_export,
+    MACOS_NAMED_PRESETS,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (matching vlm/export.py)
@@ -404,19 +409,19 @@ def _export_decode(
     head_dim   = hidden // text_cfg.num_attention_heads
 
     if quantize:
-        print(f"[INFO] Applying {quantize} quantization...")
-        # Build example inputs for tracing (content doesn't affect weight-only quant)
+        print(f"[INFO] Applying {quantize} compression...")
         ex_k = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
         ex_v = torch.zeros_like(ex_k)
         example_inputs = (
-            torch.randn(1, QUERY_LEN, hidden, dtype=torch.float16),  # inputs_embeds
-            torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0),  # position_ids
-            ex_k,   # k_cache
-            ex_v,   # v_cache
+            torch.randn(1, QUERY_LEN, hidden, dtype=torch.float16),
+            torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0),
+            ex_k,
+            ex_v,
         )
-        model, quantizer = apply_quantization(model, level=quantize, example_inputs=example_inputs)
-        model = finalize_for_export(model, quantizer)
-        print(f"[INFO] Quantization finalized for CoreAI export")
+        compression_config, _ = load_compression_config(quantize, platform="macOS")
+        model = apply_quantization_from_config(model, compression_config, example_inputs)
+        model = finalize_for_export(model, None)
+        print(f"[INFO] Compression finalized for CoreAI export")
 
     # Build reference inputs exactly as vlm/export.py
     k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
