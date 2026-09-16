@@ -10,12 +10,12 @@ Silicon.
 A three-component VLM bundle compatible with `CoreAISequentialVLMEngine`:
 
 ```
-exports/fastvlm-{variant}.vlmasset/
-  vision.aimodel          — FastViTHD encoder + mlp2x_gelu projector
-  embed.aimodel           — Token embedding lookup (input_ids → embeddings)
-  fastvlm-{variant}.aimodel — Qwen2 decoder with stateful KV cache
-  tokenizer/              — Qwen2 tokenizer + <image> special token (ID 151646)
-  metadata.json           — Bundle manifest (kind=vlm)
+exports/fastvlm-{variant}/
+  vision.aimodel              — FastViTHD encoder + mlp2x_gelu projector
+  embed.aimodel               — Token embedding lookup (input_ids → embeddings)
+  fastvlm-{variant}.aimodel   — Qwen2 decoder with stateful KV cache
+  tokenizer/                  — Qwen2 tokenizer + <image> special token (ID 151646)
+  metadata.json               — Bundle manifest (kind=vlm) with provenance
 ```
 
 Supported variants: `0.5b`, `1.5b`, `7b`
@@ -24,13 +24,14 @@ Supported variants: `0.5b`, `1.5b`, `7b`
 
 ### Hardware
 - Apple Silicon Mac
-- macOS 26.5+ (macOS 27 beta has an MPSGraph bug affecting Python runtime
-  verification on macOS 27 beta — see [Known Issues](#known-issues))
+- macOS 27 GM or later
 
 ### Software
 - Python 3.11
 - [uv](https://docs.astral.sh/uv/) package manager
 - Xcode 27+ with Metal Toolchain (`xcrun coreai-build`)
+
+---
 
 ## Installation
 
@@ -44,9 +45,8 @@ cd fastvlm-coreai
 ### 2. Clone coreai-models
 
 `coreai-models` is required for the export pipeline. Clone Apple's upstream repo
-directly — image preprocessing support (`center_crop`, `pad`, `stretch`) was
-merged in [apple/coreai-models #108](https://github.com/apple/coreai-models/pull/108),
-which closed [#100](https://github.com/apple/coreai-models/issues/100).
+directly — the PyPI version has an incorrect `Python>=3.14` constraint and cannot
+be used (see [Known Issues](#known-issues)).
 
 ```bash
 git clone https://github.com/apple/coreai-models.git ~/git/apple/coreai-models
@@ -59,12 +59,12 @@ uv sync
 source .venv/bin/activate
 ```
 
-This installs pinned versions matching Apple's own coreai-models environment:
+Installs pinned versions matching Apple's coreai-models environment:
 
 ```
-torch==2.9.0        — required for asset.executable() with stateful KV cache
+torch==2.9.0
 coreai-core==1.0.0b2
-coreai-torch==0.4.1
+coreai-torch==0.4.2
 coreai-opt==0.2.1
 ```
 
@@ -74,19 +74,27 @@ coreai-opt==0.2.1
 uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
 ```
 
-> **Note:** This step must be repeated after every `uv sync` because `uv sync`
-> does not preserve editable installs from local paths outside the project.
-> The PyPI version of `coreai-models` has an incorrect `Python>=3.14` constraint
-> and cannot be used (see [apple/coreai-models #96](https://github.com/apple/coreai-models/issues/96)).
+> **Note:** `uv sync` will uninstall `coreai-models` because it is not in
+> `pyproject.toml`. Always reinstall it after running `uv sync`.
 
-### 5. Download FastVLM weights
+### 5. Download model weights
+
+Use `sync_weights.py` to download weights from HuggingFace. This records
+provenance (HF revision, download timestamp) into `.provenance.json` alongside
+the weights, which is later stamped into every exported bundle's `metadata.json`.
 
 ```bash
-hf download apple/FastVLM-0.5B --local-dir weights/fastvlm-0.5b
-# Repeat for 1.5b and 7b as needed:
-# hf download apple/FastVLM-1.5B --local-dir weights/fastvlm-1.5b
-# hf download apple/FastVLM-7B   --local-dir weights/fastvlm-7b
+# Download a specific variant
+python scripts/sync_weights.py --variant fastvlm-0.5b
+
+# Download all registered models
+python scripts/sync_weights.py --all
+
+# Show download status
+python scripts/sync_weights.py --list
 ```
+
+See [Provenance](#provenance) for details on what gets recorded and why.
 
 ### 6. Download benchmark test images
 
@@ -94,11 +102,10 @@ hf download apple/FastVLM-0.5B --local-dir weights/fastvlm-0.5b
 python scripts/fetch_test_images.py
 ```
 
-This downloads 9 public domain benchmark images to `test_assets/images/`
-for use with `llm-runner` and `run_hf_fastvlm.py`. See
-`test_assets/images/README.md` for the full catalog and test purposes.
+Downloads 9 public domain images to `test_assets/images/` for use with
+verification scripts and `run_hf_fastvlm.py`.
 
-### 7. Build llm-runner (Swift inference tool)
+### 7. Build llm-runner
 
 Apple's `coreai-models` includes `llm-runner`, a Swift CLI that uses
 `CoreAISequentialVLMEngine` to run any exported VLM bundle end-to-end:
@@ -107,12 +114,8 @@ Apple's `coreai-models` includes `llm-runner`, a Swift CLI that uses
 cd ~/git/apple/coreai-models
 swift build --product llm-runner
 # Binary: .build/out/Products/Debug/llm-runner
-cd -   # return to fastvlm-coreai
+cd -
 ```
-
-> **Note:** First build takes ~20 seconds. Subsequent builds are incremental.
-> If `swift build --product` doesn't produce a binary, run
-> `swift package clean` first then retry.
 
 ### Verify installation
 
@@ -120,7 +123,6 @@ cd -   # return to fastvlm-coreai
 python3 -c "
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.primitives.macos.cache import KVCache
-from coreai_models.export.mlir_ops import remove_functionalization
 print('coreai-models OK')
 import coreai_torch; print(f'coreai-torch {coreai_torch.__version__}')
 import torch; print(f'torch {torch.__version__}')
@@ -139,14 +141,22 @@ python scripts/export_fastvlm.py --variant 0.5b --overwrite
 
 # With compression preset (recommended)
 python scripts/export_fastvlm.py --variant 1.5b --compression 4bit --overwrite
+python scripts/export_fastvlm.py --variant 1.5b --compression 8bit --overwrite
 python scripts/export_fastvlm.py --variant 7b   --compression 4bit --overwrite
 
-# Dynamic KV cache (GrowingKVCache in Swift, lower initial memory)
+# With mixed-precision YAML recipe
+python scripts/export_fastvlm.py --variant 1.5b \
+    --compression-config quantization_recipes/fastvlm-1.5b-aggressive.yaml
+
+# Dynamic KV cache (lower initial memory, useful for mobile)
 python scripts/export_fastvlm.py --variant 0.5b --kv-cache dynamic --overwrite
 
-# Smaller context for mobile
+# Smaller context for mobile deployment
 python scripts/export_fastvlm.py --variant 1.5b --max-context-length 512 --overwrite
 ```
+
+See [docs/RECIPES.md](docs/RECIPES.md) for compression options, benchmarks, and
+how to generate per-model mixed-precision recipes with the scanner.
 
 ### Inspect the bundle
 
@@ -155,7 +165,7 @@ python scripts/export_fastvlm.py --variant 1.5b --max-context-length 512 --overw
 python scripts/inspect_aimodel.py exports/fastvlm-0.5b/
 
 # Individual component
-python scripts/inspect_aimodel.py exports/fastvlm-0.5b//fastvlm-0.5b.aimodel
+python scripts/inspect_aimodel.py exports/fastvlm-0.5b/fastvlm-0.5b.aimodel
 ```
 
 Expected output (0.5B):
@@ -166,139 +176,243 @@ Bundle [PASS]: fastvlm-0.5b/
   vision.aimodel  [PASS]  pixel_values fp32 [1,3,1024,1024] → image_features fp16
 ```
 
-### Verify numerical correctness
+### Verify correctness
 
-Run on macOS 26.5 — see [Known Issues](#known-issues):
+FastVLM CoreAI uses a two-layer verification pipeline. See
+[docs/VERIFICATION.md](docs/VERIFICATION.md) for the complete guide.
+
+**Layer 1 — PyTorch verification** (no CoreAI runtime needed):
 
 ```bash
-python scripts/verify_runtime.py --variant 0.5b
-python scripts/verify_runtime.py --variant 0.5b --decode-steps 5
+# Build fixtures first (one-time per variant, ~5s per image on MPS)
+python scripts/build_fixtures.py --variant 0.5b
+
+# Verify decoder — all four phases
+python scripts/verify_decoder.py --variant 0.5b
+
+# With compression recipe
+python scripts/verify_decoder.py --variant 0.5b --compression 4bit
+
+# Verify projector — two phases
+python scripts/verify_projector.py --variant 0.5b
+
+# Verify vision encoder — two phases
+python scripts/verify_vision_encoder.py --variant 0.5b
 ```
 
-Expected (with `--image` flag for meaningful vision PSNR):
-```
-  ✓ vision_encode PSNR:  71.9 dB (PASS)
-  ✓ project PSNR:        67.6 dB (PASS)
-  ✓ embed_tokens PSNR:   inf dB  (PASS)
-  ✓ scatter_merge PSNR:  67.7 dB (PASS)
-  ✓ decode prefill PSNR: 50.2 dB (PASS > 40 dB)
-  ✓ decode step 1/3:     XX.X dB (PASS > 40 dB)
-[PASS] All stages match PyTorch reference (> 40 dB PSNR).
-```
+**Layer 2 — CoreAI runtime verification** (requires exported bundle):
 
-Without `--image`, vision stages show NaN (expected — fp16 saturation with random input).
-Use `--image test_assets/images/earthrise.jpg` for meaningful end-to-end verification.
+```bash
+python scripts/verify_runtime.py --variant 0.5b \
+    --image test_assets/images/great_wave.jpg
+```
 
 ### Run inference with llm-runner
-
-`llm-runner` from Apple's `coreai-models` is the primary way to run the
-exported bundle via `CoreAISequentialVLMEngine`:
 
 ```bash
 LLM_RUNNER=~/git/apple/coreai-models/.build/out/Products/Debug/llm-runner
 
 # Text only
-$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+$LLM_RUNNER --model exports/fastvlm-0.5b \
   --prompt "What is the capital of France?" \
   --max-tokens 50
 
 # Image + text (VLM)
-$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+$LLM_RUNNER --model exports/fastvlm-0.5b \
   --image test_assets/images/earthrise.jpg \
-  --prompt "What do you see in this image? Describe the colors and spatial arrangement." \
+  --prompt "What do you see in this image?" \
   --max-tokens 300 --temperature 0
 
-# Hallucination resistance test
-$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
-  --image test_assets/images/pale_blue_dot.png \
-  --prompt "Describe exactly what you see in this image." \
-  --max-tokens 200 --temperature 0
-
-# Verbose timing breakdown (TTFT, throughput, memory)
-$LLM_RUNNER --model exports/fastvlm-0.5b.vlmasset \
+# Verbose timing (TTFT, throughput, memory)
+$LLM_RUNNER --model exports/fastvlm-0.5b \
   --image test_assets/images/great_wave.jpg \
   --prompt "Describe this image." \
   --max-tokens 300 --temperature 0 --verbose
 ```
 
-> **`--max-tokens`** is the generation limit (default 50), not the KV cache limit.
-> Set to 300-500 for typical use. The KV cache ceiling is `--max-context-length`
-> set at export time (default 4096).
-
 ### Compare with HuggingFace reference
 
-`run_hf_fastvlm.py` runs the original HF model for ground truth comparison:
-
 ```bash
-# Run HF model on same image/prompt as llm-runner for direct comparison
 python scripts/run_hf_fastvlm.py \
   --variant 0.5b \
   --image test_assets/images/earthrise.jpg \
   --prompt "What do you see in this image?" \
-  --temperature 0
-
-# MPS acceleration (faster on Apple Silicon)
-python scripts/run_hf_fastvlm.py \
-  --variant 0.5b \
-  --image test_assets/images/great_wave.jpg \
-  --prompt "Describe this image." \
   --temperature 0 --device mps
-```
-
-### Compile for ANE (ahead-of-time)
-
-```bash
-xcrun coreai-build compile \
-  --preferred-compute neural-engine \
-  exports/fastvlm-0.5b.vlmasset/fastvlm-0.5b.aimodel
 ```
 
 ---
 
+## Provenance
+
+Every exported bundle's `metadata.json` is stamped with a provenance record
+tracing the exact inputs that produced it:
+
+```json
+"source": {
+  "hf_model_id":              "apple/FastVLM-0.5B",
+  "model_definition":         "torch",
+  "compression":              "4bit",
+  "export_timestamp":         "2026-09-15T18:00:00+00:00",
+  "fastvlm_coreai_git_sha":   "7f08f2807e2e",
+  "hf_revision":              "fc2d1a370002183f44d8a1c1ac62cbf14e0c5c85",
+  "hf_weights_downloaded_at": "2026-09-09T04:20:48+00:00"
+}
+```
+
+This answers the question "where did this bundle come from?" unambiguously:
+
+- **`hf_revision`** — exact HuggingFace commit SHA of the weights used
+- **`fastvlm_coreai_git_sha`** — exact commit of this repo that ran the export
+- **`export_timestamp`** — when the export ran
+- **`hf_weights_downloaded_at`** — when the weights were downloaded from HF
+
+Provenance is written automatically when you use `sync_weights.py` to download
+weights. It requires no extra steps at export time.
+
+### Model registry
+
+`models.yaml` in the repo root is the single source of truth for which models
+this project supports:
+
+```bash
+# See all registered models and their download status
+python scripts/sync_weights.py --list
+
+# Download a specific model
+python scripts/sync_weights.py --variant fastvlm-1.5b
+
+# Force re-download (picks up any HF updates)
+python scripts/sync_weights.py --variant fastvlm-0.5b --force
+```
+
+MLX quantized weights (`apple/FastVLM-1.5B-int8`, etc.) are NOT in the registry.
+They are managed exclusively by `compare_weights.py` and stored in the standard
+HF cache (`~/.cache/huggingface/`).
+
+---
+
+## Verification System
+
+The verification pipeline has two layers and covers three components
+(vision encoder, projector, decoder). Each script runs independently.
+See [docs/VERIFICATION.md](docs/VERIFICATION.md) for the complete guide.
+
+### verify_decoder.py — Four phases
+
+```bash
+python scripts/build_fixtures.py --variant 0.5b  # one-time prerequisite
+python scripts/verify_decoder.py --variant 0.5b --compression 4bit
+```
+
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored decoder vs HF Qwen2 in fp32. Random token sequence using real embedding-table inputs. | >80 dB PASS, 50–80 dB MARGINAL (exits nonzero) |
+| 2 — FP16 fidelity | MPS | Decoder fp32 vs fp16 on real fixture inputs. Establishes the fp16 deployment baseline for Phase 4. | Informational (MEASURED) |
+| 3 — KV cache correctness | MPS | Incremental cached decode vs full-pass reference. Catches cache offset and head reshape bugs. | >40 dB |
+| 4 — Compression quality | CPU prepare → MPS infer | Compressed vs fp16 over 9-image corpus at the final generation position. | Top-5 overlap ≥80% mean, ≥60% worst |
+
+**On PSNR:** PSNR is reported as context throughout but is NOT the gate for any
+phase. The 21.7 dB PSNR for 1.5B int4 fails any reasonable PSNR threshold yet
+the model produces clean output at 115 tok/sec. Behavioral metrics (top-5 overlap,
+KL divergence) are the evidence. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+### verify_projector.py — Two phases
+
+```bash
+python scripts/verify_projector.py --variant 0.5b
+python scripts/verify_projector.py --variant 0.5b --stage correctness
+python scripts/verify_projector.py --variant 0.5b --stage fidelity
+```
+
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored FastVLMProjector vs HF mm_projector (nn.Sequential) in fp32. | >60 dB PASS, 40–60 dB MARGINAL |
+| 2 — FP16 fidelity | CPU | Port fp32 vs port fp16. Measures bf16→fp16 cast cost. | Informational (MEASURED) |
+
+Phase 1 typically produces inf dB (bit-identical) because the projector is two
+`nn.Linear` layers — no architectural difference to introduce error.
+
+### verify_vision_encoder.py — Two phases
+
+```bash
+python scripts/verify_vision_encoder.py --variant 0.5b
+python scripts/verify_vision_encoder.py --variant 0.5b --stage correctness
+python scripts/verify_vision_encoder.py --variant 0.5b --stage fidelity
+```
+
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored encoder vs full HF model integration at fp32. | >70 dB PASS, 50–70 dB MARGINAL |
+| 2 — FP16 fidelity | MPS | Port fp32 vs port fp16 on 9 real corpus images via HF image processor. | Informational (MEASURED) |
+
+**Key findings:**
+- Phase 2 uses MPS — fp16 overflows on CPU at 1024×1024 (FastViTHD has 186
+  conv2d ops, and fp16 saturates at network.9 with random inputs).
+- Phase 2 uses real corpus images — random N(0,1) inputs produce completely
+  misleading metrics (cosine=0.04) due to conv networks saturating outside their
+  training distribution. Real images produce cosine≈1.0, PSNR≈81 dB.
+- Phase 2 requires `.eval()` called AFTER `.to(device)` on MPS — calling eval
+  on CPU then moving to MPS leaves MPS state incorrectly initialized.
+
+### Device strategy
+
+| Script / Phase | Device | Reason |
+|----------------|--------|--------|
+| verify_decoder Phase 1 | CPU | IEEE 754 strict fp32 for architecture correctness |
+| verify_decoder Phases 2-3 | MPS | Deployment accuracy, fast |
+| verify_decoder Phase 4 prepare | CPU | coreai_opt RoPEImpl incompatible with MPS |
+| verify_decoder Phase 4 infer | MPS | Fast corpus evaluation |
+| verify_projector (both phases) | CPU | Architecture correctness, projector is small |
+| verify_vision_encoder Phase 1 | CPU | Architecture correctness |
+| verify_vision_encoder Phase 2 | MPS | fp16 overflows on CPU; real images required |
+
+---
+
 ## Scripts
+
+### Weight management
+
+| Script | Purpose |
+|--------|---------|
+| `sync_weights.py` | Download/verify model weights from HuggingFace. Writes `.provenance.json`. `--list`, `--variant`, `--all`, `--force`. |
+| `compare_weights.py` | Compare Apple's MLX quantized weights vs HF bf16 source by dequantizing and measuring PSNR. MLX weights auto-downloaded from HF cache. |
 
 ### Export pipeline
 
 | Script | Purpose |
 |--------|---------|
 | `export_fastvlm.py` | Main export script. Produces the full VLM bundle. Supports `--variant`, `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length`. |
-| `fastvlm_decoder.py` | Re-authored Qwen2 decoder module for CoreAI export. Imported by `export_fastvlm.py`. |
-| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder module. Imported by `export_fastvlm.py`. |
+| `fastvlm_decoder.py` | Re-authored Qwen2 decoder for CoreAI export. Imported by `export_fastvlm.py`. |
+| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder. Imported by `export_fastvlm.py`. |
 | `fastvlm_projector.py` | mlp2x_gelu projector module. Imported by `export_fastvlm.py`. |
 | `quantization.py` | Compression presets (`none`, `4bit`, `8bit`). `load_compression_config()`, `apply_quantization_from_config()`. See [docs/RECIPES.md](docs/RECIPES.md). |
 | `scan_quantization_sensitivity.py` | Per-layer sensitivity scanner. Generates mixed-precision YAML recipes. See [docs/RECIPES.md](docs/RECIPES.md). |
 
-### Inspection and verification
+### Verification
 
 | Script | Purpose |
 |--------|---------|
-| `inspect_aimodel.py` | Inspect any CoreAI VLM bundle or `.aimodel` file. Works on FastVLM (`.vlmasset`) and Qwen3-VL (`.llmasset`). Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
-| `verify_vision_encoder.py` | **Layer 1:** HF FastVLMVisionEncoder vs re-authored PyTorch encoder PSNR. Verifies the re-authoring is correct. |
-| `verify_projector.py` | **Layer 1:** HF projector vs re-authored PyTorch projector PSNR. |
 | `verify_decoder.py` | **Layer 1:** Four-phase decoder verification — architecture correctness, FP16 fidelity, KV cache correctness, compression quality. See [docs/VERIFICATION.md](docs/VERIFICATION.md). |
-| `metrics.py` | Canonical metric module shared by verify_decoder and scanner. |
-| `fastvlm_fixtures.py` | Realistic decoder fixtures from the HF multimodal pipeline. Shared by verify_decoder and scanner. |
+| `verify_projector.py` | **Layer 1:** Two-phase projector verification — port vs HF mm_projector (Phase 1), FP16 fidelity (Phase 2). |
+| `verify_vision_encoder.py` | **Layer 1:** Two-phase vision encoder verification — architecture correctness (Phase 1), FP16 fidelity on real corpus images (Phase 2). |
+| `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all pipeline stages. Run on macOS 27 GM. |
+| `metrics.py` | Canonical metric module (PSNR, NRMSE, cosine, KL divergence, top-k agreement, margin preservation). Shared by verify_decoder and scanner. |
+| `fastvlm_fixtures.py` | Realistic decoder input fixtures from the full HF multimodal pipeline. Shared by verify_decoder and scanner. |
 | `build_fixtures.py` | Pre-build and cache decoder fixtures for verify_decoder and scanner. Run once per variant. |
-| `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all 6 pipeline stages. Use `--image` for meaningful vision PSNR. Run on macOS 26.5 (see Known Issues). |
 
-### Test assets
-
-| Script | Purpose |
-|--------|---------|
-| `fetch_test_images.py` | Download 9 public domain benchmark images to `test_assets/images/`. Uses Wikimedia Commons API. Run once after cloning. |
-| `generate_test_images.py` | Generate synthetic test images (tall_narrow_circle.png, wide_short_square.png) for preprocessing strategy verification. No external downloads needed. |
-| `run_hf_fastvlm.py` | Run FastVLM from original HF weights for ground truth comparison against CoreAI export. Supports `--variant`, `--image`, `--prompt`, `--temperature`, `--device`. |
-| `probe_vlm_config.py` | Probe any HF VLM config for native resolution and preprocessing metadata. Supports Qwen3-VL (2B/7B/32B/72B), FastVLM, and any HF VLM. |
-
-### Diagnostics and discovery
+### Inspection and test assets
 
 | Script | Purpose |
 |--------|---------|
-| `discover_weights.py` | Dump weight shapes and dtypes from HF safetensors to `discovery/`. Run when adding a new variant. |
-| `inspect_weights.py` | Human-readable PyTorch/MLX weight inspection. Complements `inspect_aimodel.py` (which inspects compiled CoreAI models). |
-| `probe_activations.py` | Profile intermediate activation magnitudes in the vision encoder's network stages. Used to identify fp16 overflow risk at `network.8-10`. |
-| `audit_weight_dtypes.py` | Exhaustive dtype/shape audit across HF and Apple MLX checkpoints. Used to verify that `quantization.py` matches Apple's exact quantization scope. |
-| `compare_weights.py` | Compare Apple's MLX quantized weights against HF bf16 source by dequantizing and measuring PSNR. Requires Apple's MLX checkpoints locally. |
+| `inspect_aimodel.py` | Inspect any CoreAI VLM bundle directory or individual `.aimodel` file. Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
+| `fetch_test_images.py` | Download 9 public domain benchmark images to `test_assets/images/`. Run once after cloning. |
+| `generate_test_images.py` | Generate synthetic test images (tall_narrow_circle.png, wide_short_square.png) for preprocessing strategy verification. |
+| `run_hf_fastvlm.py` | Run FastVLM from original HF weights for ground truth comparison. Supports `--variant`, `--image`, `--prompt`, `--temperature`, `--device`. |
+| `probe_vlm_config.py` | Probe any HF VLM config for native resolution and preprocessing metadata. |
+| `probe_activations.py` | Profile intermediate activation magnitudes in the vision encoder. Used to identify fp16 overflow risk at network.8-10. |
+| `discover_weights.py` | Dump weight shapes and dtypes from HF safetensors to `discovery/`. |
+| `inspect_weights.py` | Human-readable PyTorch/MLX weight inspection. |
+| `audit_weight_dtypes.py` | Exhaustive dtype/shape audit across HF and Apple MLX checkpoints. |
 
 ---
 
@@ -314,26 +428,23 @@ Model size. Affects decoder architecture and weight file.
 Named compression preset for the decoder. Vision encoder and embed are always fp16.
 See [docs/RECIPES.md](docs/RECIPES.md) for benchmarks and mixed-precision YAML recipes.
 - *(none)* — fp16, highest quality
-- `8bit` — int8 symmetric_with_clipping, ~2.5× smaller, 71 tok/sec (1.5B)
-- `4bit` — int4 symmetric_with_clipping, ~3.5× smaller, 115 tok/sec (1.5B) — recommended
+- `8bit` — int8 symmetric_with_clipping per_block_32, ~2.5× smaller, 71 tok/sec (1.5B)
+- `4bit` — int4 symmetric_with_clipping per_block_32, ~3.5× smaller, 115 tok/sec (1.5B) — recommended
+
+### `--compression-config`
+Path to a mixed-precision YAML recipe generated by `scan_quantization_sensitivity.py`.
+Mutually exclusive with `--compression`.
 
 ### `--kv-cache`
-KV cache allocation strategy. Both modes use `--max-context-length` as the hard
-ceiling — the compiled graph rejects inputs beyond it.
-- `static` *(default)* — pre-allocates `max_ctx` tokens of Metal memory upfront.
-  `StaticKVCache` in Swift. Matches Apple's `vlm/export.py`.
-- `dynamic` — starts at 256 tokens, grows 2× as needed up to `max_ctx`.
-  `GrowingKVCache` in Swift. Lower initial memory footprint — useful when
-  exporting with a large `max_ctx` but expecting mostly short conversations.
-
-FastVLM uses only 12 KB/token (KV), so static `max_ctx=32768` (393 MB) is
-feasible on device. Compare: Qwen3-VL-2B uses 115 KB/token (3.6 GB at 32768,
-requiring dynamic).
+KV cache allocation strategy.
+- `static` *(default)* — pre-allocates `max_ctx` tokens upfront. `StaticKVCache` in Swift.
+- `dynamic` — starts at 256 tokens, grows 2× as needed. `GrowingKVCache` in Swift.
+  Lower initial memory — useful for mobile deployment with small expected context.
 
 ### `--max-context-length`
-Maximum context length in tokens. Hard ceiling in both static and dynamic modes.
-Must not exceed `max_position_embeddings` from the model config (32768 for all
-FastVLM variants). Default: 4096.
+Maximum context length in tokens. Default: 4096. Hard ceiling in both static and
+dynamic modes. For mobile deployment, `512` is a practical default that reduces
+KV cache memory significantly.
 
 ---
 
@@ -346,13 +457,13 @@ pixel_values [1, 3, 1024, 1024]
       ↓ vision.aimodel::encode_image
 image_features [1, 256, 3072]
       ↓ vision.aimodel::project
-projected_features [1, 256, hidden]   ← 256 image tokens in LM space (hidden=896/1536/3584 by variant)
+projected_features [1, 256, hidden]   ← 256 image tokens in LM space
       ↓
 all_token_ids [1, 256+N]              ← 256 <image> placeholders + N text tokens
       ↓ embed.aimodel::main
-embeddings [1, 256+N, 896]
+embeddings [1, 256+N, hidden]
       ↓ scatter-merge (CoreAISequentialVLMEngine)
-merged_inputs_embeds [1, 256+N, 896]  ← image positions replaced with projected_features
+merged_inputs_embeds [1, 256+N, hidden]  ← image positions replaced
       ↓ fastvlm-{variant}.aimodel::main (+ stateful KV cache)
 logits [1, 256+N, 151936]             → sample next token
       ↓ repeat for each decode step
@@ -362,12 +473,11 @@ logits [1, 256+N, 151936]             → sample next token
 
 **`mutable_slice_update` for KV cache:** The only pattern supported by
 `remove_functionalization` in `coreai-models`. `slice_scatter` does not work for
-export (it doesn't create `AutoFunctionalized` nodes). Imported directly from
-`coreai_models.primitives.macos.cache.KVCache`.
+export. Imported from `coreai_models.primitives.macos.cache.KVCache`.
 
-**`inputs_embeds` not `input_ids`:** The decoder takes pre-computed embeddings.
-`embed_tokens` is a separate model (`embed.aimodel`) so `CoreAISequentialVLMEngine`
-can scatter-merge image features before calling the decoder.
+**`inputs_embeds` not `input_ids`:** The decoder takes pre-computed embeddings
+so `CoreAISequentialVLMEngine` can scatter-merge image features before calling
+the decoder. `embed_tokens` is a separate `embed.aimodel`.
 
 **State names:** Python export uses `k_cache`/`v_cache`. The `coreai-torch`
 compiler renames these to `keyCache`/`valueCache` (camelCase) in the compiled
@@ -377,15 +487,13 @@ model for Swift compatibility.
 Qwen3-VL which uses ImageNet stats, FastVLM's vision tower was trained without
 normalization.
 
-**Image preprocessing strategy:** FastVLM's `CLIPImageProcessor` uses shortest-edge
-resize + center crop to 1024×1024 — not stretch resize. The exported bundle declares
-`"image_strategy": "center_crop"` in `metadata.json`, which `CoreAISequentialVLMEngine`
-reads to select the correct resize algorithm. Apple's `coreai-models` supports three
-strategies: `stretch` (default), `center_crop`, and `pad` — merged in
-[apple/coreai-models #108](https://github.com/apple/coreai-models/pull/108).
+**Image preprocessing:** FastVLM uses shortest-edge resize + center crop to
+1024×1024. The bundle declares `"image_strategy": "center_crop"` in
+`metadata.json`, which `CoreAISequentialVLMEngine` reads to select the correct
+resize algorithm.
 
-**Performance (M4 Pro, GPU path):** ~97ms TTFT, 3,901 tok/sec prompt processing,
-113 tok/sec generation. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full benchmarks.
+**Performance (M4 Pro, 1.5B int4):** 172ms TTFT warm, 115 tok/sec, 2.0GB peak
+memory. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for full benchmarks.
 
 ---
 
@@ -393,35 +501,17 @@ strategies: `stretch` (default), `center_crop`, and `pad` — merged in
 
 | File | Contents |
 |------|---------|
+| `models.yaml` | Model registry — all supported models, HF repos, local directories |
 | `docs/PERFORMANCE.md` | Benchmark results — throughput, TTFT, memory, quality |
-| `docs/psnr_results.md` | PSNR verification results (PyTorch and CoreAI runtime) |
-| `docs/FASTVLM_ARCHITECTURE.md` | Architecture deep-dive — components, quantization, export gotchas, image preprocessing |
-| `docs/RECIPES.md` | Compression presets, YAML recipes, and the scanner pipeline for per-model mixed-precision recipes |
-| `docs/FASTVLM_SWIFT_INTEGRATION.md` | Swift integration guide — llm-runner, CoreAISequentialVLMEngine, custom app |
+| `docs/RECIPES.md` | Compression presets, YAML recipes, scanner pipeline |
+| `docs/VERIFICATION.md` | Complete verification guide — both layers, all phases, device strategy |
+| `docs/FASTVLM_ARCHITECTURE.md` | Architecture deep-dive — components, quantization, export gotchas |
+| `docs/FASTVLM_SWIFT_INTEGRATION.md` | Swift integration guide — llm-runner, CoreAISequentialVLMEngine |
 | `docs/STATUS.md` | Current project status, known issues, pending items |
 
 ---
 
 ## Known Issues
-
-### MPSGraph crash on macOS 27 beta
-
-Python runtime verification (`verify_runtime.py` and `asset.executable()`) crashes
-on macOS 27 beta:
-
-```
-MPSGraphExecutable.mm:4442: failed assertion 'Incompatible shape for parameter at index 0'
-```
-
-This affects Apple's own Qwen3-VL export identically — it is an OS/platform bug,
-not a model or export issue. The same model and script pass on macOS 26.5.
-
-**Workaround:**
-- Run `verify_runtime.py` on macOS 26.5
-- For macOS 27 beta, use `xcrun coreai-build compile` (ahead-of-time compilation)
-  and verify via Xcode performance tests or Swift app
-
-A Feedback Assistant report has been filed against Apple.
 
 ### `coreai-models` PyPI version
 
@@ -429,35 +519,43 @@ The PyPI version of `coreai-models==0.1.0` has an incorrect `Python>=3.14`
 constraint and cannot be installed on Python 3.11. Always install from the
 GitHub source (see [Installation](#installation)).
 
+### `uv sync` uninstalls coreai-models
+
+`uv sync` enforces exactly what is declared in `pyproject.toml`. Since
+`coreai-models` is installed as a local editable install outside of
+`pyproject.toml`, it is uninstalled every time you run `uv sync`. Always
+reinstall it afterward:
+
+```bash
+uv sync
+uv pip install -e ~/git/apple/coreai-models/python/ --no-deps
+```
+
 ### Vision encoder fp32 on ANE
 
-`vision.aimodel` accepts `pixel_values` as `float32` (the natural dtype for image
-data). On some platforms, `AIModel.load()` triggers ANE compilation which rejects
-fp32 inputs. `inspect_aimodel.py` handles this gracefully. The structural export
-is correct — the fp32→fp16 cast happens as the first op inside the model.
+`vision.aimodel` accepts `pixel_values` as `float32`. On some platforms,
+`AIModel.load()` triggers ANE compilation which rejects fp32 inputs.
+`inspect_aimodel.py` handles this gracefully. The fp32→fp16 cast happens
+as the first op inside the model.
 
 ---
 
 ## Relationship to Apple's coreai-models
 
 This repo follows Apple's authoritative VLM export recipe from
-[`coreai-models/vlm/export.py`](https://github.com/apple/coreai-models) exactly,
-with FastVLM-specific additions:
+`coreai-models/vlm/export.py` exactly, with FastVLM-specific additions:
 
-- Re-authored `FastVLMVisionEncoder` (FastViTHD via `trust_remote_code`, not in HF
-  `transformers`)
-- Re-authored `FastVLMDecoder` (Qwen2, matching
-  `Qwen3VLForCausalLMEmbeddings.forward()`)
+- Re-authored `FastVLMVisionEncoder` (FastViTHD via `trust_remote_code`)
+- Re-authored `FastVLMDecoder` (Qwen2, matching `Qwen3VLForCausalLMEmbeddings.forward()`)
 - `<image>` special token added to Qwen2 tokenizer (ID 151646)
-- `--kv-cache`, `--compression`, `--compression-config`, `--max-context-length` export flags
-- Generic `inspect_aimodel.py` (works on any CoreAI VLM bundle)
-
-Adding FastVLM as a first-class recipe in Apple's `coreai-models` is a planned
-future contribution.
+- `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length` export flags
+- Compression support (4bit, 8bit) — not available in Apple's VLM exporter
+- Two-layer verification pipeline with corpus-based behavioral metrics
+- Provenance chain from HF weights to exported bundle
 
 ### Issues filed against apple/coreai-models
 
 | Issue | Status | Description |
 |-------|--------|-------------|
 | [#96](https://github.com/apple/coreai-models/issues/96) | 🔲 Open | PyPI wheel declares incorrect `Python>=3.14` constraint |
-| [#100](https://github.com/apple/coreai-models/issues/100) | ✅ Closed — merged as [#108](https://github.com/apple/coreai-models/pull/108) | `CoreAISequentialVLMEngine` image preprocessing strategy — `center_crop`, `pad`, `stretch` now supported in upstream |
+| [#100](https://github.com/apple/coreai-models/issues/100) | ✅ Closed — merged as [#108](https://github.com/apple/coreai-models/pull/108) | `CoreAISequentialVLMEngine` image preprocessing strategy support |
