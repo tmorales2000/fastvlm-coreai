@@ -342,7 +342,10 @@ def _export_vision(
         config=config, weights_dir=str(weights_dir)
     ).eval()
 
-    from coreai_models.export.macos import _EXTERNALIZE_SPECS
+    try:
+        from coreai_models.export.externalize import EXTERNALIZE_SPECS as _EXTERNALIZE_SPECS
+    except ImportError:
+        from coreai_models.export.macos import _EXTERNALIZE_SPECS
     from coreai_models.export.mlir_ops import (
         remove_functionalization,
         register_custom_torch_lowering,
