@@ -5,7 +5,7 @@ Provides the full multimodal pipeline from image + prompt to decoder inputs_embe
 factored out of run_hf_fastvlm.py for reuse by:
 
   - verify_decoder.py  Phase 4 (recipe quality with realistic inputs)
-  - scan_quantization_sensitivity.py  (per-layer sensitivity on real inputs)
+  - compression_scanner.py  (per-layer sensitivity on real inputs)
   - verify_runtime.py  (end-to-end comparison against CoreAI runtime)
 
 The key function is build_decoder_fixture(), which runs:

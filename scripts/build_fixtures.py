@@ -7,7 +7,7 @@ projector → scatter-merge) for each image in the corpus and caches
 the resulting decoder inputs_embeds to disk.
 
 Fixtures are used by verify_decoder.py (Phase 2 and Phase 4) and
-scan_quantization_sensitivity.py. Building them once up-front means
+compression_scanner.py. Building them once up-front means
 verification and scanning runs are fast (cache hits, no model loading).
 
 Each variant has its own fixture cache because inputs_embeds dimensions

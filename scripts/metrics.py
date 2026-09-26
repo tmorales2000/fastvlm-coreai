@@ -1,7 +1,7 @@
 """
 metrics.py — Canonical metric module for FastVLM-CoreAI verification.
 
-Shared by verify_decoder.py, scan_quantization_sensitivity.py, and
+Shared by verify_decoder.py, compression_scanner.py, and
 verify_runtime.py. All metric functions operate on torch.Tensor inputs
 and return Python floats.
 

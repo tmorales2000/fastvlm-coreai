@@ -91,7 +91,7 @@ python scripts/verify_decoder.py --variant 0.5b --compression 4bit --stage compr
 **RECOMMEND** — export and validate with `verify_runtime.py`.
 
 **CAUTION** — worst-case image degrades significantly. Consider `8bit`
-or a mixed-precision YAML recipe from `scan_quantization_sensitivity.py`.
+or a mixed-precision YAML recipe from `compression_scanner.py`.
 
 **INCONCLUSIVE** — fixtures unavailable. Run `build_fixtures.py` first.
 

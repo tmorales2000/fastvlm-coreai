@@ -28,7 +28,7 @@ Compression is specified via one of two mutually exclusive options:
   --compression-config path/to/recipe.yaml
       YAML file with a quantization_config block. Accepts the same format
       as QuantizerConfig.from_dict(). Use for mixed-precision per-model
-      recipes produced by scan_quantization_sensitivity.py. Mutually
+      recipes produced by compression_scanner.py. Mutually
       exclusive with --compression.
 
   --platform macOS|iOS
@@ -50,7 +50,7 @@ Compression is specified via one of two mutually exclusive options:
 
 YAML RECIPE FORMAT
 ==================
-Recipes produced by scan_quantization_sensitivity.py or written by hand:
+Recipes produced by compression_scanner.py or written by hand:
 
   quantization_config:
     execution_mode: eager
@@ -89,7 +89,7 @@ USAGE
   python scripts/export_fastvlm.py --variant 1.5b --compression 8bit
   python scripts/export_fastvlm.py --variant 7b   --compression 4bit
 
-  # YAML recipe (mixed precision, from scan_quantization_sensitivity.py)
+  # YAML recipe (mixed precision, from compression_scanner.py)
   python scripts/export_fastvlm.py --variant 7b \\
       --compression-config recipes/fastvlm_7b_mixed.yaml
 
@@ -727,7 +727,7 @@ def main():
         help=(
             "Path to a coreai-opt YAML quantization recipe. "
             "Top-level key must be 'quantization_config'. "
-            "Use for mixed-precision recipes from scan_quantization_sensitivity.py. "
+            "Use for mixed-precision recipes from compression_scanner.py. "
             "Mutually exclusive with --compression."
         ),
     )

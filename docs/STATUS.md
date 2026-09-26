@@ -67,7 +67,7 @@ is always used. Filed as a pending issue against `apple/coreai-models`.
 5. **FastVLM as first-class coreai-models recipe** — add to `vlm/export.py` registry
    and register FastViTHD architecture in `CoreAILanguageModels` Swift package.
 
-6. **Mixed-precision YAML recipes** — `scan_quantization_sensitivity.py` produces
+6. **Mixed-precision YAML recipes** — `compression_scanner.py` produces
    YAML compression configs for per-layer mixed precision (some layers int8,
    others int4). Pending validation run and integration test.
 

@@ -27,7 +27,7 @@ Per-model mixed-precision recipes and non-standard compression schemes.
 
 Pre-built recipes in quantization_recipes/:
   fastvlm-{variant}-aggressive.yaml — mixed int4/int8/fp16 from
-    scan_quantization_sensitivity.py.
+    compression_scanner.py.
   fastvlm-{variant}-conservative.yaml — mixed int8/fp16.
 
 Custom YAML format (QuantizerConfig native):
