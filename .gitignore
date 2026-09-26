@@ -5,9 +5,13 @@ __pycache__/
 venv/
 *.egg-info/
 
-# test_assets — ignore downloaded images, keep documentation and prompts
+# test_assets — downloaded images are large and regenerable, exclude them
 test_assets/images/*
 !test_assets/images/README.md
+
+# Fixtures — derived from weights + corpus images, regenerate with build_fixtures.py
+test_assets/fixtures/*
+!test_assets/fixtures/.gitkeep
 
 # Model weights — NEVER commit
 weights/*
