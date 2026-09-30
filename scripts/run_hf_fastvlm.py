@@ -12,8 +12,8 @@ USAGE:
     --prompt "Describe this image."
 
   # Compare with CoreAI export:
-  python scripts/run_hf_fastvlm.py --variant 0.5b --image test_assets/images/afghan_girl.jpg \
-    --prompt "Describe this portrait. What color are the subject's eyes?"
+  python scripts/run_hf_fastvlm.py --variant 0.5b --image verification/images/great_wave.jpg \
+    --prompt "Describe this image."
 
   # Use temperature 0 for deterministic output (recommended for benchmarking):
   python scripts/run_hf_fastvlm.py --variant 0.5b --image ~/test.jpeg \
@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from models import resolve_variant, weights_dir as _weights_dir, get_model_entry
 
 
 def main():
@@ -41,7 +42,7 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--variant", choices=["0.5b", "1.5b", "7b"], default="0.5b")
+    parser.add_argument("--variant", default="0.5b", help="Model variant (0.5b, 1.5b, 7b or registry key)")
     parser.add_argument("--image", type=Path, required=True, help="Path to input image")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
     parser.add_argument("--max-tokens", type=int, default=500)
@@ -51,11 +52,11 @@ def main():
                         help="Device to run on. Default: mps (GPU on Apple Silicon). Use cpu if mps fails.")
     args = parser.parse_args()
 
-    weights_dir = Path(__file__).parent.parent / "weights" / f"fastvlm-{args.variant}"
+    variant     = resolve_variant(args.variant)
+    weights_dir = _weights_dir(variant)
     if not weights_dir.exists():
         print(f"ERROR: Weights not found at {weights_dir}", file=sys.stderr)
-        print(f"Download with: hf download apple/FastVLM-{args.variant.upper()} "
-              f"--local-dir {weights_dir}", file=sys.stderr)
+        print(f"Download with: python scripts/sync_weights.py --variant {variant}", file=sys.stderr)
         sys.exit(1)
 
     if not args.image.exists():
