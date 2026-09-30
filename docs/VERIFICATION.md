@@ -31,7 +31,7 @@ python scripts/build_fixtures.py
 python scripts/build_fixtures.py --list
 ```
 
-Fixtures are stored in `test_assets/fixtures/`. They are cached until
+Fixtures are stored in `verification/fixtures/`. They are cached until
 `FIXTURE_SCHEMA_VERSION` changes (pipeline change). If that happens,
 run `build_fixtures.py --force` to rebuild.
 
@@ -130,11 +130,11 @@ Run on macOS 26.5 — see [Known Issues](STATUS.md) for macOS 27 beta crash.
 ```bash
 # Verify end-to-end CoreAI runtime vs PyTorch reference
 python scripts/verify_runtime.py --variant 0.5b \
-    --image test_assets/images/great_wave.jpg
+    --image verification/images/great_wave.jpg
 
 # With decode steps
 python scripts/verify_runtime.py --variant 0.5b \
-    --image test_assets/images/great_wave.jpg \
+    --image verification/images/great_wave.jpg \
     --decode-steps 5
 ```
 

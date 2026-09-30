@@ -12,7 +12,7 @@ For PSNR verification results see [psnr_results.md](psnr_results.md).
 ## ✅ Complete
 
 - Full 3-component bundle export for all three variants (0.5B, 1.5B, 7B)
-- `--compression 4bit_per_channel` (7B), `--compression 8bit` (1.5B), no compression (0.5B)
+- `--compression 4bit` (7B), `--compression 8bit` (1.5B), no compression (0.5B)
 - `--kv-cache static` and `--kv-cache dynamic` working
 - `inspect_aimodel.py` passes on all exported bundles
 - `verify_runtime.py` passes on macOS 26.5 (71.9 dB vision_encode, 44+ dB decode)
@@ -21,7 +21,7 @@ For PSNR verification results see [psnr_results.md](psnr_results.md).
 - HF reference inference via `run_hf_fastvlm.py` — outputs match CoreAI export
 - Image preprocessing fix (`center_crop`) — filed as #100, merged upstream as [apple/coreai-models #108](https://github.com/apple/coreai-models/pull/108)
 - Compression preset system matching Apple's `coreai-models` pattern (`--compression`/`--compression-config`)
-- 7B int4 throughput fix: 7.2 → 50.8 tok/sec via per_channel quantization
+- 7B int4 throughput fix: 7.2 → 50.8 tok/sec via symmetric per_block_32 quantization
 - Bundle directories now plain directories (no `.vlmasset`/`.llmasset` extension) per Apple PR #125
 - Performance documented: 0.5B 80ms TTFT, 131 tok/sec; 7B int4 903ms TTFT, 51 tok/sec
 
@@ -55,7 +55,7 @@ is always used. Filed as a pending issue against `apple/coreai-models`.
 4. **iOS export** — `fastvlm_ios.py` implemented following `Qwen3ForCausalLMForiOS`
    pattern exactly. Uses `BaseForCausalLMForiOS`, iOS primitives (Conv2d projections,
    `KVCacheHandler`, `RoPECache`, BC1S layout), and `export_ios_model()`.
-   `--platform iOS` CLI routes to `_export_ios()` in `export_fastvlm.py`.
+   `--platform iOS` CLI routes to `_export_ios()` in `export.py`.
    Produces 4-entrypoint bundle (load_embeddings, gather_embeddings, extend, prompt_opt).
    **Known gap:** iOS exports text decoder only. FastViTHD vision encoder is macOS-only.
    A full iOS VLM pipeline requires both iOS decoder + macOS vision.aimodel, or

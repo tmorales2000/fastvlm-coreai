@@ -23,7 +23,7 @@ All inference numbers are via the GPU path (MPSGraph). ANE path pending.
 **Cold** = no `.aimodelx` cache (first ever run). **Warm** = `.aimodelx` cache present.
 
 Two benchmark sets collected with different images and prompts:
-- **great_wave**: `test_assets/images/great_wave.jpg`, "Describe exactly what you see in this image."
+- **great_wave**: `verification/images/great_wave.jpg`, "Describe exactly what you see in this image."
 - **portrait**: `~/pix/a.jpg`, "Describe what you see in this image."
 
 ---
@@ -52,7 +52,7 @@ TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excl
 
 ## FastVLM 0.5B (fp16)
 
-**Export:** `python scripts/export_fastvlm.py --variant 0.5b`
+**Export:** `python scripts/export.py --variant 0.5b`
 
 ### great_wave benchmark
 
@@ -95,7 +95,7 @@ TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excl
 
 ## FastVLM 1.5B (fp16)
 
-**Export:** `python scripts/export_fastvlm.py --variant 1.5b`
+**Export:** `python scripts/export.py --variant 1.5b`
 
 ### great_wave benchmark
 
@@ -127,9 +127,9 @@ TTFT = `decoder.Prompt` metric from verbose output (image encode + prefill, excl
 
 ---
 
-## FastVLM 1.5B (int4 per_channel)
+## FastVLM 1.5B (int4 per_block_32)
 
-**Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 4bit`
+**Export:** `python scripts/export.py --variant 1.5b --compression 4bit`
 
 Compression: int4 symmetric per-channel.
 
@@ -162,7 +162,7 @@ Compression: int4 symmetric per-channel.
 
 ## FastVLM 1.5B (int8 per_block_32)
 
-**Export:** `python scripts/export_fastvlm.py --variant 1.5b --compression 8bit`
+**Export:** `python scripts/export.py --variant 1.5b --compression 8bit`
 
 Compression: int8 symmetric_with_clipping per_block_32. Targets `nn.Linear` only.
 `FastVLMRMSNorm` excluded (1D weight incompatible with per_block axis=1).
@@ -191,13 +191,13 @@ Compression: int8 symmetric_with_clipping per_block_32. Targets `nn.Linear` only
 
 > **Cold TTFT 1,326ms** — higher than warm (212ms) because the first inference
 > run includes JIT graph priming. Model load (3.6s cold) is much faster than
-> the old per_channel scheme which caused a 59-second cold load.
+> an old per_block_64 asymmetric scheme which caused a 59-second cold load.
 
 ---
 
 ## FastVLM 7B (int4)
 
-**Export:** `python scripts/export_fastvlm.py --variant 7b --compression 4bit`
+**Export:** `python scripts/export.py --variant 7b --compression 4bit`
 
 Compression: int4 symmetric_with_clipping per_block_32 (preset `4bit`).
 Apple's canonical macOS int4 preset.
@@ -223,8 +223,8 @@ Apple's canonical macOS int4 preset.
 > **7× throughput improvement over original scheme** (7.2 → 50 tok/sec).
 > Root cause: the original scheme was asymmetric per_block_64 (from Apple's MLX checkpoints).
 > Asymmetric dequantization computes `(q - zero_point) * scale` — two operations.
-> Symmetric schemes (`4bit`, `4bit_per_channel`) only need `q * scale` — the real speedup.
-> Both `4bit` and `4bit_per_channel` produce identical throughput (~50 tok/sec) on M4 Pro GPU.
+> Symmetric schemes only need `q * scale` — the real speedup.
+> `4bit` (per_block_32 symmetric) produces ~50 tok/sec on M4 Pro GPU.
 > `blockwise_shift_scale` count is 197 for all per_block schemes — the op count does not
 > predict fusion behavior. The M4 Pro MPSGraph fuses symmetric dequant regardless.
 
@@ -232,7 +232,7 @@ Apple's canonical macOS int4 preset.
 
 ## FastVLM 7B (fp16)
 
-**Export:** `python scripts/export_fastvlm.py --variant 7b`
+**Export:** `python scripts/export.py --variant 7b`
 
 ⚠️ **Not recommended for production.** Memory requirements exceed practical limits
 for interactive use even on 64GB machines.
@@ -268,17 +268,17 @@ for interactive use even on 64GB machines.
 |--------|----------------------|--------------|-------|
 | per_block_64 asymmetric (original MLX) | 197 | 7.2 | Slow — asymmetric dequant |
 | per_block_32 symmetric_with_clipping (`4bit`) | 197 | **50** | Fast — symmetric dequant |
-| per_channel symmetric (`4bit_per_channel`) | 197 | **50** | Fast — symmetric dequant |
+| per_block_32 symmetric (`4bit`) | 197 | **50** | Fast — symmetric dequant |
 
 **Key finding:** `blockwise_shift_scale` count is 197 for ALL schemes — the op count
 does not predict GPU throughput. The M4 Pro MPSGraph fuses both per_block_32 and
-per_channel symmetric dequantization at execution time.
+symmetric dequantization at execution time.
 
 The real cause of the original 7.2 tok/sec: the old scheme (from Apple's MLX checkpoints)
 used **asymmetric** quantization — dequant computes `(q - zero_point) * scale` (two ops).
 Symmetric schemes only need `q * scale` (one op). That's the 7× speedup, not per_channel.
 
-`4bit` and `4bit_per_channel` produce identical throughput on M4 Pro GPU. Use `4bit`
+`4bit` (per_block_32 symmetric) produces ~50 tok/sec on M4 Pro GPU. Use `4bit`
 (Apple's standard) for simplicity and best alignment with Apple's tooling.
 
 **Current presets (`quantization.py`):**
@@ -366,5 +366,5 @@ Result: 71 tok/sec (faster than fp16), 2.8GB memory (61% lower), clean output.
 
 The original 7.2 tok/sec regression was caused by asymmetric per_block_64
 quantization (from Apple's MLX checkpoints). The fix was switching to symmetric
-schemes — `4bit` (per_block_32) and the now-retired `4bit_per_channel` produce
+schemes — `4bit` (per_block_32) produce
 identical throughput (~50 tok/sec for 7B) on M4 Pro GPU. Use `--compression 4bit`.

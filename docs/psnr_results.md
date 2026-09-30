@@ -55,7 +55,7 @@ See Known Issues in README.
 ### 0.5B — real image (earthrise.jpg) — MacBook Pro M1 Pro, macOS 26.5.2, torch 2.9.0 (July 12 2026)
 
 **Definitive end-to-end verification with a real image.**
-Uses `python scripts/verify_runtime.py --variant 0.5b --image test_assets/images/earthrise.jpg`
+Uses `python scripts/verify_runtime.py --variant 0.5b --image verification/images/earthrise.jpg`
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
@@ -113,7 +113,7 @@ verify_decoder.py rewritten July 29 2026 against stable FastVLMDecoder API
 | Stage 2 — fp16 cached decode | **58.9 dB** | ✓ | first step: 62.6 dB |
 | Stage 2 — fp16 max \|logit\| | 14 | ✓ | |
 
-### 1.5B (int8 per_channel)
+### 1.5B (int8 per_block_32)
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
@@ -121,9 +121,9 @@ verify_decoder.py rewritten July 29 2026 against stable FastVLMDecoder API
 | Stage 2 — fp16 cached decode | **58.9 dB** | ✓ | |
 | Stage 3 — int8 vs fp16 baseline | **38.0 dB** | ✓ | Above 35 dB threshold |
 
-Compression: `--compression 8bit` (int8 symmetric per_channel, `torch.nn.modules.linear.Linear` only).
+Compression: `--compression 8bit` (int8 symmetric_with_clipping per_block_32, `nn.Linear` only).
 
-### 7B (int4 per_channel)
+### 7B (int4 per_block_32)
 
 | Stage | PSNR | Pass? | Notes |
 |-------|------|-------|-------|
@@ -132,7 +132,7 @@ Compression: `--compression 8bit` (int8 symmetric per_channel, `torch.nn.modules
 | Stage 2 — fp16 max \|logit\| | 15 | ✓ | |
 | Stage 3 — int4 vs fp16 baseline | **29.5 dB** | ✓ | Above 25 dB threshold |
 
-Compression: `--compression 4bit_per_channel` (int4 symmetric per_channel).
+Compression: `--compression 4bit` (int4 symmetric_with_clipping per_block_32).
 
 Note: 7B uses Qwen2.5-7B base (vocab 152064, image token 151665) vs Qwen2 for
 0.5B/1.5B (vocab 151936, image token 151646). Same FastViTHD vision tower.
@@ -166,10 +166,10 @@ Key finding from `xcrun coreai-build inspect` on 7B int4 exports:
 |--------|----------------------|--------------|-------------|-------|
 | per_block_64 asymmetric | 197 | 199 | 7.2 | Old default — unfused, catastrophic |
 | per_block_32 symmetric_with_clipping (apple_4bit) | 197 | 199 | ~7-10 (est.) | Unfused — same problem |
-| per_channel symmetric (4bit_per_channel) | 197 | 199 | **50.8** | Fused — 7× faster |
+| per_block_32 symmetric (4bit) | 197 | 199 | **50.8** | Fused — 7× faster |
 
 Op count is identical across schemes. The difference is execution behavior:
-per_channel allows the GPU to fuse dequantization into batch_matmul as a
+per_block_32 symmetric allows the GPU to fuse dequantization into batch_matmul as a
 row-wise scaling. Per_block requires a separate pass regardless of block size
 or symmetric/asymmetric. The op name (`blockwise_shift_scale`) is the same;
 only the runtime cost differs.

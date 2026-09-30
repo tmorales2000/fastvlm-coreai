@@ -18,11 +18,11 @@ Three named presets, matching Apple's `coreai.llm.export --compression` options:
 
 ```bash
 # Named preset
-python scripts/export_fastvlm.py --variant 1.5b --compression 4bit
-python scripts/export_fastvlm.py --variant 1.5b --compression 8bit
+python scripts/export.py --variant 1.5b --compression 4bit
+python scripts/export.py --variant 1.5b --compression 8bit
 
 # No compression (fp16)
-python scripts/export_fastvlm.py --variant 1.5b
+python scripts/export.py --variant 1.5b
 ```
 
 **Key finding:** `4bit` (per_block_32 symmetric) and the former `4bit_per_channel`
@@ -44,7 +44,7 @@ at fp16. Use `--compression-config` instead of `--compression`:
 
 ```bash
 # Use a pre-built recipe
-python scripts/export_fastvlm.py --variant 1.5b \
+python scripts/export.py --variant 1.5b \
     --compression-config quantization_recipes/fastvlm-1.5b-aggressive.yaml
 
 # --compression and --compression-config are mutually exclusive
