@@ -32,6 +32,8 @@ from transformers import AutoConfig
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from models import resolve_variant, weights_dir as _weights_dir, argparse_choices  # noqa: E402
+
 from fastvlm_vision_encoder import FastVLMVisionEncoder, _load_vision_weights  # noqa: E402
 from metrics import psnr, nrmse                                                 # noqa: E402
 
@@ -247,7 +249,8 @@ def phase_fidelity(config, weights_dir: str, image_size: int) -> None:
 
 
 def verify(variant: str, stage: str) -> None:
-    weights_dir = str(REPO_ROOT / "weights" / f"fastvlm-{variant}")
+    variant     = resolve_variant(variant)
+    weights_dir = str(_weights_dir(variant))
     print(f"Verifying vision encoder: {variant}")
 
     config = AutoConfig.from_pretrained(weights_dir, trust_remote_code=True)
@@ -280,7 +283,7 @@ if __name__ == "__main__":
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--variant", default="1.5b", choices=["0.5b", "1.5b", "7b"])
+    ap.add_argument("--variant", default="1.5b", choices=argparse_choices())
     ap.add_argument(
         "--stage", default="all",
         choices=["all", "correctness", "fidelity"],
