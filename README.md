@@ -400,7 +400,7 @@ python scripts/verify_vision_encoder.py --variant 0.5b --stage fidelity
 | `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all pipeline stages. Run on macOS 27 GM. |
 | `metrics.py` | Canonical metric module (PSNR, NRMSE, cosine, KL divergence, top-k agreement, margin preservation). Shared by verify_decoder and scanner. |
 | `fastvlm_fixtures.py` | Realistic decoder input fixtures from the full HF multimodal pipeline. Shared by verify_decoder and scanner. |
-| `build_fixtures.py` | Download corpus images (reads `verification/corpus.yaml`) and pre-build decoder fixtures. Absorbs `fetch_test_images.py`. Run once per variant. |
+| `build_fixtures.py` | Download corpus images (reads `verification/corpus.yaml`) and pre-build decoder fixtures. Run once per variant. |
 
 ### Tests
 
