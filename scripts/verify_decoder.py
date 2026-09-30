@@ -127,7 +127,12 @@ COMPRESSION_TOP5_PASS = 0.80   # top-5 overlap fraction — mean threshold
 COMPRESSION_TOP5_FLOOR = 0.60  # top-5 overlap fraction — worst-case floor
 
 # Default fixture image for Phase 2 and Phase 4
-DEFAULT_FIXTURE_IMAGE = "test_assets/images/great_wave.jpg"
+# Default image for Phase 2 — first available corpus image
+def _default_fixture_image() -> str:
+    from fastvlm_fixtures import CORPUS_IMAGES
+    return CORPUS_IMAGES[0]
+
+DEFAULT_FIXTURE_IMAGE = _default_fixture_image()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -540,7 +545,7 @@ def phase_compression(
     except Exception as e:
         print(f"\n[INCONCLUSIVE] Could not load corpus fixtures: {e}")
         print("  Phase 4 requires realistic multimodal fixtures.")
-        print("  Ensure test_assets/images/ contains the corpus images.")
+        print("  Run build_fixtures.py to download corpus images.")
         return PhaseResult.INCONCLUSIVE
 
     if not fixtures:
