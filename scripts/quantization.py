@@ -217,7 +217,7 @@ def load_compression_config(
     """Load a compression config from a named preset or YAML file.
 
     Args:
-        source: Named preset string ("4bit", "4bit_per_channel", "8bit", "none")
+        source: Named preset string ("4bit", "8bit", "none")
                 or Path to a YAML file.
         platform: "macOS" or "iOS". iOS raises NotImplementedError.
 

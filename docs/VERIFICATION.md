@@ -197,4 +197,4 @@ Nine public domain images covering diverse scene types:
 | `migrant_mother.jpg` | Portrait / documentary |
 | `lunch_skyscraper.jpg` | Architecture / people |
 
-Download with: `python scripts/fetch_test_images.py`
+Download with: `python scripts/build_fixtures.py --images-only`

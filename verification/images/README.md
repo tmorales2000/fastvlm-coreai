@@ -3,14 +3,14 @@
 These images are **not committed to the repository** due to file size.
 All images are **public domain** (NASA or pre-1928).
 
-Run the fetch script to download them:
+Run build_fixtures.py to download them:
 
 ```bash
-bash scripts/fetch_test_images.sh
+python scripts/build_fixtures.py --images-only
 ```
 
 If automated download fails (some hosts block scripts), download manually
-from the URLs listed below and place in `test_assets/images/`.
+from the URLs listed below and place in `verification/images/`.
 
 ---
 
@@ -95,7 +95,7 @@ Hubble Deep Field — structure rather than point sources.
 
 ## Standard Prompts
 
-See `test_assets/prompts/standard.txt` for the standard prompt set used in
+See `fastvlm_fixtures.py (DEFAULT_PROMPT)` for the standard prompt set used in
 `docs/PERFORMANCE.md` benchmarks.
 
 ---
@@ -105,7 +105,7 @@ See `test_assets/prompts/standard.txt` for the standard prompt set used in
 ```bash
 LLM_RUNNER=~/git/apple/coreai-models/.build/out/Products/Debug/llm-runner
 BUNDLE=exports/fastvlm-0.5b.vlmasset
-IMG=test_assets/images
+IMG=verification/images
 
 # Color / spatial
 $LLM_RUNNER --model $BUNDLE --image $IMG/earthrise.jpg \

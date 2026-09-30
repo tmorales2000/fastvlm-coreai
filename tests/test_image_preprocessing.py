@@ -198,10 +198,12 @@ def main() -> None:
     if args.generate_only:
         return
 
-    model = REPO_ROOT / "exports" / f"fastvlm-{args.variant}"
+    from models import resolve_variant
+    variant  = resolve_variant(args.variant)
+    model    = REPO_ROOT / "exports" / variant
     if not model.exists():
         print(f"\nERROR: Bundle not found: {model}")
-        print(f"Export first: python scripts/export_fastvlm.py --variant {args.variant}")
+        print(f"Export first: python scripts/export.py --variant {args.variant}")
         sys.exit(1)
 
     results = [

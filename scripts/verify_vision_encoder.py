@@ -160,7 +160,7 @@ def _load_corpus_pixels(weights_dir: str, image_size: int) -> list[torch.Tensor]
 
     if not pixel_list:
         print("  [WARN] No corpus images found — using random input.")
-        print("         Run fetch_test_images.py to download corpus images.")
+        print("         Run: python scripts/build_fixtures.py --images-only")
         return [torch.randn(1, 3, image_size, image_size)]
 
     print(f"  Loaded {len(pixel_list)} corpus images via image processor.")

@@ -713,10 +713,9 @@ def main():
         help=(
             "Named compression preset (default: none = fp16). "
             "Matches Apple's coreai.llm.export --compression options. "
-            "4bit: int4 symmetric_with_clipping per_block_32 (Apple macOS standard). "
+            "4bit: int4 symmetric_with_clipping per_block_32 (Apple macOS standard, ~51 tok/sec for 7B). "
             "8bit: int8 symmetric_with_clipping per_block_32 (our addition). "
-            "For per_channel int4 (7× faster GPU throughput), use: "
-            "--compression-config quantization_recipes/4bit_per_channel.yaml"
+            "For mixed-precision recipes use --compression-config instead."
         ),
     )
     compression_group.add_argument(
