@@ -23,7 +23,7 @@ encoding). The cache stores the decoder inputs to disk so verify_decoder
 and the scanner can reuse them without re-running the vision pipeline.
 
 Cache key: hash of (variant, image_path, prompt, preprocessing_config).
-Cache location: test_assets/fixtures/fastvlm-{variant}-{hash}.pt
+Cache location: verification/fixtures/{model_key}-{hash}.pt
 
 USAGE
 -----
@@ -31,7 +31,7 @@ USAGE
 
   fixture = build_decoder_fixture(
       variant="0.5b",
-      image_path="test_assets/images/great_wave.jpg",
+      image_path="verification/images/great_wave.jpg",
       prompt="Describe exactly what you see in this image.",
       use_cache=True,
   )
@@ -62,26 +62,25 @@ import torch
 # Bumping invalidates all cached fixtures, forcing a rebuild.
 FIXTURE_SCHEMA_VERSION = 2
 
-# Default corpus — semantic images from test_assets/images/
-# Excludes synthetic aspect-ratio fixtures (tall_narrow_circle, wide_short_square)
-# which are degenerate for recipe quality testing.
+# Default corpus — images from verification/images/ (see verification/corpus.yaml)
+# Excludes synthetic images (tests/fixtures/) used by test_image_preprocessing.py.
 CORPUS_IMAGES = [
-    "test_assets/images/great_wave.jpg",
-    "test_assets/images/earthrise.jpg",
-    "test_assets/images/blue_marble.jpg",
-    "test_assets/images/pale_blue_dot.png",
-    "test_assets/images/pillars_of_creation.jpg",
-    "test_assets/images/hubble_deep_field.jpg",
-    "test_assets/images/girl_pearl_earring.jpg",
-    "test_assets/images/migrant_mother.jpg",
-    "test_assets/images/lunch_skyscraper.jpg",
+    "verification/images/great_wave.jpg",
+    "verification/images/earthrise.jpg",
+    "verification/images/blue_marble.jpg",
+    "verification/images/pale_blue_dot.png",
+    "verification/images/pillars_of_creation.jpg",
+    "verification/images/hubble_deep_field.jpg",
+    "verification/images/girl_pearl_earring.jpg",
+    "verification/images/migrant_mother.jpg",
+    "verification/images/lunch_skyscraper.jpg",
 ]
 
 # Fixed evaluation prompt — same across all images for cross-recipe comparison
 DEFAULT_PROMPT = "Describe exactly what you see in this image."
 
 # Cache directory
-FIXTURE_CACHE_DIR = Path("test_assets/fixtures")
+FIXTURE_CACHE_DIR = Path("verification/fixtures")
 
 IMAGE_TOKEN_INDEX = -200  # Sentinel used by llava_qwen.py
 
@@ -137,8 +136,11 @@ def _fixture_cache_key(
 
 
 def _fixture_cache_path(variant: str, image_path: str, prompt: str) -> Path:
+    """Cache path uses the fully-qualified registry key (e.g. fastvlm-0.5b, qwen3-vl-2b)."""
+    from models import resolve_variant
+    model_key = resolve_variant(variant)
     key = _fixture_cache_key(variant, image_path, prompt)
-    return FIXTURE_CACHE_DIR / f"fastvlm-{variant}-{key}.pt"
+    return FIXTURE_CACHE_DIR / f"{model_key}-{key}.pt"
 
 
 def _load_cached_fixture(cache_path: Path) -> Optional[DecoderFixture]:
@@ -248,12 +250,13 @@ def build_decoder_fixture(
         if verbose:
             print(f"[fixture] Cache miss — building fixture...")
 
-    weights_dir = Path(__file__).parent.parent / "weights" / f"fastvlm-{variant}"
+    from models import weights_dir as _weights_dir, resolve_variant
+    weights_dir = _weights_dir(variant)
     if not weights_dir.exists():
+        model_key = resolve_variant(variant)
         raise FileNotFoundError(
             f"Weights not found: {weights_dir}\n"
-            f"Download: hf download apple/FastVLM-{variant.upper()} "
-            f"--local-dir {weights_dir}"
+            f"Download: python scripts/sync_weights.py --variant {model_key}"
         )
 
     if not Path(image_path).exists():
@@ -403,7 +406,8 @@ def build_corpus_fixtures(
         print(f"[corpus] Building {len(needs_build)} fixture(s) — loading model...")
 
     # Load model once for all uncached images
-    weights_dir = Path(__file__).parent.parent / "weights" / f"fastvlm-{variant}"
+    from models import weights_dir as _weights_dir
+    weights_dir = _weights_dir(variant)
     dtype = torch.float16
     target_device = torch.device(
         "mps" if device == "mps" and torch.backends.mps.is_available() else "cpu"

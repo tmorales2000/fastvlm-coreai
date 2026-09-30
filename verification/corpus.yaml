@@ -1,0 +1,67 @@
+# verification/corpus.yaml — FastVLM CoreAI verification image corpus
+#
+# Declares the 9 public domain images used for:
+#   - verify_decoder.py Phase 2 (FP16 fidelity) and Phase 4 (compression quality)
+#   - verify_vision_encoder.py Phase 2 (FP16 fidelity)
+#   - compression_scanner.py (KL divergence on real multimodal inputs)
+#
+# All images are PUBLIC DOMAIN (NASA or pre-1928 art).
+# Images are NOT committed to the repo. Download with:
+#   python scripts/build_fixtures.py --variant 0.5b
+#
+# The build_fixtures.py script reads this file and downloads any
+# missing images before building decoder fixtures.
+
+schema_version: 1
+
+wikimedia_api: "https://commons.wikimedia.org/w/api.php"
+user_agent: "fastvlm-coreai/1.0 (https://github.com/tmorales2000/fastvlm-coreai)"
+
+# Prompt used for all corpus-based verification and scanning
+default_prompt: "Describe exactly what you see in this image."
+
+images:
+  - local: great_wave.jpg
+    wikimedia: The_Great_Wave_off_Kanagawa.jpg
+    description: "The Great Wave off Kanagawa — Katsushika Hokusai, c.1831 (public domain)"
+    purpose: "Art recognition — color, composition, Mt. Fuji identification"
+
+  - local: earthrise.jpg
+    wikimedia: NASA-Apollo8-Dec24-Earthrise.jpg
+    description: "Earth rising over the Moon — Apollo 8, William Anders, 1968 (NASA)"
+    purpose: "Color / spatial orientation — both bodies, correct orientation"
+
+  - local: blue_marble.jpg
+    wikimedia: The_Earth_seen_from_Apollo_17.jpg
+    description: "The Blue Marble — Earth from Apollo 17, NASA, 1972"
+    purpose: "Whole-Earth recognition — Africa and cloud patterns visible"
+
+  - local: pale_blue_dot.png
+    wikimedia: Pale_Blue_Dot.png
+    description: "Earth from 3.7 billion miles — Voyager 1, NASA/JPL-Caltech, 1990"
+    purpose: "Hallucination resistance — minimal content, model should not invent detail"
+
+  - local: pillars_of_creation.jpg
+    wikimedia: Pillars_of_creation_2014_HST_WFC3-UVIS_full-res_denoised.jpg
+    description: "Pillars of Creation — Hubble Space Telescope, NASA/ESA, 2014"
+    purpose: "Nebula / cosmic structure — gas columns and star-forming region"
+
+  - local: hubble_deep_field.jpg
+    wikimedia: HubbleDeepField.800px.jpg
+    description: "Hubble Deep Field — ~3000 galaxies, R. Williams / STScI / NASA, 1996"
+    purpose: "Cosmic scale / galaxy recognition"
+
+  - local: girl_pearl_earring.jpg
+    wikimedia: Girl_with_a_Pearl_Earring.jpg
+    description: "Girl with a Pearl Earring — Johannes Vermeer, c.1665 (public domain)"
+    purpose: "Portrait detail — color accuracy (blue/yellow headscarf, pearl earring)"
+
+  - local: migrant_mother.jpg
+    wikimedia: Lange-MigrantMother02.jpg
+    description: "Migrant Mother — Dorothea Lange / FSA / US Government, 1936"
+    purpose: "Portrait / documentary — woman with children, emotion and context"
+
+  - local: lunch_skyscraper.jpg
+    wikimedia: Lunch_atop_a_Skyscraper.jpg
+    description: "Lunch atop a Skyscraper — ironworkers 840ft above Manhattan, 1932"
+    purpose: "Scene / counting — ~11 workers, skyline below"
