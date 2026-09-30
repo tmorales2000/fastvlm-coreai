@@ -39,13 +39,13 @@ $LLM_RUNNER --model $BUNDLE \
 
 # Image + text (VLM)
 $LLM_RUNNER --model $BUNDLE \
-  --image test_assets/images/earthrise.jpg \
+  --image verification/images/earthrise.jpg \
   --prompt "Describe this image in detail." \
   --max-tokens 300 --temperature 0
 
 # Verbose timing breakdown (TTFT, throughput, memory, compute allocation)
 $LLM_RUNNER --model $BUNDLE \
-  --image test_assets/images/earthrise.jpg \
+  --image verification/images/earthrise.jpg \
   --prompt "Describe this image." \
   --max-tokens 300 --temperature 0 --verbose
 ```
@@ -152,7 +152,7 @@ Our default export (`--kv-cache static`) uses `StaticKVCache`. Re-export with
 `--kv-cache dynamic` for `GrowingKVCache`:
 
 ```bash
-python scripts/export_fastvlm.py --variant 0.5b --kv-cache dynamic --overwrite
+python scripts/export.py --variant 0.5b --kv-cache dynamic --overwrite
 ```
 
 KV cache memory for static at 4096 tokens:

@@ -93,11 +93,11 @@ python scripts/inspect_aimodel.py exports/fastvlm-0.5b
 ```bash
 # Verify numerical correctness against the HF reference
 python scripts/verify_vision_encoder.py --variant 0.5b
-# Stage 1 (fp32):  should be ~129 dB  (bit-identical to HF)
-# Stage 2 (fp16):  should be ~50 dB   (fp16 rounding from HF bf16)
+# Phase 1 (CPU, fp32): ~138 dB  (architecture correctness vs full HF model)
+# Phase 2 (MPS, fp16): ~81.5 dB (fp16 fidelity on real corpus images)
 
 # Verify CoreAI compiled vision.aimodel against PyTorch reference
-python scripts/verify_runtime.py --variant 0.5b --image test_assets/images/earthrise.jpg
+python scripts/verify_runtime.py --variant 0.5b --image verification/images/earthrise.jpg
 # vision_encode PSNR: 71.9 dB  (PASS)
 # project PSNR:       67.6 dB  (PASS)
 ```
@@ -174,12 +174,11 @@ python scripts/inspect_aimodel.py exports/fastvlm-7b
 ```bash
 # Verify projector numerical quality including quantization
 python scripts/verify_projector.py --variant 1.5b
-# Stage 1 (fp32): ~113 dB
-# Stage 2 (fp16): ~59 dB
-# Stage 3 (int8): ~68 dB vs fp16 reference
+# Phase 1 (CPU, fp32): inf dB  (bit-identical — two Linear layers + GELU)
+# Phase 2 (CPU, fp16): ~92 dB (bf16→fp16 fidelity)
 
 # Verify CoreAI compiled vision.aimodel (includes projector) against PyTorch reference
-python scripts/verify_runtime.py --variant 1.5b --image test_assets/images/earthrise.jpg
+python scripts/verify_runtime.py --variant 1.5b --image verification/images/earthrise.jpg
 # vision_encode PSNR: 71.9 dB  (PASS)
 # project PSNR:       67.6 dB  (PASS)
 # embed_tokens PSNR:  inf dB   (PASS)
@@ -198,8 +197,8 @@ python scripts/compare_weights.py --component projector --variant 1.5b --ours
 | Variant | Projector precision | Notes |
 |---------|-------------------|-------|
 | 0.5B | fp16 | No quantization |
-| 1.5B | int8 | group_size=64, asymmetric, axis=1 |
-| 7B | int4 | group_size=64, asymmetric, axis=1 |
+| 1.5B | int8 | symmetric_with_clipping per_block_32 (Apple macOS standard) |
+| 7B | int4 | symmetric_with_clipping per_block_32 (Apple macOS standard) |
 
 Quantization targets `nn.Linear` weight matrices only. Biases stay fp16.
 
@@ -327,12 +326,13 @@ python scripts/inspect_aimodel.py exports/fastvlm-0.5b
 | Variant | Decoder precision | Linear weights | Embedding | Norms |
 |---------|-----------------|----------------|-----------|-------|
 | 0.5B | fp16 | fp16 | fp16 | fp16 |
-| 1.5B | int8 | int8 (scales fp16) | fp16 | fp16 |
-| 7B | int4 | int4 (scales fp16) | fp16 | fp16 |
+| 1.5B | int8 | int8 symmetric_with_clipping per_block_32 | fp16 | fp16 |
+| 7B | int4 | int4 symmetric_with_clipping per_block_32 | fp16 | fp16 |
 
-Only `nn.Linear` and `nn.Embedding` weight matrices are quantized. Biases, RMSNorm
-weights, and all activations remain fp16. Quantization parameters: group_size=64,
-asymmetric, axis=1 — matching Apple's MLX scheme exactly.
+Only `nn.Linear` weight matrices are quantized. Biases, RMSNorm weights, and all
+activations remain fp16. Preset: `symmetric_with_clipping per_block_32` (Apple's
+canonicalmacOS standard, matching `coreai-models/export/presets.py`).
+Note: Apple's MLX reference weights use a different scheme (asymmetric group_size=64).
 
 ```bash
 # Audit all weight dtypes against HF and Apple MLX
@@ -515,24 +515,25 @@ Apple's MLX pipeline applies a two-step precision reduction:
    further quantized are cast from bf16 (HF storage) to fp16.
 
 2. **fp16 → int8 or int4:** Applied to `nn.Linear` and `nn.Embedding` weight
-   matrices only. Parameters: group_size=64, asymmetric, axis=1.
+   matrices only. Parameters: group_size=64, asymmetric, axis=1 (Apple's MLX scheme).
 
 Non-weight tensors (RMSNorm weights, biases, activations) remain fp16.
 
-### Our scheme (matches Apple's to within 0.1 dB)
+### Our scheme
 
-Our `scripts/quantization.py` replicates Apple's scheme using coreai-opt:
-- `PerBlockGranularity(axis=1, block_size=64)` matches Apple's `group_size=64, axis=1`
-- `ASYMMETRIC` matches Apple's asymmetric quantization
+Our `scripts/quantization.py` uses Apple's canonical macOS preset (matching
+`coreai-models/export/presets.py` exactly):
+- `symmetric_with_clipping` quantization scheme
+- `PerBlockGranularity(axis=1, block_size=32)` — per_block_32
 - `ExecutionMode.EAGER` avoids shape specialization (see gotcha #3 above)
+- `FastVLMRMSNorm` excluded from quantization (1D weight incompatible with global_config)
 
 ```bash
-# Verify our scheme matches Apple's
-python scripts/compare_weights.py --component decoder --variant 1.5b --ours
-# Expected output:
-#   Layer 0 q_proj  Apple: 69.3 dB  Ours: 69.4 dB  Delta: +0.1 dB
-#   Layer 0 k_proj  Apple: 68.1 dB  Ours: 68.2 dB  Delta: +0.1 dB
-#   ...  (consistently 0.0–0.1 dB delta across all layers and variants)
+# Compare our export against Apple's MLX quantized reference weights
+python scripts/compare_weights.py --component decoder --variant 1.5b
+# Note: Apple's MLX weights use asymmetric group_size=64 (a different scheme
+# from our per_block_32 symmetric). Delta is expected — different schemes
+# optimize for different quality/speed tradeoffs.
 ```
 
 ### Why the 7B int4 PSNR is low (~22.7 dB) and why that's OK
@@ -551,13 +552,13 @@ The 1.5B int8 logit PSNR is ~50 dB, the 0.5B fp16 is limited only by fp16 precis
 
 ## Exported Model Summary
 
-After running `python scripts/export_fastvlm.py --variant <V>`:
+After running `python scripts/export.py --variant <V>`:
 
 | Bundle | Decoder | vision.aimodel entrypoints | decode logits shape | KV cache shape |
 |--------|---------|--------------------------|--------------------|--------------------|
 | `fastvlm-0.5b` | fp16 | encode_image, project | `[1,-1,151936]` | `[24,1,2,4096,64]` |
-| `fastvlm-1.5b` | int8 per_channel | encode_image, project | `[1,-1,151936]` | `[28,1,2,4096,128]` |
-| `fastvlm-7b` | int4 per_channel | encode_image, project | `[1,-1,152064]` | `[28,1,4,4096,128]` |
+| `fastvlm-1.5b` | int8 per_block_32 symmetric | encode_image, project | `[1,-1,151936]` | `[28,1,2,4096,128]` |
+| `fastvlm-7b` | int4 per_block_32 symmetric | encode_image, project | `[1,-1,152064]` | `[28,1,4,4096,128]` |
 
 Note: decoder entrypoint is `main` in `fastvlm-{variant}.aimodel`.
 
@@ -589,7 +590,7 @@ The runtime automatically selects the correct specialization for the executing d
 | `scripts/inspect_weights.py` | Architecture flow, layer inventory, PyTorch vs MLX diff |
 | `scripts/audit_weight_dtypes.py` | Exhaustive dtype/shape audit of HF and MLX checkpoints |
 | `scripts/compare_weights.py` | Per-layer PSNR comparison of Apple vs our quantization |
-| `scripts/export_fastvlm.py` | Export all three components to `.aimodel` |
+| `scripts/export.py` | Export all three components to `.aimodel` |
 | `scripts/inspect_aimodel.py` | Verify entrypoints, dtypes, shapes of exported model |
 | `scripts/verify_vision_encoder.py` | Layer 1: HF FastVLMVisionEncoder vs re-authored PyTorch encoder PSNR |
 | `scripts/verify_projector.py` | Layer 1: HF projector vs re-authored PyTorch projector PSNR |
@@ -597,11 +598,10 @@ The runtime automatically selects the correct specialization for the executing d
 | `scripts/verify_runtime.py` | Layer 2: CoreAI compiled model vs PyTorch reference PSNR. Use `--image` for meaningful vision stages. |
 | `scripts/run_hf_fastvlm.py` | End-to-end HF inference — ground truth baseline for CoreAI comparison |
 | `scripts/probe_vlm_config.py` | Probe any HF VLM config for preprocessing and native resolution metadata |
-| `scripts/generate_test_images.py` | Generate synthetic test images for preprocessing verification |
 | `scripts/fastvlm_decoder.py` | Re-authored Qwen2 decoder for Core AI export |
 | `scripts/fastvlm_projector.py` | Re-authored mlp2x_gelu projector for Core AI export |
 | `scripts/fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder for Core AI export |
-| `scripts/quantization.py` | Compression preset system — `MACOS_NAMED_PRESETS` (`4bit`, `4bit_per_channel`, `8bit`), `load_compression_config()`, `apply_quantization_from_config()`. Supports YAML recipes. |
+| `scripts/quantization.py` | Compression preset system — `MACOS_NAMED_PRESETS` (`4bit`, `8bit`), `load_compression_config()`, `apply_quantization_from_config()`. Supports YAML recipes. |
 
 ---
 
@@ -838,5 +838,5 @@ to keep `verify_vision_encoder.py` working via HuggingFace's dynamic import.
 
 ---
 
-*Generated June 2026. Based on Apple FastVLM HF weights (August 2025 release),
-coreai-torch 0.4.0, coreai-opt 0.2.0, coreai-core 1.0.0b1, Xcode 27 beta.*
+*Updated September 2026 (originally June 2026). Based on Apple FastVLM HF weights (August 2025 release),
+coreai-torch 0.4.2, coreai-opt 0.2.1, coreai-core 1.0.0b2, Xcode 27 beta.*
