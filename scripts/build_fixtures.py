@@ -46,10 +46,13 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from models import resolve_variant, argparse_choices, registry_keys
+
 REPO_ROOT    = Path(__file__).parent.parent
 CORPUS_YAML  = REPO_ROOT / "verification" / "corpus.yaml"
 IMAGE_DIR    = REPO_ROOT / "verification" / "images"
-ALL_VARIANTS = ["0.5b", "1.5b", "7b"]
+ALL_VARIANTS = registry_keys()
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -128,8 +131,12 @@ def fetch_images(corpus: dict, force: bool = False) -> int:
 # ── Fixture build ──────────────────────────────────────────────────────────────
 
 def variant_weights_exist(variant: str) -> bool:
-    d = REPO_ROOT / "weights" / f"fastvlm-{variant}"
-    return d.is_dir() and any(d.glob("*.safetensors"))
+    from models import weights_dir as _weights_dir
+    try:
+        d = _weights_dir(variant)
+        return d.is_dir() and any(d.glob("*.safetensors"))
+    except (KeyError, Exception):
+        return False
 
 
 def build_variant(
@@ -150,8 +157,8 @@ def build_variant(
     print(f"{'='*60}")
 
     if not variant_weights_exist(variant):
-        print(f"[SKIP] Weights not found: weights/fastvlm-{variant}/")
-        print(f"       Download: python scripts/sync_weights.py --variant fastvlm-{variant}")
+        print(f"[SKIP] Weights not found for {variant}")
+        print(f"       Download: python scripts/sync_weights.py --variant {variant}")
         return
 
     if force:
@@ -189,7 +196,7 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--variant", choices=ALL_VARIANTS, default=None,
+    ap.add_argument("--variant", choices=argparse_choices(), default=None,
                     help="Build fixtures for one variant only (default: all available).")
     ap.add_argument("--force", action="store_true",
                     help="Re-download images and rebuild all cached fixtures.")
@@ -224,12 +231,12 @@ def main() -> None:
         return
 
     # Step 2: build fixtures
-    variants = [args.variant] if args.variant else ALL_VARIANTS
+    variants = [resolve_variant(args.variant)] if args.variant else ALL_VARIANTS
     print(f"\nBuilding fixtures — device: {args.device}")
 
     total_t0 = time.time()
     for variant in variants:
-        build_variant(variant, images, force=args.force, device=args.device)
+        build_variant(resolve_variant(variant), images, force=args.force, device=args.device)
 
     print(f"\n{'='*60}")
     print(f"Total time: {time.time()-total_t0:.1f}s")
