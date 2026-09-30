@@ -96,14 +96,16 @@ python scripts/sync_weights.py --list
 
 See [Provenance](#provenance) for details on what gets recorded and why.
 
-### 6. Download benchmark test images
+### 6. Download corpus images and build fixtures
 
 ```bash
-python scripts/fetch_test_images.py
+# Downloads corpus images to verification/images/ and builds decoder fixtures
+python scripts/build_fixtures.py --variant 0.5b
 ```
 
-Downloads 9 public domain images to `test_assets/images/` for use with
-verification scripts and `run_hf_fastvlm.py`.
+Downloads 9 public domain images from Wikimedia Commons to `verification/images/`
+and builds decoder fixtures for the specified variant. Run once per variant
+after downloading weights. See `verification/corpus.yaml` for the image catalog.
 
 ### 7. Build llm-runner
 
@@ -204,7 +206,7 @@ python scripts/verify_vision_encoder.py --variant 0.5b
 
 ```bash
 python scripts/verify_runtime.py --variant 0.5b \
-    --image test_assets/images/great_wave.jpg
+    --image verification/images/great_wave.jpg
 ```
 
 ### Run inference with llm-runner
@@ -219,13 +221,13 @@ $LLM_RUNNER --model exports/fastvlm-0.5b \
 
 # Image + text (VLM)
 $LLM_RUNNER --model exports/fastvlm-0.5b \
-  --image test_assets/images/earthrise.jpg \
+  --image verification/images/earthrise.jpg \
   --prompt "What do you see in this image?" \
   --max-tokens 300 --temperature 0
 
 # Verbose timing (TTFT, throughput, memory)
 $LLM_RUNNER --model exports/fastvlm-0.5b \
-  --image test_assets/images/great_wave.jpg \
+  --image verification/images/great_wave.jpg \
   --prompt "Describe this image." \
   --max-tokens 300 --temperature 0 --verbose
 ```
@@ -235,7 +237,7 @@ $LLM_RUNNER --model exports/fastvlm-0.5b \
 ```bash
 python scripts/run_hf_fastvlm.py \
   --variant 0.5b \
-  --image test_assets/images/earthrise.jpg \
+  --image verification/images/earthrise.jpg \
   --prompt "What do you see in this image?" \
   --temperature 0 --device mps
 ```
@@ -398,15 +400,19 @@ python scripts/verify_vision_encoder.py --variant 0.5b --stage fidelity
 | `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all pipeline stages. Run on macOS 27 GM. |
 | `metrics.py` | Canonical metric module (PSNR, NRMSE, cosine, KL divergence, top-k agreement, margin preservation). Shared by verify_decoder and scanner. |
 | `fastvlm_fixtures.py` | Realistic decoder input fixtures from the full HF multimodal pipeline. Shared by verify_decoder and scanner. |
-| `build_fixtures.py` | Pre-build and cache decoder fixtures for verify_decoder and scanner. Run once per variant. |
+| `build_fixtures.py` | Download corpus images (reads `verification/corpus.yaml`) and pre-build decoder fixtures. Absorbs `fetch_test_images.py`. Run once per variant. |
+
+### Tests
+
+| Script | Purpose |
+|--------|---------|
+| `tests/test_image_preprocessing.py` | Verifies center_crop preprocessing preserves geometry. Generates synthetic images on demand. Covers apple/coreai-models issue #100 regression. |
 
 ### Inspection and test assets
 
 | Script | Purpose |
 |--------|---------|
 | `inspect_aimodel.py` | Inspect any CoreAI VLM bundle directory or individual `.aimodel` file. Reports inputs, outputs, state names, KV cache behavior, tokenizer. |
-| `fetch_test_images.py` | Download 9 public domain benchmark images to `test_assets/images/`. Run once after cloning. |
-| `generate_test_images.py` | Generate synthetic test images (tall_narrow_circle.png, wide_short_square.png) for preprocessing strategy verification. |
 | `run_hf_fastvlm.py` | Run FastVLM from original HF weights for ground truth comparison. Supports `--variant`, `--image`, `--prompt`, `--temperature`, `--device`. |
 | `probe_vlm_config.py` | Probe any HF VLM config for native resolution and preprocessing metadata. |
 | `probe_activations.py` | Profile intermediate activation magnitudes in the vision encoder. Used to identify fp16 overflow risk at network.8-10. |
@@ -419,10 +425,12 @@ python scripts/verify_vision_encoder.py --variant 0.5b --stage fidelity
 ## Export Flags
 
 ### `--variant`
-Model size. Affects decoder architecture and weight file.
-- `0.5b` — 24 layers, hidden=896, 2 KV heads
-- `1.5b` — 28 layers, hidden=1536, 2 KV heads
-- `7b` — 32 layers, hidden=3584, 8 KV heads
+Model size or fully-qualified registry key. Short aliases expand to the FastVLM
+variants; fully-qualified keys (e.g. `fastvlm-0.5b`, `qwen3-vl-2b`) map directly
+to `models.yaml` entries.
+- `0.5b` / `fastvlm-0.5b` — 24 layers, hidden=896, 2 KV heads
+- `1.5b` / `fastvlm-1.5b` — 28 layers, hidden=1536, 2 KV heads
+- `7b` / `fastvlm-7b` — 32 layers, hidden=3584, 8 KV heads
 
 ### `--compression`
 Named compression preset for the decoder. Vision encoder and embed are always fp16.
@@ -547,7 +555,7 @@ This repo follows Apple's authoritative VLM export recipe from
 
 - Re-authored `FastVLMVisionEncoder` (FastViTHD via `trust_remote_code`)
 - Re-authored `FastVLMDecoder` (Qwen2, matching `Qwen3VLForCausalLMEmbeddings.forward()`)
-- `<image>` special token added to Qwen2 tokenizer (ID 151646)
+- `<image>` special token added to Qwen2 tokenizer (ID 151646 for 0.5B/1.5B, 151665 for 7B)
 - `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length` export flags
 - Compression support (4bit, 8bit) — not available in Apple's VLM exporter
 - Two-layer verification pipeline with corpus-based behavioral metrics
