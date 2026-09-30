@@ -527,7 +527,7 @@ def _export_decode(
 # Main export orchestration
 # ---------------------------------------------------------------------------
 
-async def export_fastvlm(
+async def export_vlm(
     variant: str,
     components: list[str],
     compression_config: dict | None,
@@ -761,7 +761,7 @@ def main():
             args.compression, platform=args.platform
         )
 
-    asyncio.run(export_fastvlm(
+    asyncio.run(export_vlm(
         variant=args.variant,
         components=args.components,
         compression_config=compression_config,

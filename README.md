@@ -14,7 +14,7 @@ exports/fastvlm-{variant}/
   vision.aimodel              — FastViTHD encoder + mlp2x_gelu projector
   embed.aimodel               — Token embedding lookup (input_ids → embeddings)
   fastvlm-{variant}.aimodel   — Qwen2 decoder with stateful KV cache
-  tokenizer/                  — Qwen2 tokenizer + <image> special token (ID 151646 for 0.5B/1.5B, 151665 for 7B)
+  tokenizer/                  — Qwen2 tokenizer + <image> special token (ID 151646)
   metadata.json               — Bundle manifest (kind=vlm) with provenance
 ```
 
@@ -137,22 +137,22 @@ import torch; print(f'torch {torch.__version__}')
 
 ```bash
 # Full export — vision + embed + decoder (fp16, static KV, max_ctx=4096)
-python scripts/export_fastvlm.py --variant 0.5b --overwrite
+python scripts/export.py --variant 0.5b --overwrite
 
 # With compression preset (recommended)
-python scripts/export_fastvlm.py --variant 1.5b --compression 4bit --overwrite
-python scripts/export_fastvlm.py --variant 1.5b --compression 8bit --overwrite
-python scripts/export_fastvlm.py --variant 7b   --compression 4bit --overwrite
+python scripts/export.py --variant 1.5b --compression 4bit --overwrite
+python scripts/export.py --variant 1.5b --compression 8bit --overwrite
+python scripts/export.py --variant 7b   --compression 4bit --overwrite
 
 # With mixed-precision YAML recipe
-python scripts/export_fastvlm.py --variant 1.5b \
+python scripts/export.py --variant 1.5b \
     --compression-config quantization_recipes/fastvlm-1.5b-aggressive.yaml
 
 # Dynamic KV cache (lower initial memory, useful for mobile)
-python scripts/export_fastvlm.py --variant 0.5b --kv-cache dynamic --overwrite
+python scripts/export.py --variant 0.5b --kv-cache dynamic --overwrite
 
 # Smaller context for mobile deployment
-python scripts/export_fastvlm.py --variant 1.5b --max-context-length 512 --overwrite
+python scripts/export.py --variant 1.5b --max-context-length 512 --overwrite
 ```
 
 See [docs/RECIPES.md](docs/RECIPES.md) for compression options, benchmarks, and
@@ -295,24 +295,76 @@ HF cache (`~/.cache/huggingface/`).
 
 The verification pipeline has two layers and covers three components
 (vision encoder, projector, decoder). Each script runs independently.
+See [docs/VERIFICATION.md](docs/VERIFICATION.md) for the complete guide.
 
-| Script | Phases | What it covers |
-|--------|--------|----------------|
-| `verify_decoder.py` | 4 | Architecture correctness, FP16 fidelity, KV cache, compression quality |
-| `verify_projector.py` | 2 | Port vs HF mm_projector, bf16→fp16 fidelity |
-| `verify_vision_encoder.py` | 2 | Architecture correctness vs full HF model, fp16 fidelity on real images |
-| `verify_runtime.py` | — | CoreAI compiled model vs PyTorch reference end-to-end |
+### verify_decoder.py — Four phases
 
-**Key principle:** PSNR is reported as context but is not the gate. The 21.7 dB
-PSNR for 1.5B int4 fails any threshold-based test yet the model produces clean
-output at 115 tok/sec. Behavioral metrics (top-5 overlap, KL divergence on real
-multimodal inputs) are the evidence.
+```bash
+python scripts/build_fixtures.py --variant 0.5b  # one-time prerequisite
+python scripts/verify_decoder.py --variant 0.5b --compression 4bit
+```
 
-Each phase runs on a specific device for a principled reason — CPU for IEEE 754
-architecture correctness, MPS for deployment fidelity. See
-[docs/VERIFICATION.md](docs/VERIFICATION.md) for the complete guide including
-the device strategy table, MPS correctness requirements, and phase-by-phase
-interpretation.
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored decoder vs HF Qwen2 in fp32. Random token sequence using real embedding-table inputs. | >80 dB PASS, 50–80 dB MARGINAL (exits nonzero) |
+| 2 — FP16 fidelity | MPS | Decoder fp32 vs fp16 on real fixture inputs. Establishes the fp16 deployment baseline for Phase 4. | Informational (MEASURED) |
+| 3 — KV cache correctness | MPS | Incremental cached decode vs full-pass reference. Catches cache offset and head reshape bugs. | >40 dB |
+| 4 — Compression quality | CPU prepare → MPS infer | Compressed vs fp16 over 9-image corpus at the final generation position. | Top-5 overlap ≥80% mean, ≥60% worst |
+
+**On PSNR:** PSNR is reported as context throughout but is NOT the gate for any
+phase. The 21.7 dB PSNR for 1.5B int4 fails any reasonable PSNR threshold yet
+the model produces clean output at 115 tok/sec. Behavioral metrics (top-5 overlap,
+KL divergence) are the evidence. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
+
+### verify_projector.py — Two phases
+
+```bash
+python scripts/verify_projector.py --variant 0.5b
+python scripts/verify_projector.py --variant 0.5b --stage correctness
+python scripts/verify_projector.py --variant 0.5b --stage fidelity
+```
+
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored FastVLMProjector vs HF mm_projector (nn.Sequential) in fp32. | >60 dB PASS, 40–60 dB MARGINAL |
+| 2 — FP16 fidelity | CPU | Port fp32 vs port fp16. Measures bf16→fp16 cast cost. | Informational (MEASURED) |
+
+Phase 1 typically produces inf dB (bit-identical) because the projector is two
+`nn.Linear` layers — no architectural difference to introduce error.
+
+### verify_vision_encoder.py — Two phases
+
+```bash
+python scripts/verify_vision_encoder.py --variant 0.5b
+python scripts/verify_vision_encoder.py --variant 0.5b --stage correctness
+python scripts/verify_vision_encoder.py --variant 0.5b --stage fidelity
+```
+
+| Phase | Device | What it tests | Gate |
+|-------|--------|---------------|------|
+| 1 — Architecture correctness | CPU | Re-authored encoder vs full HF model integration at fp32. | >70 dB PASS, 50–70 dB MARGINAL |
+| 2 — FP16 fidelity | MPS | Port fp32 vs port fp16 on 9 real corpus images via HF image processor. | Informational (MEASURED) |
+
+**Key findings:**
+- Phase 2 uses MPS — fp16 overflows on CPU at 1024×1024 (FastViTHD has 186
+  conv2d ops, and fp16 saturates at network.9 with random inputs).
+- Phase 2 uses real corpus images — random N(0,1) inputs produce completely
+  misleading metrics (cosine=0.04) due to conv networks saturating outside their
+  training distribution. Real images produce cosine≈1.0, PSNR≈81 dB.
+- Phase 2 requires `.eval()` called AFTER `.to(device)` on MPS — calling eval
+  on CPU then moving to MPS leaves MPS state incorrectly initialized.
+
+### Device strategy
+
+| Script / Phase | Device | Reason |
+|----------------|--------|--------|
+| verify_decoder Phase 1 | CPU | IEEE 754 strict fp32 for architecture correctness |
+| verify_decoder Phases 2-3 | MPS | Deployment accuracy, fast |
+| verify_decoder Phase 4 prepare | CPU | coreai_opt RoPEImpl incompatible with MPS |
+| verify_decoder Phase 4 infer | MPS | Fast corpus evaluation |
+| verify_projector (both phases) | CPU | Architecture correctness, projector is small |
+| verify_vision_encoder Phase 1 | CPU | Architecture correctness |
+| verify_vision_encoder Phase 2 | MPS | fp16 overflows on CPU; real images required |
 
 ---
 
@@ -329,10 +381,10 @@ interpretation.
 
 | Script | Purpose |
 |--------|---------|
-| `export_fastvlm.py` | Main export script. Produces the full VLM bundle. Supports `--variant`, `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length`. |
-| `fastvlm_decoder.py` | Re-authored Qwen2 decoder for CoreAI export. Imported by `export_fastvlm.py`. |
-| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder. Imported by `export_fastvlm.py`. |
-| `fastvlm_projector.py` | mlp2x_gelu projector module. Imported by `export_fastvlm.py`. |
+| `export.py` | Main export script. Produces the full VLM bundle. Supports `--variant`, `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length`. |
+| `fastvlm_decoder.py` | Re-authored Qwen2 decoder for CoreAI export. Imported by `export.py`. |
+| `fastvlm_vision_encoder.py` | Re-authored FastViTHD vision encoder. Imported by `export.py`. |
+| `fastvlm_projector.py` | mlp2x_gelu projector module. Imported by `export.py`. |
 | `quantization.py` | Compression presets (`none`, `4bit`, `8bit`). `load_compression_config()`, `apply_quantization_from_config()`. See [docs/RECIPES.md](docs/RECIPES.md). |
 | `compression_scanner.py` | Per-layer sensitivity scanner. Generates mixed-precision YAML recipes. See [docs/RECIPES.md](docs/RECIPES.md). |
 
@@ -345,7 +397,7 @@ interpretation.
 | `verify_vision_encoder.py` | **Layer 1:** Two-phase vision encoder verification — architecture correctness (Phase 1), FP16 fidelity on real corpus images (Phase 2). |
 | `verify_runtime.py` | **Layer 2:** CoreAI compiled model vs PyTorch reference PSNR across all pipeline stages. Run on macOS 27 GM. |
 | `metrics.py` | Canonical metric module (PSNR, NRMSE, cosine, KL divergence, top-k agreement, margin preservation). Shared by verify_decoder and scanner. |
-| `fastvlm_fixtures.py` | Realistic decoder input fixtures from the full HF multimodal pipeline. Shared by verify_decoder and compression_scanner. |
+| `fastvlm_fixtures.py` | Realistic decoder input fixtures from the full HF multimodal pipeline. Shared by verify_decoder and scanner. |
 | `build_fixtures.py` | Pre-build and cache decoder fixtures for verify_decoder and scanner. Run once per variant. |
 
 ### Inspection and test assets
@@ -495,7 +547,7 @@ This repo follows Apple's authoritative VLM export recipe from
 
 - Re-authored `FastVLMVisionEncoder` (FastViTHD via `trust_remote_code`)
 - Re-authored `FastVLMDecoder` (Qwen2, matching `Qwen3VLForCausalLMEmbeddings.forward()`)
-- `<image>` special token added to Qwen2 tokenizer (ID 151646 for 0.5B/1.5B, 151665 for 7B)
+- `<image>` special token added to Qwen2 tokenizer (ID 151646)
 - `--compression`, `--compression-config`, `--kv-cache`, `--max-context-length` export flags
 - Compression support (4bit, 8bit) — not available in Apple's VLM exporter
 - Two-layer verification pipeline with corpus-based behavioral metrics

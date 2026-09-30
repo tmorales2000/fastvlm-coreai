@@ -5,7 +5,7 @@ compression_scanner.py — Discover optimal quantization recipe for FastVLM.
 Measures per-layer quantization sensitivity by temporarily quantizing one layer
 at a time, running calibration images through the model, and measuring the impact
 on output quality. Produces conservative (mostly int8) and aggressive (mostly int4)
-quantization recipes for use with export_fastvlm.py --quantize-recipe.
+quantization recipes for use with export.py --compression-config.
 
 The generated recipe covers BOTH the decoder AND the vision tower — Apple's
 reference implementation skips the vision tower, but sensitivity analysis may
@@ -38,9 +38,9 @@ Output:
     Requires coreai-opt >= 0.2.2.dev0 (install from local source).
 
     Use with:
-      python scripts/export_fastvlm.py --variant 0.5b \\
+      python scripts/export.py --variant 0.5b \\
           --compression-config quantization_recipes/fastvlm-0.5b-conservative.yaml
-      python scripts/export_fastvlm.py --variant 0.5b \\
+      python scripts/export.py --variant 0.5b \\
           --compression-config quantization_recipes/fastvlm-0.5b-aggressive.yaml
 """
 
@@ -751,7 +751,7 @@ def main() -> None:
               f"{stats.get('int8',0)} int8  "
               f"{stats.get('int4',0)} int4")
         print(f"  Use with:")
-        print(f"    python scripts/export_fastvlm.py --variant {args.variant} \\")
+        print(f"    python scripts/export.py --variant {args.variant} \\")
         print(f"        --compression-config {output_path}")
 
 

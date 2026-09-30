@@ -31,7 +31,7 @@ PROVENANCE
       "sync_weights_version": "1"
     }
 
-  export_fastvlm.py reads this to stamp metadata.json with the HF revision,
+  export.py reads this to stamp metadata.json with the HF revision,
   completing the provenance chain from weights → CoreAI bundle.
 
 MLX WEIGHTS
