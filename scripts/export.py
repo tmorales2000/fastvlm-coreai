@@ -386,7 +386,6 @@ def _export_vision(
     )
     register_custom_torch_lowering(converter)
     program = converter.to_coreai()
-    program.optimize()
     meta = build_aimodel_metadata("FastVLM vision encoder + projector")
     program.save_asset(vision_path, meta)
     print("[INFO] Saved vision.aimodel")
@@ -419,7 +418,6 @@ def _export_embed(
         output_names=("embeddings",),
         state_names=None,
     )
-    program.optimize()
     meta = build_aimodel_metadata("FastVLM token embedding lookup")
     program.save_asset(embed_path, meta)
     print("[INFO] Saved embed.aimodel")
@@ -518,7 +516,6 @@ def _export_decode(
         output_names=("logits",),
         state_names=KV_STATE_NAMES,
     )
-    program.optimize()
     meta = build_aimodel_metadata(
         f"FastVLM {variant.upper()} decoder (Qwen2){comp_desc}, inputs_embeds, stateful KV"
     )
