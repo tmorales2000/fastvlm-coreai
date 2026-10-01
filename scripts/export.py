@@ -115,6 +115,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from models import (
+    resolve_variant,
+    get_model_entry,
+    weights_dir as _models_weights_dir,
+    argparse_choices,
+)
+
 import torch
 import yaml
 from coreai_models.export.macos import export_to_coreai
@@ -232,12 +239,9 @@ IOS_QUERY_LENGTHS         = [8, 16, 64]
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _weights_dir(variant: str) -> Path:
-    return Path(__file__).parent.parent / "weights" / f"fastvlm-{variant}"
-
-
 def _bundle_path(variant: str, output_dir: Path) -> Path:
-    return output_dir / f"fastvlm-{variant}"
+    """variant is the fully-qualified registry key (e.g. fastvlm-0.5b)."""
+    return output_dir / variant
 
 
 def _load_config(weights_dir: Path):
@@ -272,10 +276,10 @@ def _write_bundle_metadata(
     metadata = {
         "metadata_version": "0.2",
         "kind": "vlm",
-        "name": f"fastvlm-{variant}",
+        "name": variant,
         "assets": assets,
         "language": {
-            "tokenizer": f"fastvlm-{variant}",
+            "tokenizer": variant,
             "vocab_size": text_cfg.vocab_size,
             "max_context_length": max_ctx,
             "embedded_tokenizer": True,
@@ -292,7 +296,7 @@ def _write_bundle_metadata(
             "image_strategy":    "center_crop",
         },
         "source": {
-            "hf_model_id":      f"apple/FastVLM-{variant.upper()}",
+            "hf_model_id":      get_model_entry(variant).get("repo", f"apple/FastVLM-{variant.upper()}"),
             "model_definition": "torch",
             "compression":      compression,
             **_build_provenance_fields(weights_dir),
@@ -447,7 +451,7 @@ def _export_decode(
     for stale in bundle_path.glob("fastvlm-*.aimodel"):
         shutil.rmtree(stale)
 
-    model_path = bundle_path / f"fastvlm-{variant}.aimodel"
+    model_path = bundle_path / f"{variant}.aimodel"
     if model_path.exists():
         shutil.rmtree(model_path)
 
@@ -519,8 +523,8 @@ def _export_decode(
         f"FastVLM {variant.upper()} decoder (Qwen2){comp_desc}, inputs_embeds, stateful KV"
     )
     program.save_asset(model_path, meta)
-    print(f"[INFO] Saved fastvlm-{variant}.aimodel")
-    return f"fastvlm-{variant}.aimodel"
+    print(f"[INFO] Saved {variant}.aimodel")
+    return f"{variant}.aimodel"
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +532,7 @@ def _export_decode(
 # ---------------------------------------------------------------------------
 
 async def export_vlm(
-    variant: str,
+    variant: str,  # short alias or fully-qualified registry key
     components: list[str],
     compression_config: dict | None,
     compression_label: str,
@@ -537,12 +541,12 @@ async def export_vlm(
     max_ctx: int = 4096,
     kv_cache: str = "static",
 ):
-    weights_dir = _weights_dir(variant)
+    variant     = resolve_variant(variant)
+    weights_dir = _models_weights_dir(variant)
     if not weights_dir.exists():
         raise FileNotFoundError(
             f"Weights not found: {weights_dir}\n"
-            f"Download with: hf download apple/FastVLM-{variant.upper()} "
-            f"--local-dir {weights_dir}"
+            f"Download with: python scripts/sync_weights.py --variant {variant}"
         )
 
     config, text_cfg = _load_config(weights_dir)
@@ -623,12 +627,11 @@ def _export_ios(args) -> None:
     output_dir = args.output_dir
     overwrite  = args.overwrite
 
-    weights_dir = _weights_dir(variant)
+    weights_dir = _models_weights_dir(variant)
     if not weights_dir.exists():
         raise FileNotFoundError(
             f"Weights not found: {weights_dir}\n"
-            f"Download with: hf download apple/FastVLM-{variant.upper()} "
-            f"--local-dir {weights_dir}"
+            f"Download with: python scripts/sync_weights.py --variant {variant}"
         )
 
     compression_config, compression_label = (

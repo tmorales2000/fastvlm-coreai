@@ -130,6 +130,7 @@ def download_model(entry: dict, force: bool = False) -> bool:
             local_dir=str(directory),
             revision=revision,
             local_dir_use_symlinks=False,
+            force_download=force,
         )
     except Exception as e:
         print(f"  ERROR: Download failed: {e}")

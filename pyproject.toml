@@ -1,6 +1,6 @@
 [project]
 name = "fastvlm-coreai"
-version = "0.3.0"
+version = "0.3.1"
 description = "FastVLM to Core AI .aimodel conversion pipeline"
 requires-python = ">=3.11"
 dependencies = [

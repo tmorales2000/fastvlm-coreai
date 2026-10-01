@@ -153,7 +153,7 @@ def build_variant(
     )
 
     print(f"\n{'='*60}")
-    print(f"Variant: fastvlm-{variant}")
+    print(f"Variant: {variant}")
     print(f"{'='*60}")
 
     if not variant_weights_exist(variant):
@@ -163,7 +163,7 @@ def build_variant(
 
     if force:
         cache_dir = REPO_ROOT / FIXTURE_CACHE_DIR
-        deleted = list(cache_dir.glob(f"fastvlm-{variant}-*.pt"))
+        deleted = list(cache_dir.glob(f"{variant}-*.pt"))
         for f in deleted:
             f.unlink()
         if deleted:
